@@ -7,6 +7,7 @@
 pub use baregen_macro::coroutine;
 
 /// The result of a [`Coroutine::start`] / [`Coroutine::resume`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoroutineState<Y, R> {
     /// The coroutine suspended at a `yield_!` with this value.
     Yielded(Y),

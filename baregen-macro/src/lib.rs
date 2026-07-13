@@ -4,12 +4,15 @@
 
 use proc_macro::TokenStream;
 
+mod expand;
+
 /// Transforms a function into a coroutine state machine.
 ///
 /// See the `baregen` crate documentation for details.
 #[proc_macro_attribute]
-pub fn coroutine(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    // Task 01: pass the function through unchanged. The actual
-    // transformation is implemented in later tasks.
-    item
+pub fn coroutine(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item = syn::parse_macro_input!(item as syn::ItemFn);
+    expand::expand(attr.into(), item)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
