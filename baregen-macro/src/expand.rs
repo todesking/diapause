@@ -1,7 +1,7 @@
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
-use crate::analyze::{self, StateField, VarDef};
+use crate::analyze::{self, Analysis, VarDef};
 use crate::args::MacroArgs;
 use crate::parse::{self, CoroutineIr};
 
@@ -11,7 +11,8 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     check_signature(&item.sig)?;
     let args = parse_args(&item.sig)?;
     let ir = parse::parse_body(&item.block)?;
-    let states = analyze::live_states(&args, &ir, &macro_args.resume_ty)?;
+    let analysis = analyze::analyze(&args, &ir, &macro_args.resume_ty)?;
+    let states = &analysis.states;
 
     let attrs = &item.attrs;
     let vis = &item.vis;
@@ -46,7 +47,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
         (quote!(Poisoned,), quote!(State::Poisoned))
     };
 
-    let start_body = segment_code(&ir, &states, &state_idents, 0, yield_ty, &ret_ty);
+    let start_body = segment_code(&ir, &analysis, &state_idents, 0, yield_ty, &ret_ty);
     let arg_pat: Vec<_> = args
         .iter()
         .map(|a| bind_pat(&a.mutability, &a.ident))
@@ -69,7 +70,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
             let ty = rb.ty.as_ref().map(|ty| quote!(: #ty));
             quote!(let #mutability #ident #ty = _resume;)
         });
-        let body = segment_code(&ir, &states, &state_idents, k, yield_ty, &ret_ty);
+        let body = segment_code(&ir, &analysis, &state_idents, k, yield_ty, &ret_ty);
         quote! {
             State::#state_ident { #(#field_pats),* } => {
                 #resume_stmt
@@ -136,22 +137,39 @@ fn bind_pat(mutability: &Option<syn::Token![mut]>, ident: &syn::Ident) -> TokenS
 
 /// Emits the code that runs segment `k` and either suspends at yield `k`
 /// or completes the coroutine.
+///
+/// Borrows that crossed a yield into this segment are re-established
+/// first; original borrow `let`s whose binding is only needed after a
+/// yield are omitted (the analysis marked them as removed).
 fn segment_code(
     ir: &CoroutineIr,
-    states: &[Vec<StateField>],
+    analysis: &Analysis,
     state_idents: &[syn::Ident],
     k: usize,
     yield_ty: &syn::Type,
     ret_ty: &syn::Type,
 ) -> TokenStream {
-    let stmts = &ir.segments[k].stmts;
+    let reborrows = analysis.reborrows[k].iter().map(|rb| {
+        let target_mut = &rb.target_mut;
+        let target = &rb.target;
+        let source = &rb.source;
+        let mut_tok = rb.mutable.then(|| quote!(mut));
+        quote!(let #target_mut #target = & #mut_tok #source;)
+    });
+    let stmts = ir.segments[k]
+        .stmts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !analysis.removed_stmts[k].contains(i))
+        .map(|(_, stmt)| stmt);
     if k < ir.yields.len() {
         let value = &ir.yields[k].value;
         let next = &state_idents[k];
-        let field_idents = states[k].iter().map(|f| &f.ident);
+        let field_idents = analysis.states[k].iter().map(|f| &f.ident);
         // The yield value is evaluated before live variables are moved
         // into the state, matching the original evaluation order.
         quote! {
+            #(#reborrows)*
             #(#stmts)*
             let __yielded: #yield_ty = #value;
             *self = State::#next { #(#field_idents),* };
@@ -159,7 +177,10 @@ fn segment_code(
         }
     } else {
         quote! {
-            let __ret: #ret_ty = { #(#stmts)* };
+            let __ret: #ret_ty = {
+                #(#reborrows)*
+                #(#stmts)*
+            };
             *self = State::Done;
             ::baregen::CoroutineState::Complete(__ret)
         }

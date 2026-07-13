@@ -1,5 +1,6 @@
 //! Liveness analysis: decides which variables must be stored in each
-//! intermediate state of the generated state machine.
+//! intermediate state of the generated state machine, and which borrows
+//! must be reconstructed after a resume.
 
 use std::collections::{HashMap, HashSet};
 
@@ -25,17 +26,61 @@ pub struct StateField {
     pub ty: syn::Type,
 }
 
-/// Computes the fields of each intermediate state `S1..Sn`.
+/// A direct borrow (`let y = &x;` / `let y = &mut x;`) that crossed a
+/// yield and must be re-established at the head of a later segment.
+#[derive(Debug)]
+pub struct Reborrow {
+    pub target: syn::Ident,
+    pub target_mut: Option<syn::Token![mut]>,
+    pub source: syn::Ident,
+    pub mutable: bool,
+}
+
+#[derive(Debug)]
+pub struct Analysis {
+    /// Fields of each intermediate state `S1..Sn` (one entry per yield).
+    pub states: Vec<Vec<StateField>>,
+    /// `reborrows[k]`: borrow statements to prepend to segment k's arm.
+    pub reborrows: Vec<Vec<Reborrow>>,
+    /// `removed_stmts[k]`: indices of statements in segment k to omit
+    /// (original borrow `let`s whose binding is only used after a yield).
+    pub removed_stmts: Vec<HashSet<usize>>,
+}
+
+#[derive(Debug, Clone)]
+enum BorrowKind {
+    NotABorrow,
+    /// `let y = &x;` / `let y = &mut x;` with a plain identifier source.
+    Direct { source: syn::Ident, mutable: bool },
+    /// A reference that cannot be reconstructed; the message explains why.
+    NonReconstructible { why: &'static str },
+}
+
+#[derive(Debug)]
+struct DefRecord {
+    var: VarDef,
+    borrow: BorrowKind,
+    segment: usize,
+    /// Index within the segment's statements; `None` for arguments and
+    /// resume bindings.
+    stmt_idx: Option<usize>,
+}
+
+/// Analyzes the coroutine body.
 ///
-/// The returned vector has one entry per yield point: entry `j` holds the
-/// variables that are live across `yields[j]`, i.e. defined in segments
-/// `0..=j` and used in segments `j+1..`.
-pub fn live_states(
-    args: &[VarDef],
-    ir: &CoroutineIr,
-    resume_ty: &syn::Type,
-) -> syn::Result<Vec<Vec<StateField>>> {
+/// State `S{j+1}` holds the variables that are live across `yields[j]`,
+/// i.e. defined in segments `0..=j` and used in segments `j+1..`. A
+/// variable bound by a direct borrow is never stored: its source is
+/// stored instead and the borrow is re-created after resume.
+pub fn analyze(args: &[VarDef], ir: &CoroutineIr, resume_ty: &syn::Type) -> syn::Result<Analysis> {
     let n = ir.yields.len();
+    let mut errors: Option<syn::Error> = None;
+    let push_error = |errors: &mut Option<syn::Error>, e: syn::Error| match errors {
+        Some(prev) => prev.combine(e),
+        None => *errors = Some(e),
+    };
+
+    // === Definitions, in program order ===
 
     // env: name -> known type at the current point in program order.
     // Used for move propagation (`let y = x;` copies x's type).
@@ -44,37 +89,51 @@ pub fn live_states(
         .filter_map(|a| a.ty.clone().map(|ty| (a.ident.to_string(), ty)))
         .collect();
 
-    let mut defs: Vec<Vec<VarDef>> = vec![Vec::new(); n + 1];
-    defs[0].extend(args.iter().cloned());
+    let mut defs: Vec<DefRecord> = args
+        .iter()
+        .map(|a| DefRecord {
+            var: a.clone(),
+            borrow: BorrowKind::NotABorrow,
+            segment: 0,
+            stmt_idx: None,
+        })
+        .collect();
     for (k, seg) in ir.segments.iter().enumerate() {
         if k > 0
             && let Some(rb) = &ir.yields[k - 1].resume_binding
         {
             let ty = rb.ty.clone().unwrap_or_else(|| resume_ty.clone());
             env.insert(rb.ident.to_string(), ty.clone());
-            defs[k].push(VarDef {
-                ident: rb.ident.clone(),
-                mutability: rb.mutability,
-                ty: Some(ty),
+            defs.push(DefRecord {
+                var: VarDef {
+                    ident: rb.ident.clone(),
+                    mutability: rb.mutability,
+                    ty: Some(ty),
+                },
+                borrow: BorrowKind::NotABorrow,
+                segment: k,
+                stmt_idx: None,
             });
         }
-        for stmt in &seg.stmts {
-            let before = defs[k].len();
-            collect_let_defs(stmt, &mut defs[k], &env);
-            for d in &defs[k][before..] {
-                match &d.ty {
-                    Some(ty) => env.insert(d.ident.to_string(), ty.clone()),
+        for (i, stmt) in seg.stmts.iter().enumerate() {
+            let before = defs.len();
+            collect_let_defs(stmt, k, i, &mut defs, &env);
+            for d in &defs[before..] {
+                match &d.var.ty {
+                    Some(ty) => env.insert(d.var.ident.to_string(), ty.clone()),
                     // A def of unknown type shadows any earlier known one.
-                    None => env.remove(&d.ident.to_string()),
+                    None => env.remove(&d.var.ident.to_string()),
                 };
             }
         }
     }
 
+    // === Uses per segment ===
+
     // uses[k]: identifiers appearing in segment k, including the value
     // expression of the yield that terminates it (evaluated in the same
     // match arm, before the state transition).
-    let uses: Vec<HashSet<String>> = ir
+    let mut uses: Vec<HashSet<String>> = ir
         .segments
         .iter()
         .enumerate()
@@ -90,16 +149,77 @@ pub fn live_states(
         })
         .collect();
 
-    let mut errors: Option<syn::Error> = None;
+    // A reborrowed target needs its source in the same segment, so a use
+    // of the target implies a use of the source. Iterate to a fixpoint to
+    // handle chains (`let y = &x; let z = &y;`).
+    let direct_borrows: Vec<(String, String, usize)> = defs
+        .iter()
+        .filter_map(|d| match &d.borrow {
+            BorrowKind::Direct { source, .. } => Some((
+                d.var.ident.to_string(),
+                source.to_string(),
+                d.segment,
+            )),
+            _ => None,
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for (target, source, def_seg) in &direct_borrows {
+            for seg_uses in &mut uses[def_seg + 1..] {
+                if seg_uses.contains(target) && seg_uses.insert(source.clone()) {
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let crosses = |d: &DefRecord| {
+        let name = d.var.ident.to_string();
+        (d.segment + 1..=n).any(|k| uses[k].contains(&name))
+    };
+
+    // === Errors for borrows that cannot be reconstructed ===
+
+    for d in &defs {
+        if let BorrowKind::NonReconstructible { why } = &d.borrow
+            && crosses(d)
+        {
+            let name = &d.var.ident;
+            push_error(
+                &mut errors,
+                syn::Error::new(d.var.ident.span(), format!("`{name}` {why}")),
+            );
+        }
+    }
+
+    // Sources reborrowed mutably must be bound `mut` when unpacked.
+    let mutable_sources: HashSet<String> = defs
+        .iter()
+        .filter(|d| crosses(d))
+        .filter_map(|d| match &d.borrow {
+            BorrowKind::Direct {
+                source,
+                mutable: true,
+            } => Some(source.to_string()),
+            _ => None,
+        })
+        .collect();
+
+    // === State fields ===
+
     let mut states = Vec::with_capacity(n);
     for j in 0..n {
         let used_after: HashSet<&String> = uses[j + 1..].iter().flatten().collect();
 
         // The last definition of a name shadows the earlier ones.
-        let mut last_def: HashMap<String, &VarDef> = HashMap::new();
+        let mut last_def: HashMap<String, &DefRecord> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
-        for d in defs[..=j].iter().flatten() {
-            let name = d.ident.to_string();
+        for d in defs.iter().filter(|d| d.segment <= j) {
+            let name = d.var.ident.to_string();
             if last_def.insert(name.clone(), d).is_some() {
                 order.retain(|n| n != &name);
             }
@@ -112,67 +232,193 @@ pub fn live_states(
                 continue;
             }
             let d = last_def[name];
-            match &d.ty {
-                Some(ty) => fields.push(StateField {
-                    ident: d.ident.clone(),
-                    mutability: d.mutability,
-                    ty: ty.clone(),
-                }),
-                None => {
-                    let e = syn::Error::new(
-                        d.ident.span(),
+            match &d.borrow {
+                // Reconstructed after resume, never stored. Errors for
+                // NonReconstructible were already reported above.
+                BorrowKind::Direct { .. } | BorrowKind::NonReconstructible { .. } => continue,
+                BorrowKind::NotABorrow => {}
+            }
+            match &d.var.ty {
+                Some(ty) => {
+                    let forced_mut = mutable_sources
+                        .contains(name)
+                        .then(|| syn::Token![mut](d.var.ident.span()));
+                    fields.push(StateField {
+                        ident: d.var.ident.clone(),
+                        mutability: d.var.mutability.or(forced_mut),
+                        ty: ty.clone(),
+                    });
+                }
+                None => push_error(
+                    &mut errors,
+                    syn::Error::new(
+                        d.var.ident.span(),
                         format!(
                             "cannot determine the type of `{name}`, which is held across \
                              yield_!; write an explicit type annotation: `let {name}: Type = ...`"
                         ),
-                    );
-                    match &mut errors {
-                        Some(prev) => prev.combine(e),
-                        None => errors = Some(e),
-                    }
-                }
+                    ),
+                ),
             }
         }
         states.push(fields);
     }
 
+    // === Reborrow statements and original-borrow removal ===
+
+    let mut reborrows: Vec<Vec<Reborrow>> = (0..=n).map(|_| Vec::new()).collect();
+    for (k, rb) in reborrows.iter_mut().enumerate().skip(1) {
+        for d in &defs {
+            let BorrowKind::Direct { source, mutable } = &d.borrow else {
+                continue;
+            };
+            if d.segment < k && uses[k].contains(&d.var.ident.to_string()) {
+                rb.push(Reborrow {
+                    target: d.var.ident.clone(),
+                    target_mut: d.var.mutability,
+                    source: source.clone(),
+                    mutable: *mutable,
+                });
+            }
+        }
+    }
+
+    let mut removed_stmts: Vec<HashSet<usize>> = vec![HashSet::new(); n + 1];
+    for d in &defs {
+        let (BorrowKind::Direct { .. }, Some(i)) = (&d.borrow, d.stmt_idx) else {
+            continue;
+        };
+        if !crosses(d) {
+            continue;
+        }
+        // Drop the original `let` unless the binding is still used later
+        // within its own segment (borrows have no side effects).
+        let mut c = UseCollector::default();
+        for stmt in &ir.segments[d.segment].stmts[i + 1..] {
+            c.visit_stmt(stmt);
+        }
+        if d.segment < n {
+            c.visit_expr(&ir.yields[d.segment].value);
+        }
+        if !c.used.contains(&d.var.ident.to_string()) {
+            removed_stmts[d.segment].insert(i);
+        }
+    }
+
     match errors {
         Some(e) => Err(e),
-        None => Ok(states),
+        None => Ok(Analysis {
+            states,
+            reborrows,
+            removed_stmts,
+        }),
     }
 }
 
 /// Records the variables bound by a `let` statement, determining their
-/// types where possible: explicit annotation, literal suffix, or move
-/// propagation from a variable of known type.
-fn collect_let_defs(stmt: &syn::Stmt, out: &mut Vec<VarDef>, env: &HashMap<String, syn::Type>) {
+/// types where possible (explicit annotation, literal suffix, or move
+/// propagation) and classifying direct borrows.
+fn collect_let_defs(
+    stmt: &syn::Stmt,
+    segment: usize,
+    stmt_idx: usize,
+    out: &mut Vec<DefRecord>,
+    env: &HashMap<String, syn::Type>,
+) {
     let syn::Stmt::Local(local) = stmt else {
         return;
     };
-    let init_ty = || {
-        local
-            .init
-            .as_ref()
-            .and_then(|init| infer_expr_ty(&init.expr, env))
+    let init = local.init.as_ref().map(|init| &*init.expr);
+    let mut push = |var: VarDef, borrow: BorrowKind| {
+        out.push(DefRecord {
+            var,
+            borrow,
+            segment,
+            stmt_idx: Some(stmt_idx),
+        })
     };
     match &local.pat {
-        syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => out.push(VarDef {
-            ident: pi.ident.clone(),
-            mutability: pi.mutability,
-            ty: init_ty(),
-        }),
+        syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => push(
+            VarDef {
+                ident: pi.ident.clone(),
+                mutability: pi.mutability,
+                ty: init.and_then(|e| infer_expr_ty(e, env)),
+            },
+            classify_borrow(init, None),
+        ),
         syn::Pat::Type(pt) => match &*pt.pat {
-            syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
-                out.push(VarDef {
+            syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => push(
+                VarDef {
                     ident: pi.ident.clone(),
                     mutability: pi.mutability,
                     ty: Some((*pt.ty).clone()),
-                })
-            }
-            other => collect_pat_idents(other, out),
+                },
+                classify_borrow(init, Some(&pt.ty)),
+            ),
+            other => collect_pat_idents(other, segment, stmt_idx, out),
         },
-        other => collect_pat_idents(other, out),
+        other => collect_pat_idents(other, segment, stmt_idx, out),
     }
+}
+
+fn classify_borrow(init: Option<&syn::Expr>, annotated: Option<&syn::Type>) -> BorrowKind {
+    let mut init = init;
+    while let Some(syn::Expr::Paren(p)) = init {
+        init = Some(&p.expr);
+    }
+    match init {
+        Some(syn::Expr::Reference(r)) => match &*r.expr {
+            syn::Expr::Path(p) if p.qself.is_none() && p.path.get_ident().is_some() => {
+                BorrowKind::Direct {
+                    source: p.path.get_ident().unwrap().clone(),
+                    mutable: r.mutability.is_some(),
+                }
+            }
+            _ => BorrowKind::NonReconstructible {
+                why: "is held across yield_! but borrows a non-trivial place; only direct \
+                      borrows of local variables (`let y = &x;` / `let y = &mut x;`) can be \
+                      reconstructed after resume",
+            },
+        },
+        _ if matches!(annotated, Some(syn::Type::Reference(_))) => {
+            BorrowKind::NonReconstructible {
+                why: "has a reference type but is not a direct borrow (`let y = &x;` / \
+                      `let y = &mut x;`), so it cannot be held across yield_!",
+            }
+        }
+        _ => BorrowKind::NotABorrow,
+    }
+}
+
+/// Fallback for complex patterns: every bound identifier becomes a def of
+/// unknown type.
+fn collect_pat_idents(pat: &syn::Pat, segment: usize, stmt_idx: usize, out: &mut Vec<DefRecord>) {
+    struct Collector<'a> {
+        out: &'a mut Vec<DefRecord>,
+        segment: usize,
+        stmt_idx: usize,
+    }
+    impl<'ast> Visit<'ast> for Collector<'_> {
+        fn visit_pat_ident(&mut self, pi: &'ast syn::PatIdent) {
+            self.out.push(DefRecord {
+                var: VarDef {
+                    ident: pi.ident.clone(),
+                    mutability: pi.mutability,
+                    ty: None,
+                },
+                borrow: BorrowKind::NotABorrow,
+                segment: self.segment,
+                stmt_idx: Some(self.stmt_idx),
+            });
+            syn::visit::visit_pat_ident(self, pi);
+        }
+    }
+    Collector {
+        out,
+        segment,
+        stmt_idx,
+    }
+    .visit_pat(pat);
 }
 
 /// Syntactic type inference for an initializer expression.
@@ -215,23 +461,6 @@ fn infer_lit_ty(lit: &syn::Lit) -> Option<syn::Type> {
         syn::Lit::Byte(_) => Some(syn::parse_quote!(u8)),
         _ => None,
     }
-}
-
-/// Fallback for complex patterns: every bound identifier becomes a def of
-/// unknown type.
-fn collect_pat_idents(pat: &syn::Pat, out: &mut Vec<VarDef>) {
-    struct Collector<'a>(&'a mut Vec<VarDef>);
-    impl<'ast> Visit<'ast> for Collector<'_> {
-        fn visit_pat_ident(&mut self, pi: &'ast syn::PatIdent) {
-            self.0.push(VarDef {
-                ident: pi.ident.clone(),
-                mutability: pi.mutability,
-                ty: None,
-            });
-            syn::visit::visit_pat_ident(self, pi);
-        }
-    }
-    Collector(out).visit_pat(pat);
 }
 
 /// Collects identifiers that may refer to local variables.
@@ -281,8 +510,18 @@ mod tests {
         parse_quote!(())
     }
 
+    fn states(block: &syn::Block, args: &[VarDef], resume_ty: &syn::Type) -> Vec<Vec<StateField>> {
+        let ir = parse_body(block).unwrap();
+        analyze(args, &ir, resume_ty).unwrap().states
+    }
+
     fn field_names(fields: &[StateField]) -> Vec<String> {
         fields.iter().map(|f| f.ident.to_string()).collect()
+    }
+
+    fn error_of(block: &syn::Block) -> syn::Error {
+        let ir = parse_body(block).unwrap();
+        analyze(&[], &ir, &unit()).unwrap_err()
     }
 
     #[test]
@@ -293,8 +532,7 @@ mod tests {
             yield_!(1);
             a
         });
-        let ir = parse_body(&block).unwrap();
-        let states = live_states(&[], &ir, &unit()).unwrap();
+        let states = states(&block, &[], &unit());
         assert_eq!(states.len(), 1);
         assert_eq!(field_names(&states[0]), ["a"]);
     }
@@ -306,13 +544,12 @@ mod tests {
             yield_!(2);
             x
         });
-        let ir = parse_body(&block).unwrap();
         let arg = VarDef {
             ident: parse_quote!(x),
             mutability: None,
             ty: Some(parse_quote!(u32)),
         };
-        let states = live_states(&[arg], &ir, &unit()).unwrap();
+        let states = states(&block, &[arg], &unit());
         assert_eq!(field_names(&states[0]), ["x"]);
         assert_eq!(field_names(&states[1]), ["x"]);
     }
@@ -325,8 +562,7 @@ mod tests {
             let a: i32 = 1;
             yield_!(a);
         });
-        let ir = parse_body(&block).unwrap();
-        let states = live_states(&[], &ir, &unit()).unwrap();
+        let states = states(&block, &[], &unit());
         assert!(states[0].is_empty());
     }
 
@@ -337,9 +573,8 @@ mod tests {
             yield_!(2);
             r
         });
-        let ir = parse_body(&block).unwrap();
         let resume_ty: syn::Type = parse_quote!(String);
-        let states = live_states(&[], &ir, &resume_ty).unwrap();
+        let states = states(&block, &[], &resume_ty);
         assert!(states[0].is_empty());
         assert_eq!(field_names(&states[1]), ["r"]);
         assert_eq!(states[1][0].ty, resume_ty);
@@ -353,8 +588,7 @@ mod tests {
             yield_!(1);
             x
         });
-        let ir = parse_body(&block).unwrap();
-        let states = live_states(&[], &ir, &unit()).unwrap();
+        let states = states(&block, &[], &unit());
         assert_eq!(field_names(&states[0]), ["x"]);
         let expected: syn::Type = parse_quote!(String);
         assert_eq!(states[0][0].ty, expected);
@@ -370,8 +604,7 @@ mod tests {
             yield_!(1);
             f(a, b, c, d);
         });
-        let ir = parse_body(&block).unwrap();
-        let states = live_states(&[], &ir, &unit()).unwrap();
+        let states = states(&block, &[], &unit());
         assert_eq!(field_names(&states[0]), ["a", "b", "c", "d"]);
         let tys: Vec<syn::Type> =
             vec![parse_quote!(u8), parse_quote!(f32), parse_quote!(bool), parse_quote!(char)];
@@ -387,8 +620,7 @@ mod tests {
             yield_!(1);
             f(a);
         });
-        let ir = parse_body(&block).unwrap();
-        assert!(live_states(&[], &ir, &unit()).is_err());
+        assert!(error_of(&block).to_string().contains("type annotation"));
     }
 
     #[test]
@@ -400,8 +632,7 @@ mod tests {
             yield_!(1);
             c
         });
-        let ir = parse_body(&block).unwrap();
-        let states = live_states(&[], &ir, &unit()).unwrap();
+        let states = states(&block, &[], &unit());
         assert_eq!(field_names(&states[0]), ["c"]);
         let expected: syn::Type = parse_quote!(String);
         assert_eq!(states[0][0].ty, expected);
@@ -414,13 +645,12 @@ mod tests {
             yield_!(1);
             y
         });
-        let ir = parse_body(&block).unwrap();
         let arg = VarDef {
             ident: parse_quote!(x),
             mutability: None,
             ty: Some(parse_quote!(u32)),
         };
-        let states = live_states(&[arg], &ir, &unit()).unwrap();
+        let states = states(&block, &[arg], &unit());
         let expected: syn::Type = parse_quote!(u32);
         assert_eq!(states[0][0].ty, expected);
     }
@@ -433,9 +663,8 @@ mod tests {
             yield_!(2);
             s
         });
-        let ir = parse_body(&block).unwrap();
         let resume_ty: syn::Type = parse_quote!(String);
-        let states = live_states(&[], &ir, &resume_ty).unwrap();
+        let states = states(&block, &[], &resume_ty);
         assert_eq!(field_names(&states[1]), ["s"]);
         assert_eq!(states[1][0].ty, resume_ty);
     }
@@ -449,8 +678,7 @@ mod tests {
             yield_!(1);
             b
         });
-        let ir = parse_body(&block).unwrap();
-        assert!(live_states(&[], &ir, &unit()).is_err());
+        assert!(error_of(&block).to_string().contains("type annotation"));
     }
 
     #[test]
@@ -460,9 +688,7 @@ mod tests {
             yield_!(1);
             x
         });
-        let ir = parse_body(&block).unwrap();
-        let err = live_states(&[], &ir, &unit()).unwrap_err();
-        assert!(err.to_string().contains("type annotation"));
+        assert!(error_of(&block).to_string().contains("type annotation"));
     }
 
     #[test]
@@ -472,8 +698,108 @@ mod tests {
             yield_!(1);
             println!("{}", a);
         });
-        let ir = parse_body(&block).unwrap();
-        let states = live_states(&[], &ir, &unit()).unwrap();
+        let states = states(&block, &[], &unit());
         assert_eq!(field_names(&states[0]), ["a"]);
+    }
+
+    #[test]
+    fn borrow_target_is_replaced_by_its_source() {
+        let block: syn::Block = parse_quote!({
+            let mut x: i32 = 1;
+            let y = &mut x;
+            yield_!(1);
+            *y += 1;
+        });
+        let ir = parse_body(&block).unwrap();
+        let a = analyze(&[], &ir, &unit()).unwrap();
+        // y is reconstructed, x is stored (bound mutably for the reborrow)
+        assert_eq!(field_names(&a.states[0]), ["x"]);
+        assert!(a.states[0][0].mutability.is_some());
+        assert_eq!(a.reborrows[1].len(), 1);
+        assert_eq!(a.reborrows[1][0].target, "y");
+        assert_eq!(a.reborrows[1][0].source, "x");
+        assert!(a.reborrows[1][0].mutable);
+        // the original `let y = &mut x;` (stmt 1 of segment 0) is dropped
+        assert!(a.removed_stmts[0].contains(&1));
+    }
+
+    #[test]
+    fn borrow_used_before_yield_keeps_original_stmt() {
+        let block: syn::Block = parse_quote!({
+            let mut x: i32 = 1;
+            let y = &mut x;
+            *y += 1;
+            yield_!(1);
+            *y += 1;
+        });
+        let ir = parse_body(&block).unwrap();
+        let a = analyze(&[], &ir, &unit()).unwrap();
+        assert!(a.removed_stmts[0].is_empty());
+        assert_eq!(a.reborrows[1].len(), 1);
+    }
+
+    #[test]
+    fn shared_borrow_does_not_force_mut() {
+        let block: syn::Block = parse_quote!({
+            let x: String = mk();
+            let y = &x;
+            yield_!(1);
+            y.len()
+        });
+        let ir = parse_body(&block).unwrap();
+        let a = analyze(&[], &ir, &unit()).unwrap();
+        assert_eq!(field_names(&a.states[0]), ["x"]);
+        assert!(a.states[0][0].mutability.is_none());
+        assert!(!a.reborrows[1][0].mutable);
+    }
+
+    #[test]
+    fn borrow_chain_reborrows_in_definition_order() {
+        let block: syn::Block = parse_quote!({
+            let x: i32 = 1;
+            let y = &x;
+            let z = &y;
+            yield_!(1);
+            f(z);
+        });
+        let ir = parse_body(&block).unwrap();
+        let a = analyze(&[], &ir, &unit()).unwrap();
+        assert_eq!(field_names(&a.states[0]), ["x"]);
+        let order: Vec<_> = a.reborrows[1].iter().map(|r| r.target.to_string()).collect();
+        assert_eq!(order, ["y", "z"]);
+    }
+
+    #[test]
+    fn complex_borrow_across_yield_is_an_error() {
+        let block: syn::Block = parse_quote!({
+            let y = &x.field;
+            yield_!(1);
+            f(y);
+        });
+        assert!(error_of(&block).to_string().contains("non-trivial place"));
+    }
+
+    #[test]
+    fn reference_typed_non_borrow_across_yield_is_an_error() {
+        let block: syn::Block = parse_quote!({
+            let y: &u32 = first(v);
+            yield_!(1);
+            f(y);
+        });
+        assert!(error_of(&block).to_string().contains("reference type"));
+    }
+
+    #[test]
+    fn non_crossing_borrows_are_untouched() {
+        let block: syn::Block = parse_quote!({
+            let y = &x.field;
+            f(y);
+            yield_!(1);
+        });
+        let ir = parse_body(&block).unwrap();
+        let a = analyze(&[], &ir, &unit()).unwrap();
+        assert!(a.states[0].is_empty());
+        assert!(a.reborrows[1].is_empty());
+        assert!(a.removed_stmts[0].is_empty());
     }
 }

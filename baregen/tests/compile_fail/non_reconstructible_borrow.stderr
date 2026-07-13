@@ -1,0 +1,11 @@
+error: `y` is held across yield_! but borrows a non-trivial place; only direct borrows of local variables (`let y = &x;` / `let y = &mut x;`) can be reconstructed after resume
+ --> tests/compile_fail/non_reconstructible_borrow.rs:7:9
+  |
+7 |     let y = &w.field;
+  |         ^
+
+error: `first` has a reference type but is not a direct borrow (`let y = &x;` / `let y = &mut x;`), so it cannot be held across yield_!
+  --> tests/compile_fail/non_reconstructible_borrow.rs:14:9
+   |
+14 |     let first: &u32 = v.first().unwrap();
+   |         ^^^^^
