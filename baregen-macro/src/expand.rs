@@ -20,7 +20,13 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     let analysis = analyze::analyze(&args, &ir, &macro_args.resume_ty)?;
     let states = &analysis.states;
 
-    let attrs = &item.attrs;
+    // `#[derive(...)]` written below the coroutine attribute applies to
+    // the generated State enum; everything else (doc comments, allow,
+    // etc.) stays on the starter fn.
+    let (derive_attrs, fn_attrs): (Vec<&syn::Attribute>, Vec<&syn::Attribute>) = item
+        .attrs
+        .iter()
+        .partition(|a| a.path().is_ident("derive"));
     let vis = &item.vis;
     let name = &item.sig.ident;
     let yield_ty = &macro_args.yield_ty;
@@ -106,7 +112,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     Ok(quote! {
-        #(#attrs)*
+        #(#fn_attrs)*
         #vis fn #name #impl_generics (#(#arg_ident: #arg_ty),*) -> #name::State #ty_generics
         #where_clause
         {
@@ -117,6 +123,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
             #[allow(unused_imports)]
             use super::*;
 
+            #(#derive_attrs)*
             pub enum State #generics #where_clause {
                 Start { #(#arg_ident: #arg_ty,)* #phantom_field },
                 #(#state_variants,)*
