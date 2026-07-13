@@ -1,0 +1,5 @@
+error: the binding of `let ... = yield_!(...)` must be a simple identifier
+ --> tests/compile_fail/bad_resume_binding.rs:3:9
+  |
+3 |     let (a, b) = yield_!(1);
+  |         ^^^^^^

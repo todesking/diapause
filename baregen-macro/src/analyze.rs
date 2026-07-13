@@ -51,9 +51,14 @@ pub struct Analysis {
 enum BorrowKind {
     NotABorrow,
     /// `let y = &x;` / `let y = &mut x;` with a plain identifier source.
-    Direct { source: syn::Ident, mutable: bool },
+    Direct {
+        source: syn::Ident,
+        mutable: bool,
+    },
     /// A reference that cannot be reconstructed; the message explains why.
-    NonReconstructible { why: &'static str },
+    NonReconstructible {
+        why: &'static str,
+    },
 }
 
 #[derive(Debug)]
@@ -155,11 +160,9 @@ pub fn analyze(args: &[VarDef], ir: &CoroutineIr, resume_ty: &syn::Type) -> syn:
     let direct_borrows: Vec<(String, String, usize)> = defs
         .iter()
         .filter_map(|d| match &d.borrow {
-            BorrowKind::Direct { source, .. } => Some((
-                d.var.ident.to_string(),
-                source.to_string(),
-                d.segment,
-            )),
+            BorrowKind::Direct { source, .. } => {
+                Some((d.var.ident.to_string(), source.to_string(), d.segment))
+            }
             _ => None,
         })
         .collect();
@@ -380,12 +383,10 @@ fn classify_borrow(init: Option<&syn::Expr>, annotated: Option<&syn::Type>) -> B
                       reconstructed after resume",
             },
         },
-        _ if matches!(annotated, Some(syn::Type::Reference(_))) => {
-            BorrowKind::NonReconstructible {
-                why: "has a reference type but is not a direct borrow (`let y = &x;` / \
+        _ if matches!(annotated, Some(syn::Type::Reference(_))) => BorrowKind::NonReconstructible {
+            why: "has a reference type but is not a direct borrow (`let y = &x;` / \
                       `let y = &mut x;`), so it cannot be held across yield_!",
-            }
-        }
+        },
         _ => BorrowKind::NotABorrow,
     }
 }
@@ -606,8 +607,12 @@ mod tests {
         });
         let states = states(&block, &[], &unit());
         assert_eq!(field_names(&states[0]), ["a", "b", "c", "d"]);
-        let tys: Vec<syn::Type> =
-            vec![parse_quote!(u8), parse_quote!(f32), parse_quote!(bool), parse_quote!(char)];
+        let tys: Vec<syn::Type> = vec![
+            parse_quote!(u8),
+            parse_quote!(f32),
+            parse_quote!(bool),
+            parse_quote!(char),
+        ];
         for (f, ty) in states[0].iter().zip(&tys) {
             assert_eq!(&f.ty, ty);
         }
@@ -765,7 +770,10 @@ mod tests {
         let ir = parse_body(&block).unwrap();
         let a = analyze(&[], &ir, &unit()).unwrap();
         assert_eq!(field_names(&a.states[0]), ["x"]);
-        let order: Vec<_> = a.reborrows[1].iter().map(|r| r.target.to_string()).collect();
+        let order: Vec<_> = a.reborrows[1]
+            .iter()
+            .map(|r| r.target.to_string())
+            .collect();
         assert_eq!(order, ["y", "z"]);
     }
 

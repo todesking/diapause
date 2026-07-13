@@ -23,10 +23,8 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     // `#[derive(...)]` written below the coroutine attribute applies to
     // the generated State enum; everything else (doc comments, allow,
     // etc.) stays on the starter fn.
-    let (derive_attrs, fn_attrs): (Vec<&syn::Attribute>, Vec<&syn::Attribute>) = item
-        .attrs
-        .iter()
-        .partition(|a| a.path().is_ident("derive"));
+    let (derive_attrs, fn_attrs): (Vec<&syn::Attribute>, Vec<&syn::Attribute>) =
+        item.attrs.iter().partition(|a| a.path().is_ident("derive"));
     let vis = &item.vis;
     let name = &item.sig.ident;
     let yield_ty = &macro_args.yield_ty;
@@ -404,7 +402,8 @@ impl VisitMut for TypeRewriter {
             self.used_type_params.insert(name.clone());
             let ident = syn::Ident::new(&name, it.span());
             let bounds = it.bounds.clone();
-            self.fresh_type_params.push(syn::parse_quote!(#ident: #bounds));
+            self.fresh_type_params
+                .push(syn::parse_quote!(#ident: #bounds));
             *ty = syn::parse_quote!(#ident);
         }
     }
