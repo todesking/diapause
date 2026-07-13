@@ -1,5 +1,10 @@
+use std::collections::HashSet;
+
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use syn::spanned::Spanned;
+use syn::visit::Visit;
+use syn::visit_mut::VisitMut;
 
 use crate::analyze::{self, Analysis, VarDef};
 use crate::args::MacroArgs;
@@ -9,7 +14,8 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     let macro_args: MacroArgs = syn::parse2(attr)?;
 
     check_signature(&item.sig)?;
-    let args = parse_args(&item.sig)?;
+    let mut args = parse_args(&item.sig)?;
+    let generics = augment_generics(&item.sig, &mut args)?;
     let ir = parse::parse_body(&item.block)?;
     let analysis = analyze::analyze(&args, &ir, &macro_args.resume_ty)?;
     let states = &analysis.states;
@@ -23,6 +29,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
         syn::ReturnType::Default => syn::parse_quote!(()),
         syn::ReturnType::Type(_, ty) => (**ty).clone(),
     };
+    check_return_type(&ret_ty)?;
 
     let n = ir.yields.len();
     let state_idents: Vec<syn::Ident> = (1..=n).map(|k| format_ident!("S{k}")).collect();
@@ -39,6 +46,21 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
         quote!(#id { #(#field_defs),* })
     });
 
+    // A generic parameter used only inside the body would leave the enum
+    // with an unconstrained parameter (E0392); a PhantomData field in
+    // Start keeps such parameters anchored.
+    let all_field_tys = arg_ty
+        .iter()
+        .copied()
+        .chain(states.iter().flatten().map(|f| &f.ty));
+    let phantom_ty = phantom_for_unused_params(&generics, all_field_tys);
+    let phantom_field = phantom_ty
+        .as_ref()
+        .map(|ty| quote!(__phantom: ::core::marker::PhantomData<#ty>,));
+    let phantom_init = phantom_ty
+        .as_ref()
+        .map(|_| quote!(__phantom: ::core::marker::PhantomData,));
+
     // Without yields no transition can panic halfway, so Done doubles as
     // the placeholder and Poisoned is omitted.
     let (poisoned_variant, placeholder) = if n == 0 {
@@ -53,7 +75,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
         .map(|a| bind_pat(&a.mutability, &a.ident))
         .collect();
     let start_arm = quote! {
-        State::Start { #(#arg_pat),* } => {
+        State::Start { #(#arg_pat,)* .. } => {
             #start_body
         }
     };
@@ -81,24 +103,30 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
 
     let poisoned_arm = (n > 0).then(|| quote!(State::Poisoned => ::core::panic!("Poisoned"),));
 
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
     Ok(quote! {
         #(#attrs)*
-        #vis fn #name(#(#arg_ident: #arg_ty),*) -> #name::State {
-            #name::State::Start { #(#arg_ident),* }
+        #vis fn #name #impl_generics (#(#arg_ident: #arg_ty),*) -> #name::State #ty_generics
+        #where_clause
+        {
+            #name::State::Start { #(#arg_ident,)* #phantom_init }
         }
 
         #vis mod #name {
             #[allow(unused_imports)]
             use super::*;
 
-            pub enum State {
-                Start { #(#arg_ident: #arg_ty),* },
+            pub enum State #generics #where_clause {
+                Start { #(#arg_ident: #arg_ty,)* #phantom_field },
                 #(#state_variants,)*
                 Done,
                 #poisoned_variant
             }
 
-            impl ::baregen::Coroutine<#resume_ty> for State {
+            impl #impl_generics ::baregen::Coroutine<#resume_ty> for State #ty_generics
+            #where_clause
+            {
                 type Yield = #yield_ty;
                 type Return = #ret_ty;
 
@@ -209,13 +237,56 @@ fn check_signature(sig: &syn::Signature) -> syn::Result<()> {
     if let Some(v) = &sig.variadic {
         return unsupported(v, "variadic functions");
     }
-    if !sig.generics.params.is_empty() || sig.generics.where_clause.is_some() {
-        return Err(syn::Error::new_spanned(
-            &sig.generics,
-            "generic parameters are not supported yet",
-        ));
-    }
     Ok(())
+}
+
+/// The return type becomes `type Return` of the impl, where lifetime
+/// elision and `impl Trait` are not available.
+fn check_return_type(ty: &syn::Type) -> syn::Result<()> {
+    struct Check {
+        error: Option<syn::Error>,
+    }
+    impl Check {
+        fn record(&mut self, e: syn::Error) {
+            match &mut self.error {
+                Some(prev) => prev.combine(e),
+                None => self.error = Some(e),
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Check {
+        fn visit_type_reference(&mut self, r: &'ast syn::TypeReference) {
+            if r.lifetime.is_none() {
+                self.record(syn::Error::new(
+                    r.span(),
+                    "elided lifetimes in the return type are not supported; \
+                     use a named lifetime",
+                ));
+            }
+            syn::visit::visit_type_reference(self, r);
+        }
+        fn visit_lifetime(&mut self, lt: &'ast syn::Lifetime) {
+            if lt.ident == "_" {
+                self.record(syn::Error::new(
+                    lt.span(),
+                    "elided lifetimes in the return type are not supported; \
+                     use a named lifetime",
+                ));
+            }
+        }
+        fn visit_type_impl_trait(&mut self, it: &'ast syn::TypeImplTrait) {
+            self.record(syn::Error::new(
+                it.span(),
+                "`impl Trait` in the return type is not supported",
+            ));
+        }
+    }
+    let mut check = Check { error: None };
+    check.visit_type(ty);
+    match check.error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn parse_args(sig: &syn::Signature) -> syn::Result<Vec<VarDef>> {
@@ -231,12 +302,6 @@ fn parse_args(sig: &syn::Signature) -> syn::Result<Vec<VarDef>> {
                 }
                 syn::FnArg::Typed(pt) => pt,
             };
-            if let syn::Type::Reference(r) = &*pat_type.ty {
-                return Err(syn::Error::new_spanned(
-                    r,
-                    "reference arguments are not supported yet",
-                ));
-            }
             match &*pat_type.pat {
                 syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => Ok(VarDef {
                     ident: pi.ident.clone(),
@@ -250,4 +315,136 @@ fn parse_args(sig: &syn::Signature) -> syn::Result<Vec<VarDef>> {
             }
         })
         .collect()
+}
+
+/// Rewrites argument types so they can appear on the State enum: elided
+/// lifetimes get fresh named parameters and `impl Trait` becomes a named
+/// type parameter. Returns the function's generics augmented with the
+/// fresh parameters.
+fn augment_generics(sig: &syn::Signature, args: &mut [VarDef]) -> syn::Result<syn::Generics> {
+    let mut generics = sig.generics.clone();
+    let mut rewriter = TypeRewriter {
+        used_lifetimes: generics
+            .lifetimes()
+            .map(|l| l.lifetime.ident.to_string())
+            .collect(),
+        used_type_params: generics
+            .type_params()
+            .map(|t| t.ident.to_string())
+            .collect(),
+        fresh_lifetimes: Vec::new(),
+        fresh_type_params: Vec::new(),
+    };
+    for arg in args.iter_mut() {
+        if let Some(ty) = &mut arg.ty {
+            rewriter.visit_type_mut(ty);
+        }
+    }
+    // Lifetime parameters must precede type parameters.
+    for (i, lt) in rewriter.fresh_lifetimes.into_iter().enumerate() {
+        generics
+            .params
+            .insert(i, syn::GenericParam::Lifetime(syn::LifetimeParam::new(lt)));
+    }
+    for tp in rewriter.fresh_type_params {
+        generics.params.push(syn::GenericParam::Type(tp));
+    }
+    Ok(generics)
+}
+
+struct TypeRewriter {
+    used_lifetimes: HashSet<String>,
+    used_type_params: HashSet<String>,
+    fresh_lifetimes: Vec<syn::Lifetime>,
+    fresh_type_params: Vec<syn::TypeParam>,
+}
+
+impl TypeRewriter {
+    fn fresh_lifetime(&mut self, span: proc_macro2::Span) -> syn::Lifetime {
+        let name = ('a'..='z')
+            .map(|c| c.to_string())
+            .chain((0..).map(|i| format!("lt{i}")))
+            .find(|name| !self.used_lifetimes.contains(name))
+            .unwrap();
+        self.used_lifetimes.insert(name.clone());
+        let lt = syn::Lifetime::new(&format!("'{name}"), span);
+        self.fresh_lifetimes.push(lt.clone());
+        lt
+    }
+}
+
+impl VisitMut for TypeRewriter {
+    fn visit_type_reference_mut(&mut self, r: &mut syn::TypeReference) {
+        if r.lifetime.is_none() {
+            r.lifetime = Some(self.fresh_lifetime(r.and_token.span()));
+        }
+        syn::visit_mut::visit_type_reference_mut(self, r);
+    }
+
+    fn visit_lifetime_mut(&mut self, lt: &mut syn::Lifetime) {
+        if lt.ident == "_" {
+            *lt = self.fresh_lifetime(lt.span());
+        }
+    }
+
+    fn visit_type_mut(&mut self, ty: &mut syn::Type) {
+        syn::visit_mut::visit_type_mut(self, ty);
+        if let syn::Type::ImplTrait(it) = ty {
+            let name = (0..)
+                .map(|i| format!("__T{i}"))
+                .find(|name| !self.used_type_params.contains(name))
+                .unwrap();
+            self.used_type_params.insert(name.clone());
+            let ident = syn::Ident::new(&name, it.span());
+            let bounds = it.bounds.clone();
+            self.fresh_type_params.push(syn::parse_quote!(#ident: #bounds));
+            *ty = syn::parse_quote!(#ident);
+        }
+    }
+}
+
+/// Returns the PhantomData payload type anchoring generic parameters that
+/// appear in no variant field, or `None` if every parameter is used.
+///
+/// Detection is a token-level ident scan of the field types: a false
+/// "used" only omits the phantom and surfaces as E0392.
+fn phantom_for_unused_params<'a>(
+    generics: &syn::Generics,
+    field_tys: impl Iterator<Item = &'a syn::Type>,
+) -> Option<syn::Type> {
+    use quote::ToTokens;
+
+    let mut used = HashSet::new();
+    for ty in field_tys {
+        collect_idents(ty.to_token_stream(), &mut used);
+    }
+
+    let unused_types: Vec<&syn::Ident> = generics
+        .type_params()
+        .map(|t| &t.ident)
+        .filter(|id| !used.contains(&id.to_string()))
+        .collect();
+    let unused_lifetimes: Vec<&syn::Lifetime> = generics
+        .lifetimes()
+        .map(|l| &l.lifetime)
+        .filter(|lt| !used.contains(&lt.ident.to_string()))
+        .collect();
+    if unused_types.is_empty() && unused_lifetimes.is_empty() {
+        return None;
+    }
+    // fn pointers keep the phantom covariant and unconditionally
+    // Send/Sync/Copy/Clone.
+    Some(syn::parse_quote!((#(fn() -> #unused_types,)* #(fn() -> &#unused_lifetimes (),)*)))
+}
+
+fn collect_idents(tokens: TokenStream, out: &mut HashSet<String>) {
+    for tt in tokens {
+        match tt {
+            proc_macro2::TokenTree::Ident(id) => {
+                out.insert(id.to_string());
+            }
+            proc_macro2::TokenTree::Group(g) => collect_idents(g.stream(), out),
+            _ => {}
+        }
+    }
 }

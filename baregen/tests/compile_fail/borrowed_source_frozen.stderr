@@ -1,0 +1,10 @@
+error[E0499]: cannot borrow `v` as mutable more than once at a time
+  --> tests/compile_fail/borrowed_source_frozen.rs:15:5
+   |
+12 |     let mut c = fill(&mut v);
+   |                      ------ first mutable borrow occurs here
+...
+15 |     v.push(99);
+   |     ^ second mutable borrow occurs here
+16 |     c.resume(());
+   |     - first borrow later used here
