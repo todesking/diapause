@@ -1,6 +1,9 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 
+use crate::args::MacroArgs;
+use crate::parse;
+
 struct Arg {
     ident: syn::Ident,
     mutability: Option<syn::Token![mut]>,
@@ -8,15 +11,19 @@ struct Arg {
 }
 
 pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> {
-    if !attr.is_empty() {
-        return Err(syn::Error::new_spanned(
-            attr,
-            "attribute arguments are not supported yet",
-        ));
-    }
+    let macro_args: MacroArgs = syn::parse2(attr)?;
 
     check_signature(&item.sig)?;
     let args = parse_args(&item.sig)?;
+    let ir = parse::parse_body(&item.block)?;
+    if !ir.yields.is_empty() {
+        // Codegen for suspension points lands in task 04.
+        return Err(syn::Error::new_spanned(
+            &item.sig.ident,
+            "coroutines containing yield_! are not implemented yet",
+        ));
+    }
+    let _ = &macro_args;
 
     let attrs = &item.attrs;
     let vis = &item.vis;

@@ -1,0 +1,11 @@
+error: unknown argument, expected `yield` or `resume`
+ --> tests/compile_fail/bad_attr_args.rs:1:22
+  |
+1 | #[baregen::coroutine(banana = i32)]
+  |                      ^^^^^^
+
+error: duplicate `yield` argument
+ --> tests/compile_fail/bad_attr_args.rs:4:35
+  |
+4 | #[baregen::coroutine(yield = i32, yield = u32)]
+  |                                   ^^^^^

@@ -4,7 +4,9 @@
 
 use proc_macro::TokenStream;
 
+mod args;
 mod expand;
+mod parse;
 
 /// Transforms a function into a coroutine state machine.
 ///

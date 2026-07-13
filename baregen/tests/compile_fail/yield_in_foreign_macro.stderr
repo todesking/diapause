@@ -1,0 +1,5 @@
+error: yield_! cannot appear inside another macro invocation
+ --> tests/compile_fail/yield_in_foreign_macro.rs:3:5
+  |
+3 |     println!("{}", yield_!(1));
+  |     ^^^^^^^
