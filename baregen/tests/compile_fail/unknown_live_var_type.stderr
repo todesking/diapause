@@ -1,0 +1,11 @@
+error: cannot determine the type of `x`, which is held across yield_!; write an explicit type annotation: `let x: Type = ...`
+ --> tests/compile_fail/unknown_live_var_type.rs:7:9
+  |
+7 |     let x = compute();
+  |         ^
+
+error: cannot determine the type of `unsuffixed`, which is held across yield_!; write an explicit type annotation: `let unsuffixed: Type = ...`
+ --> tests/compile_fail/unknown_live_var_type.rs:8:9
+  |
+8 |     let unsuffixed = 1;
+  |         ^^^^^^^^^^

@@ -37,20 +37,37 @@ pub fn live_states(
 ) -> syn::Result<Vec<Vec<StateField>>> {
     let n = ir.yields.len();
 
+    // env: name -> known type at the current point in program order.
+    // Used for move propagation (`let y = x;` copies x's type).
+    let mut env: HashMap<String, syn::Type> = args
+        .iter()
+        .filter_map(|a| a.ty.clone().map(|ty| (a.ident.to_string(), ty)))
+        .collect();
+
     let mut defs: Vec<Vec<VarDef>> = vec![Vec::new(); n + 1];
     defs[0].extend(args.iter().cloned());
     for (k, seg) in ir.segments.iter().enumerate() {
         if k > 0
             && let Some(rb) = &ir.yields[k - 1].resume_binding
         {
+            let ty = rb.ty.clone().unwrap_or_else(|| resume_ty.clone());
+            env.insert(rb.ident.to_string(), ty.clone());
             defs[k].push(VarDef {
                 ident: rb.ident.clone(),
                 mutability: rb.mutability,
-                ty: Some(rb.ty.clone().unwrap_or_else(|| resume_ty.clone())),
+                ty: Some(ty),
             });
         }
         for stmt in &seg.stmts {
-            collect_let_defs(stmt, &mut defs[k]);
+            let before = defs[k].len();
+            collect_let_defs(stmt, &mut defs[k], &env);
+            for d in &defs[k][before..] {
+                match &d.ty {
+                    Some(ty) => env.insert(d.ident.to_string(), ty.clone()),
+                    // A def of unknown type shadows any earlier known one.
+                    None => env.remove(&d.ident.to_string()),
+                };
+            }
         }
     }
 
@@ -125,16 +142,24 @@ pub fn live_states(
     }
 }
 
-/// Records the variables bound by a `let` statement.
-fn collect_let_defs(stmt: &syn::Stmt, out: &mut Vec<VarDef>) {
+/// Records the variables bound by a `let` statement, determining their
+/// types where possible: explicit annotation, literal suffix, or move
+/// propagation from a variable of known type.
+fn collect_let_defs(stmt: &syn::Stmt, out: &mut Vec<VarDef>, env: &HashMap<String, syn::Type>) {
     let syn::Stmt::Local(local) = stmt else {
         return;
+    };
+    let init_ty = || {
+        local
+            .init
+            .as_ref()
+            .and_then(|init| infer_expr_ty(&init.expr, env))
     };
     match &local.pat {
         syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => out.push(VarDef {
             ident: pi.ident.clone(),
             mutability: pi.mutability,
-            ty: None,
+            ty: init_ty(),
         }),
         syn::Pat::Type(pt) => match &*pt.pat {
             syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
@@ -147,6 +172,48 @@ fn collect_let_defs(stmt: &syn::Stmt, out: &mut Vec<VarDef>) {
             other => collect_pat_idents(other, out),
         },
         other => collect_pat_idents(other, out),
+    }
+}
+
+/// Syntactic type inference for an initializer expression.
+fn infer_expr_ty(expr: &syn::Expr, env: &HashMap<String, syn::Type>) -> Option<syn::Type> {
+    match expr {
+        syn::Expr::Paren(p) => infer_expr_ty(&p.expr, env),
+        // Negation of a suffixed numeric literal keeps the literal's type.
+        syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => match &*u.expr {
+            syn::Expr::Lit(_) => infer_expr_ty(&u.expr, env),
+            _ => None,
+        },
+        syn::Expr::Lit(lit) => infer_lit_ty(&lit.lit),
+        // Move propagation: `let y = x;` where x's type is known.
+        syn::Expr::Path(p) if p.qself.is_none() => {
+            let ident = p.path.get_ident()?;
+            env.get(&ident.to_string()).cloned()
+        }
+        _ => None,
+    }
+}
+
+/// The manifest type of a literal: an explicit suffix (`123u8`, `1.5f32`)
+/// or an unambiguous literal kind (`true`, `'c'`, `b'x'`). Unsuffixed
+/// numeric literals are NOT given the i32/f64 default: the actual type
+/// may be inferred differently by rustc, and guessing wrong would surface
+/// as a confusing error in generated code.
+fn infer_lit_ty(lit: &syn::Lit) -> Option<syn::Type> {
+    let suffix_ty = |suffix: &str, span: proc_macro2::Span| -> Option<syn::Type> {
+        if suffix.is_empty() {
+            return None;
+        }
+        let ident = syn::Ident::new(suffix, span);
+        Some(syn::parse_quote!(#ident))
+    };
+    match lit {
+        syn::Lit::Int(i) => suffix_ty(i.suffix(), i.span()),
+        syn::Lit::Float(f) => suffix_ty(f.suffix(), f.span()),
+        syn::Lit::Bool(_) => Some(syn::parse_quote!(bool)),
+        syn::Lit::Char(_) => Some(syn::parse_quote!(char)),
+        syn::Lit::Byte(_) => Some(syn::parse_quote!(u8)),
+        _ => None,
     }
 }
 
@@ -291,6 +358,99 @@ mod tests {
         assert_eq!(field_names(&states[0]), ["x"]);
         let expected: syn::Type = parse_quote!(String);
         assert_eq!(states[0][0].ty, expected);
+    }
+
+    #[test]
+    fn literal_suffix_determines_type() {
+        let block: syn::Block = parse_quote!({
+            let a = 123u8;
+            let b = -1.5f32;
+            let c = true;
+            let d = 'x';
+            yield_!(1);
+            f(a, b, c, d);
+        });
+        let ir = parse_body(&block).unwrap();
+        let states = live_states(&[], &ir, &unit()).unwrap();
+        assert_eq!(field_names(&states[0]), ["a", "b", "c", "d"]);
+        let tys: Vec<syn::Type> =
+            vec![parse_quote!(u8), parse_quote!(f32), parse_quote!(bool), parse_quote!(char)];
+        for (f, ty) in states[0].iter().zip(&tys) {
+            assert_eq!(&f.ty, ty);
+        }
+    }
+
+    #[test]
+    fn unsuffixed_literal_is_not_inferred() {
+        let block: syn::Block = parse_quote!({
+            let a = 123;
+            yield_!(1);
+            f(a);
+        });
+        let ir = parse_body(&block).unwrap();
+        assert!(live_states(&[], &ir, &unit()).is_err());
+    }
+
+    #[test]
+    fn move_propagates_types() {
+        let block: syn::Block = parse_quote!({
+            let a: String = mk();
+            let b = a;
+            let c = b;
+            yield_!(1);
+            c
+        });
+        let ir = parse_body(&block).unwrap();
+        let states = live_states(&[], &ir, &unit()).unwrap();
+        assert_eq!(field_names(&states[0]), ["c"]);
+        let expected: syn::Type = parse_quote!(String);
+        assert_eq!(states[0][0].ty, expected);
+    }
+
+    #[test]
+    fn move_propagates_from_argument() {
+        let block: syn::Block = parse_quote!({
+            let y = x;
+            yield_!(1);
+            y
+        });
+        let ir = parse_body(&block).unwrap();
+        let arg = VarDef {
+            ident: parse_quote!(x),
+            mutability: None,
+            ty: Some(parse_quote!(u32)),
+        };
+        let states = live_states(&[arg], &ir, &unit()).unwrap();
+        let expected: syn::Type = parse_quote!(u32);
+        assert_eq!(states[0][0].ty, expected);
+    }
+
+    #[test]
+    fn move_propagates_across_yields() {
+        let block: syn::Block = parse_quote!({
+            let r = yield_!(1);
+            let s = r;
+            yield_!(2);
+            s
+        });
+        let ir = parse_body(&block).unwrap();
+        let resume_ty: syn::Type = parse_quote!(String);
+        let states = live_states(&[], &ir, &resume_ty).unwrap();
+        assert_eq!(field_names(&states[1]), ["s"]);
+        assert_eq!(states[1][0].ty, resume_ty);
+    }
+
+    #[test]
+    fn shadowing_by_unknown_type_stops_propagation() {
+        let block: syn::Block = parse_quote!({
+            let a: u32 = 1;
+            let a = mk();
+            let b = a;
+            yield_!(1);
+            b
+        });
+        let ir = parse_body(&block).unwrap();
+        assert!(live_states(&[], &ir, &unit()).is_err());
     }
 
     #[test]

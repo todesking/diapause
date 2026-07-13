@@ -83,6 +83,24 @@ fn panic_during_resume_poisons_the_state() {
     assert_eq!(msg, "Poisoned");
 }
 
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn inferred(seed: u64) -> u64 {
+    let a = 10u64;
+    let b = a;
+    let carry = yield_!(1);
+    let c = carry;
+    yield_!(2);
+    seed + b + (c as u64)
+}
+
+#[test]
+fn types_are_inferred_without_annotations() {
+    let mut c = inferred(1000);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(7), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(0), CoroutineState::Complete(1017));
+}
+
 #[test]
 #[should_panic(expected = "Not started")]
 fn resume_before_start_panics() {
