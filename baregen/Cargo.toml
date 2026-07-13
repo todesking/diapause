@@ -1,0 +1,10 @@
+[package]
+name = "baregen"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+baregen-macro = { path = "../baregen-macro" }
+
+[dev-dependencies]
+trybuild = "1"

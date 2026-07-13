@@ -1,6 +1,7 @@
-[package]
-name = "baregen"
+[workspace]
+resolver = "3"
+members = ["baregen", "baregen-macro"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
