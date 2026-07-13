@@ -246,10 +246,8 @@ fn tokens_contain_yield(tokens: proc_macro2::TokenStream) -> bool {
                     return true;
                 }
             }
-            proc_macro2::TokenTree::Group(g) => {
-                if tokens_contain_yield(g.stream()) {
-                    return true;
-                }
+            proc_macro2::TokenTree::Group(g) if tokens_contain_yield(g.stream()) => {
+                return true;
             }
             _ => {}
         }

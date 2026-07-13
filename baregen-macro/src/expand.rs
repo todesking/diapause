@@ -1,14 +1,9 @@
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 
+use crate::analyze::{self, StateField, VarDef};
 use crate::args::MacroArgs;
-use crate::parse;
-
-struct Arg {
-    ident: syn::Ident,
-    mutability: Option<syn::Token![mut]>,
-    ty: syn::Type,
-}
+use crate::parse::{self, CoroutineIr};
 
 pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> {
     let macro_args: MacroArgs = syn::parse2(attr)?;
@@ -16,37 +11,74 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     check_signature(&item.sig)?;
     let args = parse_args(&item.sig)?;
     let ir = parse::parse_body(&item.block)?;
-    if !ir.yields.is_empty() {
-        // Codegen for suspension points lands in task 04.
-        return Err(syn::Error::new_spanned(
-            &item.sig.ident,
-            "coroutines containing yield_! are not implemented yet",
-        ));
-    }
-    let _ = &macro_args;
+    let states = analyze::live_states(&args, &ir, &macro_args.resume_ty)?;
 
     let attrs = &item.attrs;
     let vis = &item.vis;
     let name = &item.sig.ident;
-    let body = &item.block;
-
+    let yield_ty = &macro_args.yield_ty;
+    let resume_ty = &macro_args.resume_ty;
     let ret_ty: syn::Type = match &item.sig.output {
         syn::ReturnType::Default => syn::parse_quote!(()),
         syn::ReturnType::Type(_, ty) => (**ty).clone(),
     };
 
+    let n = ir.yields.len();
+    let state_idents: Vec<syn::Ident> = (1..=n).map(|k| format_ident!("S{k}")).collect();
+
     let arg_ident: Vec<_> = args.iter().map(|a| &a.ident).collect();
-    let arg_ty: Vec<_> = args.iter().map(|a| &a.ty).collect();
-    // Field shorthand with the original binding mode: `mut a` rebinds the
-    // argument mutably when the state is unpacked in start().
+    let arg_ty: Vec<_> = args.iter().map(|a| a.ty.as_ref().unwrap()).collect();
+
+    let state_variants = states.iter().zip(&state_idents).map(|(fields, id)| {
+        let field_defs = fields.iter().map(|f| {
+            let ident = &f.ident;
+            let ty = &f.ty;
+            quote!(#ident: #ty)
+        });
+        quote!(#id { #(#field_defs),* })
+    });
+
+    // Without yields no transition can panic halfway, so Done doubles as
+    // the placeholder and Poisoned is omitted.
+    let (poisoned_variant, placeholder) = if n == 0 {
+        (quote!(), quote!(State::Done))
+    } else {
+        (quote!(Poisoned,), quote!(State::Poisoned))
+    };
+
+    let start_body = segment_code(&ir, &states, &state_idents, 0, yield_ty, &ret_ty);
     let arg_pat: Vec<_> = args
         .iter()
-        .map(|a| {
-            let mutability = &a.mutability;
-            let ident = &a.ident;
-            quote!(#mutability #ident)
-        })
+        .map(|a| bind_pat(&a.mutability, &a.ident))
         .collect();
+    let start_arm = quote! {
+        State::Start { #(#arg_pat),* } => {
+            #start_body
+        }
+    };
+
+    let resume_arms = (1..=n).map(|k| {
+        let state_ident = &state_idents[k - 1];
+        let field_pats: Vec<_> = states[k - 1]
+            .iter()
+            .map(|f| bind_pat(&f.mutability, &f.ident))
+            .collect();
+        let resume_stmt = ir.yields[k - 1].resume_binding.as_ref().map(|rb| {
+            let mutability = &rb.mutability;
+            let ident = &rb.ident;
+            let ty = rb.ty.as_ref().map(|ty| quote!(: #ty));
+            quote!(let #mutability #ident #ty = _resume;)
+        });
+        let body = segment_code(&ir, &states, &state_idents, k, yield_ty, &ret_ty);
+        quote! {
+            State::#state_ident { #(#field_pats),* } => {
+                #resume_stmt
+                #body
+            }
+        }
+    });
+
+    let poisoned_arm = (n > 0).then(|| quote!(State::Poisoned => ::core::panic!("Poisoned"),));
 
     Ok(quote! {
         #(#attrs)*
@@ -60,34 +92,78 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
 
             pub enum State {
                 Start { #(#arg_ident: #arg_ty),* },
+                #(#state_variants,)*
                 Done,
+                #poisoned_variant
             }
 
-            impl ::baregen::Coroutine<()> for State {
-                type Yield = ();
+            impl ::baregen::Coroutine<#resume_ty> for State {
+                type Yield = #yield_ty;
                 type Return = #ret_ty;
 
-                fn start(&mut self) -> ::baregen::CoroutineState<(), #ret_ty> {
+                #[allow(unused_mut)]
+                fn start(&mut self) -> ::baregen::CoroutineState<#yield_ty, #ret_ty> {
                     // Fields must be moved out through &mut self, so the
-                    // state is swapped for the terminal variant up front.
-                    match ::core::mem::replace(self, State::Done) {
-                        State::Start { #(#arg_pat),* } => {
-                            let __ret: #ret_ty = #body;
-                            ::baregen::CoroutineState::Complete(__ret)
-                        }
-                        State::Done => ::core::panic!("Already started"),
+                    // state is swapped for a placeholder up front.
+                    match ::core::mem::replace(self, #placeholder) {
+                        #start_arm
+                        _ => ::core::panic!("Already started"),
                     }
                 }
 
-                fn resume(&mut self, _resume: ()) -> ::baregen::CoroutineState<(), #ret_ty> {
-                    match self {
+                #[allow(unused_mut)]
+                fn resume(
+                    &mut self,
+                    _resume: #resume_ty,
+                ) -> ::baregen::CoroutineState<#yield_ty, #ret_ty> {
+                    match ::core::mem::replace(self, #placeholder) {
+                        #(#resume_arms)*
                         State::Start { .. } => ::core::panic!("Not started"),
                         State::Done => ::core::panic!("Already done"),
+                        #poisoned_arm
                     }
                 }
             }
         }
     })
+}
+
+/// Field shorthand with the original binding mode: `mut x` rebinds the
+/// stored variable mutably when the state is unpacked.
+fn bind_pat(mutability: &Option<syn::Token![mut]>, ident: &syn::Ident) -> TokenStream {
+    quote!(#mutability #ident)
+}
+
+/// Emits the code that runs segment `k` and either suspends at yield `k`
+/// or completes the coroutine.
+fn segment_code(
+    ir: &CoroutineIr,
+    states: &[Vec<StateField>],
+    state_idents: &[syn::Ident],
+    k: usize,
+    yield_ty: &syn::Type,
+    ret_ty: &syn::Type,
+) -> TokenStream {
+    let stmts = &ir.segments[k].stmts;
+    if k < ir.yields.len() {
+        let value = &ir.yields[k].value;
+        let next = &state_idents[k];
+        let field_idents = states[k].iter().map(|f| &f.ident);
+        // The yield value is evaluated before live variables are moved
+        // into the state, matching the original evaluation order.
+        quote! {
+            #(#stmts)*
+            let __yielded: #yield_ty = #value;
+            *self = State::#next { #(#field_idents),* };
+            ::baregen::CoroutineState::Yielded(__yielded)
+        }
+    } else {
+        quote! {
+            let __ret: #ret_ty = { #(#stmts)* };
+            *self = State::Done;
+            ::baregen::CoroutineState::Complete(__ret)
+        }
+    }
 }
 
 fn check_signature(sig: &syn::Signature) -> syn::Result<()> {
@@ -121,7 +197,7 @@ fn check_signature(sig: &syn::Signature) -> syn::Result<()> {
     Ok(())
 }
 
-fn parse_args(sig: &syn::Signature) -> syn::Result<Vec<Arg>> {
+fn parse_args(sig: &syn::Signature) -> syn::Result<Vec<VarDef>> {
     sig.inputs
         .iter()
         .map(|input| {
@@ -141,10 +217,10 @@ fn parse_args(sig: &syn::Signature) -> syn::Result<Vec<Arg>> {
                 ));
             }
             match &*pat_type.pat {
-                syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => Ok(Arg {
+                syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => Ok(VarDef {
                     ident: pi.ident.clone(),
                     mutability: pi.mutability,
-                    ty: (*pat_type.ty).clone(),
+                    ty: Some((*pat_type.ty).clone()),
                 }),
                 other => Err(syn::Error::new_spanned(
                     other,

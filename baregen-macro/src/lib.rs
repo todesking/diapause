@@ -4,6 +4,7 @@
 
 use proc_macro::TokenStream;
 
+mod analyze;
 mod args;
 mod expand;
 mod parse;
