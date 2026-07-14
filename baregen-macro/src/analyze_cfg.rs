@@ -1,0 +1,1090 @@
+//! CFG-based liveness analysis, type determination, and borrow
+//! reconstruction (v2 pipeline). Consumes the CFG built by `lower.rs`
+//! and replaces `analyze.rs` when the pipeline switches (task 13).
+//!
+//! Every block that is not inlined into its predecessor's arm becomes a
+//! state-enum variant; its fields are the bindings live at its entry.
+//! Direct borrows never enter a variant: their uses are attributed to
+//! the borrowed binding instead, and the borrow is re-established at the
+//! head of every arm (region) that uses it outside its defining region.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use syn::visit::Visit;
+
+use crate::lower::{
+    BindingId, BindingKind, BlockId, BorrowSource, Cfg, PatBindingCollector, Terminator, TySource,
+    UseCollector,
+};
+
+/// Signature-level information about one function argument, parallel to
+/// `BindingId(0)..BindingId(args.len())`.
+#[derive(Debug)]
+pub struct ArgInfo {
+    pub mutability: Option<syn::Token![mut]>,
+    pub ty: syn::Type,
+}
+
+/// A field of a state variant.
+#[derive(Debug)]
+pub struct StateField {
+    pub binding: BindingId,
+    pub ident: syn::Ident,
+    pub mutability: Option<syn::Token![mut]>,
+    pub ty: syn::Type,
+}
+
+/// A direct borrow to re-establish at the head of a block's arm, before
+/// its statements run.
+#[derive(Debug)]
+pub struct Reborrow {
+    pub target: syn::Ident,
+    pub target_mut: Option<syn::Token![mut]>,
+    pub source: syn::Ident,
+    pub mutable: bool,
+}
+
+#[derive(Debug)]
+pub struct Analysis {
+    /// Indexed by `BlockId`: `Some(fields)` for blocks that become enum
+    /// variants (non-inline blocks, including the entry), `None` for
+    /// blocks emitted inline in their predecessor's arm.
+    pub variant_fields: Vec<Option<Vec<StateField>>>,
+    /// Indexed by `BlockId`: borrows to rebuild at the head of this
+    /// block's arm. Non-empty only for non-inline blocks, in definition
+    /// order (chains rebuild sources before their dependents).
+    pub reborrows: Vec<Vec<Reborrow>>,
+    /// Indexed by `BlockId`: statement indices to omit from codegen
+    /// (original borrow `let`s whose binding is only used in other arms).
+    pub removed_stmts: Vec<BTreeSet<usize>>,
+    /// Indexed by `BlockId`: bindings live at block entry, after borrow
+    /// substitution.
+    pub live_in: Vec<BTreeSet<BindingId>>,
+}
+
+/// Analyzes a lowered coroutine CFG. `args` describes the function
+/// arguments (`BindingId(0)..`); `resume_ty` is the default type of
+/// resume bindings.
+pub fn analyze(cfg: &Cfg, args: &[ArgInfo], resume_ty: &syn::Type) -> syn::Result<Analysis> {
+    let cx = Context::new(cfg, args, resume_ty);
+    cx.run()
+}
+
+struct Context<'a> {
+    cfg: &'a Cfg,
+    args: &'a [ArgInfo],
+    resume_ty: &'a syn::Type,
+    /// The root of each block's region: the non-inline block whose arm
+    /// textually contains it.
+    region: Vec<BlockId>,
+    /// The block whose entry defines each binding; `None` for arguments
+    /// (in scope from entry) and bindings in removed unreachable blocks.
+    def_block: Vec<Option<BlockId>>,
+    errors: Option<syn::Error>,
+}
+
+impl<'a> Context<'a> {
+    fn new(cfg: &'a Cfg, args: &'a [ArgInfo], resume_ty: &'a syn::Type) -> Self {
+        Context {
+            cfg,
+            args,
+            resume_ty,
+            region: region_roots(cfg),
+            def_block: def_blocks(cfg),
+            errors: None,
+        }
+    }
+
+    fn err(&mut self, span: proc_macro2::Span, msg: String) {
+        let e = syn::Error::new(span, msg);
+        match &mut self.errors {
+            Some(prev) => prev.combine(e),
+            None => self.errors = Some(e),
+        }
+    }
+
+    fn run(mut self) -> syn::Result<Analysis> {
+        let (uses, rebuilds) = self.substitute_borrows();
+        let live_in = self.liveness(&uses);
+        let removed_stmts = self.removed_statements(&rebuilds);
+        let variant_fields = self.check_and_build_fields(&live_in, &rebuilds);
+        let reborrows = self.build_reborrows(&rebuilds);
+        match self.errors {
+            Some(e) => Err(e),
+            None => Ok(Analysis {
+                variant_fields,
+                reborrows,
+                removed_stmts,
+                live_in,
+            }),
+        }
+    }
+}
+
+// === Borrow substitution and liveness ===
+
+impl Context<'_> {
+    /// Rewrites the per-block use sets so that a use of a direct-borrow
+    /// binding outside its defining region counts as a use of the
+    /// borrowed binding, and records the borrow for rebuilding at the
+    /// using region's root. Iterates to a fixed point to resolve borrow
+    /// chains (`let y = &x; let z = &y;`).
+    fn substitute_borrows(&self) -> (Vec<BTreeSet<BindingId>>, Vec<BTreeSet<BindingId>>) {
+        let mut uses: Vec<BTreeSet<BindingId>> =
+            self.cfg.blocks.iter().map(|b| b.uses.clone()).collect();
+        let mut rebuilds: Vec<BTreeSet<BindingId>> =
+            vec![BTreeSet::new(); self.cfg.blocks.len()];
+        loop {
+            let mut changed = false;
+            for (b, block_uses) in uses.iter_mut().enumerate() {
+                let root = self.region[b];
+                let foreign: Vec<BindingId> = block_uses
+                    .iter()
+                    .copied()
+                    .filter(|id| self.is_foreign_borrow(*id, root))
+                    .collect();
+                for t in foreign {
+                    block_uses.remove(&t);
+                    rebuilds[root].insert(t);
+                    let BorrowSource::Direct { source, .. } = &self.cfg.bindings[t.0].borrow
+                    else {
+                        unreachable!()
+                    };
+                    if let Some(s) = source {
+                        block_uses.insert(*s);
+                    }
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        (uses, rebuilds)
+    }
+
+    /// A direct borrow defined in a different region than `root`: its
+    /// original `let` is not in scope in `root`'s arm.
+    fn is_foreign_borrow(&self, id: BindingId, root: BlockId) -> bool {
+        matches!(
+            self.cfg.bindings[id.0].borrow,
+            BorrowSource::Direct { .. }
+        ) && matches!(self.def_block[id.0], Some(d) if self.region[d] != root)
+    }
+
+    /// Standard backward dataflow to a fixed point (the CFG has back
+    /// edges): `live_in(B) = use(B) ∪ (∪ live_in(succ) ∖ def(B))`.
+    fn liveness(&self, uses: &[BTreeSet<BindingId>]) -> Vec<BTreeSet<BindingId>> {
+        let n = self.cfg.blocks.len();
+        let mut live_in: Vec<BTreeSet<BindingId>> = vec![BTreeSet::new(); n];
+        loop {
+            let mut changed = false;
+            for b in (0..n).rev() {
+                let mut set = BTreeSet::new();
+                for s in self.cfg.blocks[b].terminator.successors() {
+                    set.extend(live_in[s].iter().copied());
+                }
+                for d in &self.cfg.blocks[b].defs {
+                    set.remove(d);
+                }
+                set.extend(uses[b].iter().copied());
+                if set != live_in[b] {
+                    live_in[b] = set;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        live_in
+    }
+
+    /// Original borrow `let`s to omit: a rebuilt borrow's defining
+    /// statement is dropped unless the binding is still used within its
+    /// own region after the definition (borrows have no side effects).
+    fn removed_statements(&self, rebuilds: &[BTreeSet<BindingId>]) -> Vec<BTreeSet<usize>> {
+        let def_stmt = self.def_stmt_indices();
+        let mut out: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); self.cfg.blocks.len()];
+        let crossed: BTreeSet<BindingId> = rebuilds.iter().flatten().copied().collect();
+        for t in crossed {
+            let (Some(d), Some(i)) = (self.def_block[t.0], def_stmt[t.0]) else {
+                continue;
+            };
+            let name = self.cfg.bindings[t.0].ident.to_string();
+            // Scan the rest of the defining block by name (conservative:
+            // a same-named use keeps the statement, which is harmless).
+            let mut c = UseCollector::default();
+            for stmt in &self.cfg.blocks[d].stmts[i + 1..] {
+                c.visit_stmt(stmt);
+            }
+            for e in terminator_exprs(&self.cfg.blocks[d].terminator) {
+                c.visit_expr(e);
+            }
+            let used_later = c.used.contains(&name)
+                || self.cfg.blocks.iter().enumerate().any(|(b, blk)| {
+                    b != d && self.region[b] == self.region[d] && blk.uses.contains(&t)
+                });
+            if !used_later {
+                out[d].insert(i);
+            }
+        }
+        out
+    }
+
+    /// Maps each `let`-bound binding to its defining statement index.
+    /// Within one block, `let` definitions of a name occur in statement
+    /// order and BindingId order, so a per-name queue matches them up.
+    fn def_stmt_indices(&self) -> Vec<Option<usize>> {
+        let mut out = vec![None; self.cfg.bindings.len()];
+        for block in &self.cfg.blocks {
+            let mut queues: BTreeMap<String, VecDeque<BindingId>> = BTreeMap::new();
+            for id in &block.defs {
+                let b = &self.cfg.bindings[id.0];
+                if b.kind == BindingKind::Local {
+                    queues.entry(b.ident.to_string()).or_default().push_back(*id);
+                }
+            }
+            for (i, stmt) in block.stmts.iter().enumerate() {
+                let syn::Stmt::Local(local) = stmt else {
+                    continue;
+                };
+                let mut c = PatBindingCollector::default();
+                c.visit_pat(&local.pat);
+                for (ident, _) in c.bindings {
+                    if let Some(id) = queues
+                        .get_mut(&ident.to_string())
+                        .and_then(VecDeque::pop_front)
+                    {
+                        out[id.0] = Some(i);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn build_reborrows(&self, rebuilds: &[BTreeSet<BindingId>]) -> Vec<Vec<Reborrow>> {
+        rebuilds
+            .iter()
+            .map(|set| {
+                set.iter()
+                    .map(|t| {
+                        let b = &self.cfg.bindings[t.0];
+                        let BorrowSource::Direct {
+                            source_ident,
+                            mutable,
+                            ..
+                        } = &b.borrow
+                        else {
+                            unreachable!("BUG: rebuild of a non-borrow binding")
+                        };
+                        Reborrow {
+                            target: b.ident.clone(),
+                            target_mut: b.mutability,
+                            source: source_ident.clone(),
+                            mutable: *mutable,
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
+// === Variant fields, type determination, and errors ===
+
+impl Context<'_> {
+    fn check_and_build_fields(
+        &mut self,
+        live_in: &[BTreeSet<BindingId>],
+        rebuilds: &[BTreeSet<BindingId>],
+    ) -> Vec<Option<Vec<StateField>>> {
+        // Bindings whose mutable borrow is rebuilt in some arm must be
+        // unpacked `mut` so the reborrow can take `&mut`.
+        let forced_mut: BTreeSet<BindingId> = rebuilds
+            .iter()
+            .flatten()
+            .filter_map(|t| match &self.cfg.bindings[t.0].borrow {
+                BorrowSource::Direct {
+                    source: Some(s),
+                    mutable: true,
+                    ..
+                } => Some(*s),
+                _ => None,
+            })
+            .collect();
+
+        let mut reported: BTreeSet<BindingId> = BTreeSet::new();
+        let mut collisions: BTreeSet<(BindingId, BindingId)> = BTreeSet::new();
+        let mut variant_fields = Vec::with_capacity(self.cfg.blocks.len());
+        for (b, block) in self.cfg.blocks.iter().enumerate() {
+            if block.inline {
+                variant_fields.push(None);
+                continue;
+            }
+            self.check_name_collisions(&live_in[b], &mut collisions);
+            let mut fields = Vec::new();
+            for id in &live_in[b] {
+                let binding = &self.cfg.bindings[id.0];
+                let name = binding.ident.to_string();
+                match &binding.borrow {
+                    // Substituted by its source during liveness.
+                    BorrowSource::Direct { .. } => {
+                        debug_assert!(
+                            self.def_block[id.0].is_none(),
+                            "BUG: direct borrow live at a variant entry"
+                        );
+                        continue;
+                    }
+                    BorrowSource::NonReconstructible { why } => {
+                        if reported.insert(*id) {
+                            self.err(binding.ident.span(), format!("`{name}` {why}"));
+                        }
+                        continue;
+                    }
+                    BorrowSource::NotABorrow => {}
+                }
+                if binding.kind == BindingKind::ArmPat {
+                    if reported.insert(*id) {
+                        self.err(
+                            binding.ident.span(),
+                            format!(
+                                "`{name}` is bound by a match arm pattern and must be stored \
+                                 across a state boundary, but arm patterns cannot be annotated \
+                                 with a type; rebind it at the top of the arm: \
+                                 `let {name}2: Type = {name};`"
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                match self.resolve_binding_ty(*id) {
+                    Some(ty) => {
+                        let base = if binding.kind == BindingKind::Arg {
+                            self.args[id.0].mutability
+                        } else {
+                            binding.mutability
+                        };
+                        let forced = forced_mut
+                            .contains(id)
+                            .then(|| syn::Token![mut](binding.ident.span()));
+                        fields.push(StateField {
+                            binding: *id,
+                            ident: binding.ident.clone(),
+                            mutability: base.or(forced),
+                            ty,
+                        });
+                    }
+                    None => {
+                        if reported.insert(*id) {
+                            self.err(
+                                binding.ident.span(),
+                                format!(
+                                    "cannot determine the type of `{name}`, which is held across \
+                                     yield_!; write an explicit type annotation: \
+                                     `let {name}: Type = ...`"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            variant_fields.push(Some(fields));
+        }
+        variant_fields
+    }
+
+    /// Two distinct bindings with the same name live at the same variant
+    /// entry (shadowing where the shadowed binding — often a borrow
+    /// source — is still in use) cannot both become fields.
+    fn check_name_collisions(
+        &mut self,
+        live: &BTreeSet<BindingId>,
+        reported: &mut BTreeSet<(BindingId, BindingId)>,
+    ) {
+        let mut by_name: BTreeMap<String, BindingId> = BTreeMap::new();
+        for id in live {
+            let ident = self.cfg.bindings[id.0].ident.clone();
+            if let Some(prev) = by_name.insert(ident.to_string(), *id)
+                && reported.insert((prev, *id))
+            {
+                self.err(
+                    ident.span(),
+                    format!(
+                        "two different bindings named `{ident}` are alive at the same \
+                         suspension point (the shadowed one is still in use, possibly as the \
+                         source of a reconstructed borrow); rename one of them"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// The type of a binding: signature type for arguments, the resume
+    /// type for unannotated resume bindings, otherwise the recursively
+    /// resolved syntactic type source. Move dependencies always point at
+    /// earlier bindings, so the recursion terminates.
+    fn resolve_binding_ty(&self, id: BindingId) -> Option<syn::Type> {
+        let binding = &self.cfg.bindings[id.0];
+        match binding.kind {
+            BindingKind::Arg => return Some(self.args[id.0].ty.clone()),
+            BindingKind::Resume if matches!(binding.ty, TySource::Unknown) => {
+                return Some(self.resume_ty.clone());
+            }
+            _ => {}
+        }
+        self.resolve_ty_source(&binding.ty)
+    }
+
+    fn resolve_ty_source(&self, src: &TySource) -> Option<syn::Type> {
+        match src {
+            TySource::Unknown => None,
+            TySource::Known(t) => Some(t.clone()),
+            TySource::Moved(id) => self.resolve_binding_ty(*id),
+            TySource::Range {
+                inclusive,
+                start,
+                end,
+            } => {
+                let t = self
+                    .resolve_ty_source(start)
+                    .or_else(|| self.resolve_ty_source(end))?;
+                Some(if *inclusive {
+                    syn::parse_quote!(::core::ops::RangeInclusive<#t>)
+                } else {
+                    syn::parse_quote!(::core::ops::Range<#t>)
+                })
+            }
+        }
+    }
+}
+
+/// Computes each block's region root by walking the unique-predecessor
+/// chain of inline blocks. Inline blocks always have exactly one
+/// predecessor and cannot form cycles (a cycle of single-predecessor
+/// blocks would be unreachable and already removed).
+fn region_roots(cfg: &Cfg) -> Vec<BlockId> {
+    let mut pred = vec![usize::MAX; cfg.blocks.len()];
+    for (b, blk) in cfg.blocks.iter().enumerate() {
+        for s in blk.terminator.successors() {
+            pred[s] = b;
+        }
+    }
+    (0..cfg.blocks.len())
+        .map(|mut b| {
+            while cfg.blocks[b].inline {
+                b = pred[b];
+            }
+            b
+        })
+        .collect()
+}
+
+fn def_blocks(cfg: &Cfg) -> Vec<Option<BlockId>> {
+    let mut out = vec![None; cfg.bindings.len()];
+    for (b, blk) in cfg.blocks.iter().enumerate() {
+        for id in &blk.defs {
+            out[id.0] = Some(b);
+        }
+    }
+    out
+}
+
+/// The expressions a terminator evaluates in its own block (before any
+/// transition), for statement-level use scans.
+fn terminator_exprs(t: &Terminator) -> Vec<&syn::Expr> {
+    match t {
+        Terminator::Goto(_) => Vec::new(),
+        Terminator::Branch { cond, .. } => vec![cond],
+        Terminator::Match { scrutinee, arms } => std::iter::once(scrutinee)
+            .chain(arms.iter().filter_map(|a| a.guard.as_ref()))
+            .collect(),
+        Terminator::Yield { value, .. } => vec![value],
+        Terminator::IterNext { .. } => Vec::new(),
+        Terminator::Return(e) => vec![e],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lower::lower;
+    use syn::parse_quote;
+
+    fn unit() -> syn::Type {
+        parse_quote!(())
+    }
+
+    fn lower_analyze(
+        args: &[(&str, &str)],
+        block: &syn::Block,
+        resume_ty: &syn::Type,
+    ) -> (Cfg, syn::Result<Analysis>) {
+        let idents: Vec<syn::Ident> = args
+            .iter()
+            .map(|(n, _)| syn::Ident::new(n, proc_macro2::Span::call_site()))
+            .collect();
+        let infos: Vec<ArgInfo> = args
+            .iter()
+            .map(|(_, t)| ArgInfo {
+                mutability: None,
+                ty: syn::parse_str(t).unwrap(),
+            })
+            .collect();
+        let cfg = lower(&idents, block).unwrap();
+        let result = analyze(&cfg, &infos, resume_ty);
+        (cfg, result)
+    }
+
+    fn run_args(
+        args: &[(&str, &str)],
+        block: &syn::Block,
+        resume_ty: &syn::Type,
+    ) -> (Cfg, Analysis) {
+        let (cfg, result) = lower_analyze(args, block, resume_ty);
+        (cfg, result.unwrap())
+    }
+
+    fn run(block: &syn::Block) -> (Cfg, Analysis) {
+        run_args(&[], block, &unit())
+    }
+
+    fn error_of(block: &syn::Block) -> syn::Error {
+        lower_analyze(&[], block, &unit()).1.unwrap_err()
+    }
+
+    /// Resume-point blocks in yield order (v1's `S1..Sn`).
+    fn resume_ids(cfg: &Cfg) -> Vec<BlockId> {
+        (0..cfg.blocks.len())
+            .filter(|b| cfg.blocks[*b].resume_point)
+            .collect()
+    }
+
+    /// Field names of the variant for `block`, in field order.
+    fn field_names(a: &Analysis, block: BlockId) -> Vec<String> {
+        a.variant_fields[block]
+            .as_ref()
+            .expect("expected a variant block")
+            .iter()
+            .map(|f| f.ident.to_string())
+            .collect()
+    }
+
+    fn field<'a>(a: &'a Analysis, block: BlockId, name: &str) -> &'a StateField {
+        a.variant_fields[block]
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|f| f.ident == name)
+            .unwrap_or_else(|| panic!("no field `{name}` in block {block}"))
+    }
+
+    /// Fields of the k-th resume variant (v1's `states[k]`).
+    fn resume_fields(cfg: &Cfg, a: &Analysis, k: usize) -> Vec<String> {
+        field_names(a, resume_ids(cfg)[k])
+    }
+
+    // === Ported from v1 analyze.rs ===
+
+    #[test]
+    fn unused_vars_are_not_stored() {
+        let block: syn::Block = parse_quote!({
+            let a: i32 = 1;
+            let b: i32 = 2;
+            yield_!(1);
+            a
+        });
+        let (cfg, a) = run(&block);
+        assert_eq!(resume_ids(&cfg).len(), 1);
+        assert_eq!(resume_fields(&cfg, &a, 0), ["a"]);
+    }
+
+    #[test]
+    fn args_live_across_yields() {
+        let block: syn::Block = parse_quote!({
+            yield_!(1);
+            yield_!(2);
+            x
+        });
+        let (cfg, a) = run_args(&[("x", "u32")], &block, &unit());
+        assert_eq!(resume_fields(&cfg, &a, 0), ["x"]);
+        assert_eq!(resume_fields(&cfg, &a, 1), ["x"]);
+        let expected: syn::Type = parse_quote!(u32);
+        assert_eq!(field(&a, resume_ids(&cfg)[0], "x").ty, expected);
+    }
+
+    #[test]
+    fn yield_value_use_does_not_keep_var_alive() {
+        // `a` is consumed by the first yield's value expression, which is
+        // evaluated before the transition, so S1 must not store it.
+        let block: syn::Block = parse_quote!({
+            let a: i32 = 1;
+            yield_!(a);
+        });
+        let (cfg, a) = run(&block);
+        assert!(resume_fields(&cfg, &a, 0).is_empty());
+    }
+
+    #[test]
+    fn resume_binding_defaults_to_resume_type() {
+        let block: syn::Block = parse_quote!({
+            let r = yield_!(1);
+            yield_!(2);
+            r
+        });
+        let resume_ty: syn::Type = parse_quote!(String);
+        let (cfg, a) = run_args(&[], &block, &resume_ty);
+        assert!(resume_fields(&cfg, &a, 0).is_empty());
+        assert_eq!(resume_fields(&cfg, &a, 1), ["r"]);
+        assert_eq!(field(&a, resume_ids(&cfg)[1], "r").ty, resume_ty);
+    }
+
+    #[test]
+    fn shadowing_last_def_wins() {
+        let block: syn::Block = parse_quote!({
+            let x: i32 = 1;
+            let x: String = format!("{x}");
+            yield_!(1);
+            x
+        });
+        let (cfg, a) = run(&block);
+        assert_eq!(resume_fields(&cfg, &a, 0), ["x"]);
+        let expected: syn::Type = parse_quote!(String);
+        assert_eq!(field(&a, resume_ids(&cfg)[0], "x").ty, expected);
+    }
+
+    #[test]
+    fn literal_suffix_determines_type() {
+        let block: syn::Block = parse_quote!({
+            let a = 123u8;
+            let b = -1.5f32;
+            let c = true;
+            let d = 'x';
+            yield_!(1);
+            f(a, b, c, d);
+        });
+        let (cfg, a) = run(&block);
+        assert_eq!(resume_fields(&cfg, &a, 0), ["a", "b", "c", "d"]);
+        let tys: Vec<syn::Type> = vec![
+            parse_quote!(u8),
+            parse_quote!(f32),
+            parse_quote!(bool),
+            parse_quote!(char),
+        ];
+        let fields = a.variant_fields[resume_ids(&cfg)[0]].as_ref().unwrap();
+        for (f, ty) in fields.iter().zip(&tys) {
+            assert_eq!(&f.ty, ty);
+        }
+    }
+
+    #[test]
+    fn unsuffixed_literal_is_not_inferred() {
+        let block: syn::Block = parse_quote!({
+            let a = 123;
+            yield_!(1);
+            f(a);
+        });
+        assert!(error_of(&block).to_string().contains("type annotation"));
+    }
+
+    #[test]
+    fn move_propagates_types() {
+        let block: syn::Block = parse_quote!({
+            let a: String = mk();
+            let b = a;
+            let c = b;
+            yield_!(1);
+            c
+        });
+        let (cfg, a) = run(&block);
+        assert_eq!(resume_fields(&cfg, &a, 0), ["c"]);
+        let expected: syn::Type = parse_quote!(String);
+        assert_eq!(field(&a, resume_ids(&cfg)[0], "c").ty, expected);
+    }
+
+    #[test]
+    fn move_propagates_from_argument() {
+        let block: syn::Block = parse_quote!({
+            let y = x;
+            yield_!(1);
+            y
+        });
+        let (cfg, a) = run_args(&[("x", "u32")], &block, &unit());
+        let expected: syn::Type = parse_quote!(u32);
+        assert_eq!(field(&a, resume_ids(&cfg)[0], "y").ty, expected);
+    }
+
+    #[test]
+    fn move_propagates_across_yields() {
+        let block: syn::Block = parse_quote!({
+            let r = yield_!(1);
+            let s = r;
+            yield_!(2);
+            s
+        });
+        let resume_ty: syn::Type = parse_quote!(String);
+        let (cfg, a) = run_args(&[], &block, &resume_ty);
+        assert_eq!(resume_fields(&cfg, &a, 1), ["s"]);
+        assert_eq!(field(&a, resume_ids(&cfg)[1], "s").ty, resume_ty);
+    }
+
+    #[test]
+    fn shadowing_by_unknown_type_stops_propagation() {
+        let block: syn::Block = parse_quote!({
+            let a: u32 = 1;
+            let a = mk();
+            let b = a;
+            yield_!(1);
+            b
+        });
+        assert!(error_of(&block).to_string().contains("type annotation"));
+    }
+
+    #[test]
+    fn unknown_type_is_an_error() {
+        let block: syn::Block = parse_quote!({
+            let x = compute();
+            yield_!(1);
+            x
+        });
+        assert!(error_of(&block).to_string().contains("type annotation"));
+    }
+
+    #[test]
+    fn macro_tokens_count_as_uses() {
+        let block: syn::Block = parse_quote!({
+            let a: i32 = 1;
+            yield_!(1);
+            println!("{}", a);
+        });
+        let (cfg, a) = run(&block);
+        assert_eq!(resume_fields(&cfg, &a, 0), ["a"]);
+    }
+
+    #[test]
+    fn borrow_target_is_replaced_by_its_source() {
+        let block: syn::Block = parse_quote!({
+            let mut x: i32 = 1;
+            let y = &mut x;
+            yield_!(1);
+            *y += 1;
+        });
+        let (cfg, a) = run(&block);
+        let s1 = resume_ids(&cfg)[0];
+        // y is reconstructed, x is stored (bound mutably for the reborrow)
+        assert_eq!(field_names(&a, s1), ["x"]);
+        assert!(field(&a, s1, "x").mutability.is_some());
+        assert_eq!(a.reborrows[s1].len(), 1);
+        assert_eq!(a.reborrows[s1][0].target, "y");
+        assert_eq!(a.reborrows[s1][0].source, "x");
+        assert!(a.reborrows[s1][0].mutable);
+        // the original `let y = &mut x;` (stmt 1 of the entry) is dropped
+        assert!(a.removed_stmts[cfg.entry].contains(&1));
+    }
+
+    #[test]
+    fn borrow_used_before_yield_keeps_original_stmt() {
+        let block: syn::Block = parse_quote!({
+            let mut x: i32 = 1;
+            let y = &mut x;
+            *y += 1;
+            yield_!(1);
+            *y += 1;
+        });
+        let (cfg, a) = run(&block);
+        assert!(a.removed_stmts[cfg.entry].is_empty());
+        assert_eq!(a.reborrows[resume_ids(&cfg)[0]].len(), 1);
+    }
+
+    #[test]
+    fn shared_borrow_does_not_force_mut() {
+        let block: syn::Block = parse_quote!({
+            let x: String = mk();
+            let y = &x;
+            yield_!(1);
+            y.len()
+        });
+        let (cfg, a) = run(&block);
+        let s1 = resume_ids(&cfg)[0];
+        assert_eq!(field_names(&a, s1), ["x"]);
+        assert!(field(&a, s1, "x").mutability.is_none());
+        assert!(!a.reborrows[s1][0].mutable);
+    }
+
+    #[test]
+    fn borrow_chain_reborrows_in_definition_order() {
+        let block: syn::Block = parse_quote!({
+            let x: i32 = 1;
+            let y = &x;
+            let z = &y;
+            yield_!(1);
+            f(z);
+        });
+        let (cfg, a) = run(&block);
+        let s1 = resume_ids(&cfg)[0];
+        assert_eq!(field_names(&a, s1), ["x"]);
+        let order: Vec<_> = a.reborrows[s1]
+            .iter()
+            .map(|r| r.target.to_string())
+            .collect();
+        assert_eq!(order, ["y", "z"]);
+        // `let z = &y;` is dropped; `let y = &x;` stays because z's
+        // original statement scan still sees a use of y (as in v1).
+        assert_eq!(a.removed_stmts[cfg.entry], BTreeSet::from([2]));
+    }
+
+    #[test]
+    fn complex_borrow_across_yield_is_an_error() {
+        let block: syn::Block = parse_quote!({
+            let y = &x.field;
+            yield_!(1);
+            f(y);
+        });
+        assert!(error_of(&block).to_string().contains("non-trivial place"));
+    }
+
+    #[test]
+    fn reference_typed_non_borrow_across_yield_is_an_error() {
+        let block: syn::Block = parse_quote!({
+            let y: &u32 = first(v);
+            yield_!(1);
+            f(y);
+        });
+        assert!(error_of(&block).to_string().contains("reference type"));
+    }
+
+    #[test]
+    fn non_crossing_borrows_are_untouched() {
+        let block: syn::Block = parse_quote!({
+            let y = &x.field;
+            f(y);
+            yield_!(1);
+        });
+        let (cfg, a) = run(&block);
+        assert!(resume_fields(&cfg, &a, 0).is_empty());
+        assert!(a.reborrows.iter().all(Vec::is_empty));
+        assert!(a.removed_stmts.iter().all(BTreeSet::is_empty));
+    }
+
+    // === Loops and branches ===
+
+    #[test]
+    fn loop_counter_is_live_at_the_header() {
+        let block: syn::Block = parse_quote!({
+            let mut sum: u32 = 0;
+            let mut i: u32 = 0;
+            while i < n {
+                let r = yield_!(sum);
+                sum += r;
+                i += 1;
+            }
+            sum
+        });
+        let (cfg, a) = run_args(&[("n", "u32")], &block, &unit());
+        let Terminator::Goto(header) = cfg.blocks[cfg.entry].terminator else {
+            panic!("entry should fall into the header");
+        };
+        // Definition order: the argument first, then the locals.
+        assert_eq!(field_names(&a, header), ["n", "sum", "i"]);
+        assert!(field(&a, header, "sum").mutability.is_some());
+        assert_eq!(resume_fields(&cfg, &a, 0), ["n", "sum", "i"]);
+        // The entry variant holds the argument.
+        assert_eq!(field_names(&a, cfg.entry), ["n"]);
+    }
+
+    #[test]
+    fn branch_local_is_not_live_at_the_join() {
+        let block: syn::Block = parse_quote!({
+            if c {
+                let a: u32 = 1;
+                yield_!(1);
+                f(a);
+            }
+            g();
+        });
+        let (cfg, a) = run_args(&[("c", "bool")], &block, &unit());
+        let s1 = resume_ids(&cfg)[0];
+        assert_eq!(field_names(&a, s1), ["a"]);
+        let Terminator::Goto(join) = cfg.blocks[s1].terminator else {
+            panic!("resume should goto the join");
+        };
+        assert!(a.live_in[join].is_empty());
+        assert!(field_names(&a, join).is_empty());
+    }
+
+    #[test]
+    fn branches_produce_different_field_sets() {
+        let block: syn::Block = parse_quote!({
+            if c {
+                let a: u32 = 1;
+                yield_!(1);
+                f(a);
+            } else {
+                let b2: i64 = 2;
+                yield_!(2);
+                g(b2);
+            }
+            done();
+        });
+        let (cfg, a) = run_args(&[("c", "bool")], &block, &unit());
+        assert_eq!(resume_fields(&cfg, &a, 0), ["a"]);
+        assert_eq!(resume_fields(&cfg, &a, 1), ["b2"]);
+    }
+
+    #[test]
+    fn loop_borrow_is_rebuilt_each_iteration() {
+        let block: syn::Block = parse_quote!({
+            let mut x: u32 = 0;
+            loop {
+                let y = &mut x;
+                yield_!(1);
+                *y += 1;
+            }
+        });
+        let (cfg, a) = run(&block);
+        let Terminator::Goto(header) = cfg.blocks[cfg.entry].terminator else {
+            panic!("entry should fall into the header");
+        };
+        let s1 = resume_ids(&cfg)[0];
+        // The borrow is defined in the header's arm and used after the
+        // yield: reconstructed at the resume arm, every iteration.
+        assert_eq!(a.reborrows[s1].len(), 1);
+        assert_eq!(a.reborrows[s1][0].target, "y");
+        assert_eq!(a.removed_stmts[header], BTreeSet::from([0]));
+        assert_eq!(field_names(&a, header), ["x"]);
+        assert_eq!(field_names(&a, s1), ["x"]);
+        assert!(field(&a, s1, "x").mutability.is_some());
+    }
+
+    #[test]
+    fn borrow_from_before_the_loop_is_rebuilt_inside() {
+        let block: syn::Block = parse_quote!({
+            let mut x: u32 = 0;
+            let y = &mut x;
+            loop {
+                yield_!(1);
+                *y += 1;
+            }
+        });
+        let (cfg, a) = run(&block);
+        let s1 = resume_ids(&cfg)[0];
+        assert_eq!(a.reborrows[s1].len(), 1);
+        assert_eq!(a.reborrows[s1][0].target, "y");
+        assert_eq!(a.removed_stmts[cfg.entry], BTreeSet::from([1]));
+        assert_eq!(field_names(&a, s1), ["x"]);
+    }
+
+    #[test]
+    fn borrow_crossing_a_join_without_yield_is_rebuilt() {
+        let block: syn::Block = parse_quote!({
+            let x: u32 = 1;
+            let y = &x;
+            if c {
+                yield_!(1);
+            }
+            f(y);
+        });
+        let (cfg, a) = run_args(&[("c", "bool")], &block, &unit());
+        let s1 = resume_ids(&cfg)[0];
+        let Terminator::Goto(join) = cfg.blocks[s1].terminator else {
+            panic!("resume should goto the join");
+        };
+        assert_eq!(field_names(&a, s1), ["x"]);
+        assert_eq!(field_names(&a, join), ["x"]);
+        assert_eq!(a.reborrows[join].len(), 1);
+        assert_eq!(a.reborrows[join][0].target, "y");
+        assert!(a.reborrows[s1].is_empty());
+        assert_eq!(a.removed_stmts[cfg.entry], BTreeSet::from([1]));
+    }
+
+    // === Range type inference ===
+
+    #[test]
+    fn range_types_are_inferred_from_either_endpoint() {
+        let block: syn::Block = parse_quote!({
+            let r = 0u32..k;
+            let ri = a..=b;
+            yield_!(1);
+            f(r, ri);
+        });
+        let (cfg, a) = run_args(&[("a", "u64")], &block, &unit());
+        let s1 = resume_ids(&cfg)[0];
+        let range: syn::Type = parse_quote!(::core::ops::Range<u32>);
+        let range_inclusive: syn::Type = parse_quote!(::core::ops::RangeInclusive<u64>);
+        assert_eq!(field(&a, s1, "r").ty, range);
+        assert_eq!(field(&a, s1, "ri").ty, range_inclusive);
+    }
+
+    #[test]
+    fn range_with_unknown_endpoints_is_an_error() {
+        let block: syn::Block = parse_quote!({
+            let r = lo()..hi();
+            yield_!(1);
+            f(r);
+        });
+        assert!(error_of(&block).to_string().contains("type annotation"));
+    }
+
+    // === New error cases ===
+
+    #[test]
+    fn match_arm_binding_crossing_a_yield_is_an_error() {
+        let block: syn::Block = parse_quote!({
+            match v {
+                0 => {}
+                n2 => {
+                    yield_!(1);
+                    g(n2);
+                }
+            }
+            done();
+        });
+        let (_, result) = lower_analyze(&[("v", "u32")], &block, &unit());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("match arm pattern"), "got: {msg}");
+        assert!(msg.contains("let n22: Type = n2;"), "got: {msg}");
+    }
+
+    #[test]
+    fn while_let_binding_crossing_a_yield_is_an_error() {
+        let block: syn::Block = parse_quote!({
+            while let Some(x2) = it.next() {
+                yield_!(1);
+                f(x2);
+            }
+        });
+        let (_, result) = lower_analyze(&[("it", "I")], &block, &unit());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("match arm pattern"), "got: {msg}");
+    }
+
+    #[test]
+    fn arm_binding_consumed_before_the_yield_is_fine() {
+        let block: syn::Block = parse_quote!({
+            match v {
+                n2 => {
+                    yield_!(n2);
+                }
+            }
+            done();
+        });
+        let (_, result) = lower_analyze(&[("v", "u32")], &block, &unit());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn same_named_bindings_in_one_variant_are_an_error() {
+        // The shadowed outer `x` survives as the borrow source while the
+        // inner `x` is live too: both would need a field named `x`.
+        let block: syn::Block = parse_quote!({
+            let x: u32 = 1;
+            let y = &x;
+            let x: u32 = 2;
+            yield_!(1);
+            f(y, x);
+        });
+        let msg = error_of(&block).to_string();
+        assert!(msg.contains("two different bindings named `x`"), "got: {msg}");
+    }
+}

@@ -20,6 +20,63 @@ pub struct BindingId(pub usize);
 #[derive(Debug)]
 pub struct Binding {
     pub ident: syn::Ident,
+    pub mutability: Option<syn::Token![mut]>,
+    pub kind: BindingKind,
+    /// Syntactic type information; resolved recursively by the analysis.
+    pub ty: TySource,
+    pub borrow: BorrowSource,
+}
+
+/// How a binding was introduced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingKind {
+    /// Function argument; its type comes from the signature.
+    Arg,
+    /// Bound by a `let` statement (simple or destructuring).
+    Local,
+    /// Resume binding of `let r = yield_!(..);`; its type defaults to
+    /// the coroutine's resume type.
+    Resume,
+    /// Bound by a `match`/`while let` arm pattern. There is no place to
+    /// write a type annotation, so it must not cross a state boundary.
+    ArmPat,
+}
+
+/// Syntactically determined type of a binding.
+// One instance per binding; keeping the syn type inline is simpler than
+// boxing it (same trade-off as Terminator).
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum TySource {
+    Unknown,
+    /// Explicit annotation, literal suffix, or unambiguous literal kind.
+    Known(syn::Type),
+    /// `let y = x;`: the type follows the moved binding.
+    Moved(BindingId),
+    /// `a..b` / `a..=b`: `Range<T>` / `RangeInclusive<T>` where `T` is
+    /// the first endpoint whose type is known.
+    Range {
+        inclusive: bool,
+        start: Box<TySource>,
+        end: Box<TySource>,
+    },
+}
+
+/// Classification of a binding's initializer as a borrow (ported from
+/// v1's analyze.rs).
+#[derive(Debug)]
+pub enum BorrowSource {
+    NotABorrow,
+    /// `let y = &x;` / `let y = &mut x;` with a plain identifier source.
+    /// `source` is `None` when the identifier is not a local binding
+    /// (e.g. a static); the borrow is still rebuilt by name.
+    Direct {
+        source_ident: syn::Ident,
+        source: Option<BindingId>,
+        mutable: bool,
+    },
+    /// A reference that cannot be reconstructed; the message explains why.
+    NonReconstructible { why: &'static str },
 }
 
 #[derive(Debug)]
@@ -169,7 +226,13 @@ impl Lowerer {
         };
         for arg in args {
             let id = BindingId(lw.bindings.len());
-            lw.bindings.push(Binding { ident: arg.clone() });
+            lw.bindings.push(Binding {
+                ident: arg.clone(),
+                mutability: None,
+                kind: BindingKind::Arg,
+                ty: TySource::Unknown,
+                borrow: BorrowSource::NotABorrow,
+            });
             lw.scopes[0].insert(arg.to_string(), id);
         }
         let entry = lw.new_block(false);
@@ -254,11 +317,16 @@ impl Lowerer {
     }
 
     /// Introduces a fresh binding into the innermost scope and records
-    /// its definition in `block`.
-    fn define(&mut self, ident: &syn::Ident, block: BlockId) -> BindingId {
+    /// its definition in `block`. Mutability, type, and borrow details
+    /// are filled in by the caller where known.
+    fn define(&mut self, ident: &syn::Ident, block: BlockId, kind: BindingKind) -> BindingId {
         let id = BindingId(self.bindings.len());
         self.bindings.push(Binding {
             ident: ident.clone(),
+            mutability: None,
+            kind,
+            ty: TySource::Unknown,
+            borrow: BorrowSource::NotABorrow,
         });
         self.scopes
             .last_mut()
@@ -295,11 +363,12 @@ impl Lowerer {
 
     /// Introduces every identifier bound by `pat` as a fresh binding
     /// defined in `block`.
-    fn define_pat_bindings(&mut self, pat: &syn::Pat, block: BlockId) {
+    fn define_pat_bindings(&mut self, pat: &syn::Pat, block: BlockId, kind: BindingKind) {
         let mut c = PatBindingCollector::default();
         c.visit_pat(pat);
-        for ident in c.idents {
-            self.define(&ident, block);
+        for (ident, mutability) in c.bindings {
+            let id = self.define(&ident, block, kind);
+            self.bindings[id.0].mutability = mutability;
         }
     }
 
@@ -450,8 +519,8 @@ impl<'ast> Visit<'ast> for YieldBan<'_> {
 /// path counts, and all identifiers inside macro invocations are taken
 /// verbatim from the token stream.
 #[derive(Default)]
-struct UseCollector {
-    used: HashSet<String>,
+pub(crate) struct UseCollector {
+    pub(crate) used: HashSet<String>,
 }
 
 impl<'ast> Visit<'ast> for UseCollector {
@@ -480,14 +549,17 @@ fn collect_token_idents(tokens: proc_macro2::TokenStream, out: &mut HashSet<Stri
     }
 }
 
+/// Collects the identifiers a pattern binds, in visit order. The order
+/// matches the BindingId assignment order, which the analysis relies on
+/// to match `let` statements back to their bindings.
 #[derive(Default)]
-struct PatBindingCollector {
-    idents: Vec<syn::Ident>,
+pub(crate) struct PatBindingCollector {
+    pub(crate) bindings: Vec<(syn::Ident, Option<syn::Token![mut]>)>,
 }
 
 impl<'ast> Visit<'ast> for PatBindingCollector {
     fn visit_pat_ident(&mut self, pi: &'ast syn::PatIdent) {
-        self.idents.push(pi.ident.clone());
+        self.bindings.push((pi.ident.clone(), pi.mutability));
         syn::visit::visit_pat_ident(self, pi);
     }
 }
@@ -645,10 +717,18 @@ impl Lowerer {
         self.check_no_yield(&value, ERR_STMT_POSITION);
         self.record_expr_uses(&value, self.current);
         let next = self.new_block(true);
-        let resume_binding = binding.map(|(ident, mutability, ty)| ResumeBinding {
-            binding: self.define(&ident, next),
-            mutability,
-            ty,
+        let resume_binding = binding.map(|(ident, mutability, ty)| {
+            let id = self.define(&ident, next, BindingKind::Resume);
+            let b = &mut self.bindings[id.0];
+            b.mutability = mutability;
+            if let Some(t) = &ty {
+                b.ty = TySource::Known(t.clone());
+            }
+            ResumeBinding {
+                binding: id,
+                mutability,
+                ty,
+            }
         });
         self.terminate(Terminator::Yield {
             value,
@@ -726,9 +806,121 @@ impl Lowerer {
         self.validate_opaque(stmt);
         self.record_stmt_uses(stmt);
         if let syn::Stmt::Local(local) = stmt {
-            self.define_pat_bindings(&local.pat, self.current);
+            self.define_local(local);
         }
         self.blocks[self.current].stmts.push(stmt.clone());
+    }
+
+    /// Introduces the bindings of an opaque `let`, classifying the type
+    /// source and borrow kind of a simple-identifier binding (ported
+    /// from v1's collect_let_defs). Classification runs before the
+    /// bindings enter scope, so the initializer resolves against the
+    /// enclosing environment (`let x = x;` sees the outer `x`).
+    fn define_local(&mut self, local: &syn::Local) {
+        let init = local.init.as_ref().map(|i| &*i.expr);
+        let (pat, annotation) = match &local.pat {
+            syn::Pat::Type(pt) => (&*pt.pat, Some(&*pt.ty)),
+            other => (other, None),
+        };
+        match pat {
+            syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
+                let ty = match annotation {
+                    Some(t) => TySource::Known(t.clone()),
+                    None => init.map_or(TySource::Unknown, |e| self.infer_ty_source(e)),
+                };
+                let borrow = self.classify_borrow(init, annotation);
+                let id = self.define(&pi.ident, self.current, BindingKind::Local);
+                let b = &mut self.bindings[id.0];
+                b.mutability = pi.mutability;
+                b.ty = ty;
+                b.borrow = borrow;
+            }
+            // Destructuring patterns: every bound identifier becomes a
+            // binding of unknown type (as in v1).
+            other => self.define_pat_bindings(other, self.current, BindingKind::Local),
+        }
+    }
+
+    /// Syntactic type inference for an initializer expression.
+    fn infer_ty_source(&self, expr: &syn::Expr) -> TySource {
+        match expr {
+            syn::Expr::Paren(p) => self.infer_ty_source(&p.expr),
+            // Negation of a suffixed numeric literal keeps its type.
+            syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => match &*u.expr {
+                syn::Expr::Lit(_) => self.infer_ty_source(&u.expr),
+                _ => TySource::Unknown,
+            },
+            syn::Expr::Lit(lit) => infer_lit_ty(&lit.lit).map_or(TySource::Unknown, TySource::Known),
+            // Move propagation: `let y = x;` follows x's type.
+            syn::Expr::Path(p) if p.qself.is_none() => p
+                .path
+                .get_ident()
+                .and_then(|i| self.resolve(&i.to_string()))
+                .map_or(TySource::Unknown, TySource::Moved),
+            syn::Expr::Range(r) => match (&r.start, &r.end) {
+                (Some(start), Some(end)) => TySource::Range {
+                    inclusive: matches!(r.limits, syn::RangeLimits::Closed(_)),
+                    start: Box::new(self.infer_ty_source(start)),
+                    end: Box::new(self.infer_ty_source(end)),
+                },
+                _ => TySource::Unknown,
+            },
+            _ => TySource::Unknown,
+        }
+    }
+
+    fn classify_borrow(&self, init: Option<&syn::Expr>, annotated: Option<&syn::Type>) -> BorrowSource {
+        let mut init = init;
+        while let Some(syn::Expr::Paren(p)) = init {
+            init = Some(&p.expr);
+        }
+        match init {
+            Some(syn::Expr::Reference(r)) => match &*r.expr {
+                syn::Expr::Path(p) if p.qself.is_none() && p.path.get_ident().is_some() => {
+                    let source_ident = p.path.get_ident().unwrap().clone();
+                    BorrowSource::Direct {
+                        source: self.resolve(&source_ident.to_string()),
+                        source_ident,
+                        mutable: r.mutability.is_some(),
+                    }
+                }
+                _ => BorrowSource::NonReconstructible {
+                    why: "is held across yield_! but borrows a non-trivial place; only direct \
+                          borrows of local variables (`let y = &x;` / `let y = &mut x;`) can be \
+                          reconstructed after resume",
+                },
+            },
+            _ if matches!(annotated, Some(syn::Type::Reference(_))) => {
+                BorrowSource::NonReconstructible {
+                    why: "has a reference type but is not a direct borrow (`let y = &x;` / \
+                          `let y = &mut x;`), so it cannot be held across yield_!",
+                }
+            }
+            _ => BorrowSource::NotABorrow,
+        }
+    }
+}
+
+/// The manifest type of a literal: an explicit suffix (`123u8`, `1.5f32`)
+/// or an unambiguous literal kind (`true`, `'c'`, `b'x'`). Unsuffixed
+/// numeric literals are NOT given the i32/f64 default: the actual type
+/// may be inferred differently by rustc, and guessing wrong would surface
+/// as a confusing error in generated code.
+fn infer_lit_ty(lit: &syn::Lit) -> Option<syn::Type> {
+    let suffix_ty = |suffix: &str, span: proc_macro2::Span| -> Option<syn::Type> {
+        if suffix.is_empty() {
+            return None;
+        }
+        let ident = syn::Ident::new(suffix, span);
+        Some(syn::parse_quote!(#ident))
+    };
+    match lit {
+        syn::Lit::Int(i) => suffix_ty(i.suffix(), i.span()),
+        syn::Lit::Float(f) => suffix_ty(f.suffix(), f.span()),
+        syn::Lit::Bool(_) => Some(syn::parse_quote!(bool)),
+        syn::Lit::Char(_) => Some(syn::parse_quote!(char)),
+        syn::Lit::Byte(_) => Some(syn::parse_quote!(u8)),
+        _ => None,
     }
 }
 
@@ -828,7 +1020,7 @@ impl Lowerer {
             let body_bb = self.new_block(false);
             self.current = body_bb;
             self.scopes.push(HashMap::new());
-            self.define_pat_bindings(&arm.pat, body_bb);
+            self.define_pat_bindings(&arm.pat, body_bb, BindingKind::ArmPat);
             let body_stmt = wrap_arm_body(&arm.body);
             self.lower_stmt_list(std::slice::from_ref(&body_stmt), TailCtx::Discard);
             self.scopes.pop();
@@ -930,7 +1122,7 @@ impl Lowerer {
         });
         self.current = body;
         self.scopes.push(HashMap::new());
-        self.define_pat_bindings(&el.pat, body);
+        self.define_pat_bindings(&el.pat, body, BindingKind::ArmPat);
         self.lower_stmt_list(&ew.body.stmts, TailCtx::Discard);
         self.scopes.pop();
         self.terminate(Terminator::Goto(header));

@@ -5,6 +5,9 @@
 use proc_macro::TokenStream;
 
 mod analyze;
+// v2 CFG pipeline; not wired into expansion yet.
+#[allow(dead_code)]
+mod analyze_cfg;
 mod args;
 mod expand;
 // v2 CFG pipeline; not wired into expansion yet.
