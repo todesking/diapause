@@ -7,6 +7,9 @@ use proc_macro::TokenStream;
 mod analyze;
 mod args;
 mod expand;
+// v2 CFG pipeline; not wired into expansion yet.
+#[allow(dead_code)]
+mod lower;
 mod parse;
 
 /// Transforms a function into a coroutine state machine.
