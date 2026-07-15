@@ -339,8 +339,14 @@ impl Lowerer {
     }
 
     fn lower_fn_body(&mut self, body: &syn::Block) {
+        self.in_scope(|lw| lw.lower_stmt_list(&body.stmts, TailCtx::FnReturn));
+    }
+
+    /// Runs `f` with a fresh innermost scope, popping it afterwards
+    /// regardless of what bindings `f` introduced.
+    fn in_scope(&mut self, f: impl FnOnce(&mut Self)) {
         self.scopes.push(HashMap::new());
-        self.lower_stmt_list(&body.stmts, TailCtx::FnReturn);
+        f(self);
         self.scopes.pop();
     }
 
@@ -1117,17 +1123,13 @@ impl Lowerer {
             else_: else_bb,
         });
         self.current = then_bb;
-        self.scopes.push(HashMap::new());
-        self.lower_stmt_list(&ei.then_branch.stmts, TailCtx::Discard);
-        self.scopes.pop();
+        self.in_scope(|lw| lw.lower_stmt_list(&ei.then_branch.stmts, TailCtx::Discard));
         self.terminate(Terminator::Goto(join));
         if let Some((_, else_expr)) = &ei.else_branch {
             self.current = else_bb;
             match &**else_expr {
                 syn::Expr::Block(b) => {
-                    self.scopes.push(HashMap::new());
-                    self.lower_stmt_list(&b.block.stmts, TailCtx::Discard);
-                    self.scopes.pop();
+                    self.in_scope(|lw| lw.lower_stmt_list(&b.block.stmts, TailCtx::Discard));
                     self.terminate(Terminator::Goto(join));
                 }
                 syn::Expr::If(nested) => self.lower_if_arms(nested, join),
@@ -1152,11 +1154,11 @@ impl Lowerer {
             }
             let body_bb = self.new_block(false);
             self.current = body_bb;
-            self.scopes.push(HashMap::new());
-            self.define_pat_bindings(&arm.pat, body_bb, BindingKind::ArmPat, None);
-            let body_stmt = wrap_arm_body(&arm.body);
-            self.lower_stmt_list(std::slice::from_ref(&body_stmt), TailCtx::Discard);
-            self.scopes.pop();
+            self.in_scope(|lw| {
+                lw.define_pat_bindings(&arm.pat, body_bb, BindingKind::ArmPat, None);
+                let body_stmt = wrap_arm_body(&arm.body);
+                lw.lower_stmt_list(std::slice::from_ref(&body_stmt), TailCtx::Discard);
+            });
             self.terminate(Terminator::Goto(join));
             arms.push(MatchArm {
                 pat: arm.pat.clone(),
@@ -1174,93 +1176,107 @@ impl Lowerer {
         self.current = join;
     }
 
-    fn lower_loop(&mut self, el: &syn::ExprLoop) {
+    /// Expands the skeleton shared by `loop`/`while`/`while let`/`for`:
+    /// a header reached by an initial goto, a `break`/`continue` frame
+    /// bound to it, and a backedge from the body to the header once
+    /// it's lowered.
+    ///
+    /// `self.current` is the header when `setup` runs; `setup` creates
+    /// (or reuses, for a plain `loop`) the `body` and `exit` blocks and
+    /// installs the header's terminator (a `Branch`, `Match`, or
+    /// `IterNext`), or leaves it unset for the body to fill in, as
+    /// `loop` does. `bind_pat` runs with the loop's scope already
+    /// pushed, before `body_stmts` are lowered, to bind a loop pattern
+    /// (`while let`'s / `for`'s); it is a no-op for `loop`/`while`.
+    fn with_loop_frame(
+        &mut self,
+        label: &Option<syn::Label>,
+        body_stmts: &[syn::Stmt],
+        setup: impl FnOnce(&mut Self, BlockId) -> (BlockId, BlockId),
+        bind_pat: impl FnOnce(&mut Self, BlockId),
+    ) {
         let header = self.new_block(false);
         self.terminate(Terminator::Goto(header));
-        let exit = self.new_block(false);
+        self.current = header;
+        let (body, exit) = setup(self, header);
         self.labels.push(Frame {
-            label: el.label.as_ref().map(|l| l.name.ident.to_string()),
+            label: label.as_ref().map(|l| l.name.ident.to_string()),
             header: Some(header),
             exit,
         });
-        self.current = header;
-        self.scopes.push(HashMap::new());
-        self.lower_stmt_list(&el.body.stmts, TailCtx::Discard);
-        self.scopes.pop();
+        self.current = body;
+        self.in_scope(|lw| {
+            bind_pat(lw, body);
+            lw.lower_stmt_list(body_stmts, TailCtx::Discard);
+        });
         self.terminate(Terminator::Goto(header));
         self.labels.pop();
         self.current = exit;
+    }
+
+    fn lower_loop(&mut self, el: &syn::ExprLoop) {
+        self.with_loop_frame(
+            &el.label,
+            &el.body.stmts,
+            |lw, header| (header, lw.new_block(false)),
+            |_, _| {},
+        );
     }
 
     fn lower_while(&mut self, ew: &syn::ExprWhile) {
         if let syn::Expr::Let(el) = &*ew.cond {
             return self.lower_while_let(ew, el);
         }
-        let header = self.new_block(false);
-        self.terminate(Terminator::Goto(header));
-        self.current = header;
-        self.check_no_yield(&ew.cond, ERR_COND);
-        self.record_expr_uses(&ew.cond, header);
-        let body = self.new_block(false);
-        let exit = self.new_block(false);
-        self.terminate(Terminator::Branch {
-            cond: (*ew.cond).clone(),
-            then_: body,
-            else_: exit,
-        });
-        self.labels.push(Frame {
-            label: ew.label.as_ref().map(|l| l.name.ident.to_string()),
-            header: Some(header),
-            exit,
-        });
-        self.current = body;
-        self.scopes.push(HashMap::new());
-        self.lower_stmt_list(&ew.body.stmts, TailCtx::Discard);
-        self.scopes.pop();
-        self.terminate(Terminator::Goto(header));
-        self.labels.pop();
-        self.current = exit;
+        self.with_loop_frame(
+            &ew.label,
+            &ew.body.stmts,
+            |lw, header| {
+                lw.check_no_yield(&ew.cond, ERR_COND);
+                lw.record_expr_uses(&ew.cond, header);
+                let body = lw.new_block(false);
+                let exit = lw.new_block(false);
+                lw.terminate(Terminator::Branch {
+                    cond: (*ew.cond).clone(),
+                    then_: body,
+                    else_: exit,
+                });
+                (body, exit)
+            },
+            |_, _| {},
+        );
     }
 
     fn lower_while_let(&mut self, ew: &syn::ExprWhile, el: &syn::ExprLet) {
-        let header = self.new_block(false);
-        self.terminate(Terminator::Goto(header));
-        self.current = header;
-        self.check_no_yield(&el.expr, ERR_SCRUTINEE);
-        self.record_expr_uses(&el.expr, header);
-        let body = self.new_block(false);
-        let exit = self.new_block(false);
-        self.set_terminator(
-            header,
-            Terminator::Match {
-                scrutinee: (*el.expr).clone(),
-                arms: vec![
-                    MatchArm {
-                        pat: (*el.pat).clone(),
-                        guard: None,
-                        body,
+        self.with_loop_frame(
+            &ew.label,
+            &ew.body.stmts,
+            |lw, header| {
+                lw.check_no_yield(&el.expr, ERR_SCRUTINEE);
+                lw.record_expr_uses(&el.expr, header);
+                let body = lw.new_block(false);
+                let exit = lw.new_block(false);
+                lw.set_terminator(
+                    header,
+                    Terminator::Match {
+                        scrutinee: (*el.expr).clone(),
+                        arms: vec![
+                            MatchArm {
+                                pat: (*el.pat).clone(),
+                                guard: None,
+                                body,
+                            },
+                            MatchArm {
+                                pat: syn::parse_quote!(_),
+                                guard: None,
+                                body: exit,
+                            },
+                        ],
                     },
-                    MatchArm {
-                        pat: syn::parse_quote!(_),
-                        guard: None,
-                        body: exit,
-                    },
-                ],
+                );
+                (body, exit)
             },
+            |lw, body| lw.define_pat_bindings(&el.pat, body, BindingKind::ArmPat, None),
         );
-        self.labels.push(Frame {
-            label: ew.label.as_ref().map(|l| l.name.ident.to_string()),
-            header: Some(header),
-            exit,
-        });
-        self.current = body;
-        self.scopes.push(HashMap::new());
-        self.define_pat_bindings(&el.pat, body, BindingKind::ArmPat, None);
-        self.lower_stmt_list(&ew.body.stmts, TailCtx::Discard);
-        self.scopes.pop();
-        self.terminate(Terminator::Goto(header));
-        self.labels.pop();
-        self.current = exit;
     }
 
     /// Expands `for pat in EXPR { .. }`: the preheader (current block)
@@ -1287,47 +1303,40 @@ impl Lowerer {
         b.mutability = Some(syn::Token![mut](ef.expr.span()));
         b.ty = TySource::IntoIter(Box::new(head_ty));
 
-        let header = self.new_block(false);
-        self.terminate(Terminator::Goto(header));
-        let body = self.new_block(false);
-        let exit = self.new_block(false);
-        // The `next()` call consumes the iterator at the header.
-        self.blocks[header].uses.insert(iter_id);
-        self.set_terminator(
-            header,
-            Terminator::IterNext {
-                iter: iter_ident,
-                pat: Box::new((*ef.pat).clone()),
-                body,
-                exit,
+        self.with_loop_frame(
+            &ef.label,
+            &ef.body.stmts,
+            |lw, header| {
+                let body = lw.new_block(false);
+                let exit = lw.new_block(false);
+                // The `next()` call consumes the iterator at the header.
+                lw.blocks[header].uses.insert(iter_id);
+                lw.set_terminator(
+                    header,
+                    Terminator::IterNext {
+                        iter: iter_ident,
+                        pat: Box::new((*ef.pat).clone()),
+                        body,
+                        exit,
+                    },
+                );
+                (body, exit)
+            },
+            |lw, body| match &*ef.pat {
+                // A simple-identifier loop variable gets the iterator's item
+                // type; destructured components have no derivable type and
+                // must not cross a state boundary.
+                syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
+                    // Bound by the `IterNext` terminator's pattern, not a
+                    // `let` statement, so it has no `def_stmt`.
+                    let id = lw.define(&pi.ident, body, BindingKind::Local, None);
+                    let b = &mut lw.bindings[id.0];
+                    b.mutability = pi.mutability;
+                    b.ty = TySource::IterItem(iter_id);
+                }
+                other => lw.define_pat_bindings(other, body, BindingKind::ForPat, None),
             },
         );
-        self.labels.push(Frame {
-            label: ef.label.as_ref().map(|l| l.name.ident.to_string()),
-            header: Some(header),
-            exit,
-        });
-        self.current = body;
-        self.scopes.push(HashMap::new());
-        match &*ef.pat {
-            // A simple-identifier loop variable gets the iterator's item
-            // type; destructured components have no derivable type and
-            // must not cross a state boundary.
-            syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
-                // Bound by the `IterNext` terminator's pattern, not a
-                // `let` statement, so it has no `def_stmt`.
-                let id = self.define(&pi.ident, body, BindingKind::Local, None);
-                let b = &mut self.bindings[id.0];
-                b.mutability = pi.mutability;
-                b.ty = TySource::IterItem(iter_id);
-            }
-            other => self.define_pat_bindings(other, body, BindingKind::ForPat, None),
-        }
-        self.lower_stmt_list(&ef.body.stmts, TailCtx::Discard);
-        self.scopes.pop();
-        self.terminate(Terminator::Goto(header));
-        self.labels.pop();
-        self.current = exit;
     }
 
     /// Rejects `for x in &local` / `for x in &mut local` where `local`
@@ -1359,17 +1368,13 @@ impl Lowerer {
                     header: None,
                     exit: join,
                 });
-                self.scopes.push(HashMap::new());
-                self.lower_stmt_list(&eb.block.stmts, TailCtx::Discard);
-                self.scopes.pop();
+                self.in_scope(|lw| lw.lower_stmt_list(&eb.block.stmts, TailCtx::Discard));
                 self.terminate(Terminator::Goto(join));
                 self.labels.pop();
                 self.current = join;
             }
             None => {
-                self.scopes.push(HashMap::new());
-                self.lower_stmt_list(&eb.block.stmts, TailCtx::Discard);
-                self.scopes.pop();
+                self.in_scope(|lw| lw.lower_stmt_list(&eb.block.stmts, TailCtx::Discard));
             }
         }
     }
