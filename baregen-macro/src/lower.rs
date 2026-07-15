@@ -635,10 +635,7 @@ impl Lowerer {
                 if is_block_like(e) || contains_yield_expr(e) {
                     self.lower_stmt(stmt);
                 } else {
-                    // The value is discarded, so a semicolon keeps the
-                    // statement sequence valid when more code follows in
-                    // the same generated arm.
-                    let wrapped = syn::Stmt::Expr(e.clone(), Some(Default::default()));
+                    let wrapped = stmt_from_discarded_expr(e.clone());
                     self.push_opaque(&wrapped);
                 }
             }
@@ -956,6 +953,18 @@ fn is_block_like(e: &syn::Expr) -> bool {
             | syn::Expr::TryBlock(_)
             | syn::Expr::Const(_)
     )
+}
+
+/// Turns a discarded expression into a statement: block-like expressions
+/// (if/match/loop/etc.) are already valid statements on their own, while
+/// everything else needs a semicolon to keep the statement sequence valid.
+fn stmt_from_discarded_expr(expr: syn::Expr) -> syn::Stmt {
+    let semi = if is_block_like(&expr) {
+        None
+    } else {
+        Some(Default::default())
+    };
+    syn::Stmt::Expr(expr, semi)
 }
 
 // === Control-flow expansion (statements that contain yield_!) ===
@@ -1497,18 +1506,11 @@ fn retarget(t: &mut Terminator, remap: &[usize]) {
     }
 }
 
-/// Turns a match arm body into a statement for lowering: blocks keep
-/// their statements, other expressions get a semicolon since the arm's
-/// value is discarded in statement-position matches.
+/// Turns a match arm body into a statement for lowering: the arm's value
+/// is discarded in statement-position matches, so this is just the
+/// discarded-expression wrapping rule.
 fn wrap_arm_body(body: &syn::Expr) -> syn::Stmt {
-    syn::Stmt::Expr(
-        body.clone(),
-        if is_block_like(body) {
-            None
-        } else {
-            Some(Default::default())
-        },
-    )
+    stmt_from_discarded_expr(body.clone())
 }
 
 #[cfg(test)]
