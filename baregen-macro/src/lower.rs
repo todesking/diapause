@@ -551,7 +551,7 @@ impl<'ast> Visit<'ast> for UseCollector {
     }
 }
 
-fn collect_token_idents(tokens: proc_macro2::TokenStream, out: &mut HashSet<String>) {
+pub(crate) fn collect_token_idents(tokens: proc_macro2::TokenStream, out: &mut HashSet<String>) {
     for tt in tokens {
         match tt {
             proc_macro2::TokenTree::Ident(id) => {

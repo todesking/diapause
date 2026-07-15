@@ -705,7 +705,7 @@ fn phantom_for_unused_params<'a>(
 
     let mut used = HashSet::new();
     for ty in field_tys {
-        collect_idents(ty.to_token_stream(), &mut used);
+        lower::collect_token_idents(ty.to_token_stream(), &mut used);
     }
 
     let unused_types: Vec<&syn::Ident> = generics
@@ -724,18 +724,6 @@ fn phantom_for_unused_params<'a>(
     // fn pointers keep the phantom covariant and unconditionally
     // Send/Sync/Copy/Clone.
     Some(syn::parse_quote!((#(fn() -> #unused_types,)* #(fn() -> &#unused_lifetimes (),)*)))
-}
-
-fn collect_idents(tokens: TokenStream, out: &mut HashSet<String>) {
-    for tt in tokens {
-        match tt {
-            proc_macro2::TokenTree::Ident(id) => {
-                out.insert(id.to_string());
-            }
-            proc_macro2::TokenTree::Group(g) => collect_idents(g.stream(), out),
-            _ => {}
-        }
-    }
 }
 
 #[cfg(test)]
