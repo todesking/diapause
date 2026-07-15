@@ -65,115 +65,42 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     let yield_ty = &macro_args.yield_ty;
     let resume_ty = &macro_args.resume_ty;
 
-    let arg_ident: Vec<_> = args.iter().map(|a| &a.ident).collect();
-    let arg_ty: Vec<_> = args.iter().map(|a| &a.ty).collect();
-
-    // Variant declarations in BlockId order: deterministic, and linear
-    // bodies produce a `Start, S1..Sn` layout.
-    let state_variants: Vec<TokenStream> = analysis
-        .variants
-        .iter()
-        .filter(|v| v.block != cfg.entry)
-        .map(|v| {
-            let ident = &v.ident;
-            let field_defs = v.fields.iter().map(|f| {
-                let ident = &f.ident;
-                let ty = &f.ty;
-                quote!(#ident: #ty)
-            });
-            quote!(#ident { #(#field_defs),* })
-        })
-        .collect();
-
-    // A generic parameter used only inside the body would leave the enum
-    // with an unconstrained parameter (E0392); a PhantomData field in
-    // Start keeps such parameters anchored.
-    let all_field_tys = arg_ty
-        .iter()
-        .copied()
-        .chain(analysis.variants.iter().flat_map(|v| &v.fields).map(|f| &f.ty));
-    let phantom_ty = phantom_for_unused_params(&generics, all_field_tys);
-    let phantom_field = phantom_ty
-        .as_ref()
-        .map(|ty| quote!(__phantom: ::core::marker::PhantomData<#ty>,));
-    let phantom_init = phantom_ty
-        .as_ref()
-        .map(|_| quote!(__phantom: ::core::marker::PhantomData,));
-
-    // Without yields the body is a single transition, so no panic can
-    // occur between a state write and the return: Done doubles as the
-    // placeholder and Poisoned is omitted.
-    let n_yields = cfg.blocks.iter().filter(|b| b.resume_point).count();
-    let (poisoned_variant, placeholder) = if n_yields == 0 {
-        (quote!(), quote!(State::Done))
-    } else {
-        (quote!(Poisoned,), quote!(State::Poisoned))
-    };
-
-    let mut resume_bindings: BTreeMap<BlockId, &lower::ResumeBinding> = BTreeMap::new();
-    for block in &cfg.blocks {
-        if let Terminator::Yield {
-            resume_binding: Some(rb),
-            next,
-            ..
-        } = &block.terminator
-        {
-            resume_bindings.insert(*next, rb);
-        }
-    }
-
-    let arg_pat: Vec<_> = args
+    let arg_ident: Vec<&syn::Ident> = args.iter().map(|a| &a.ident).collect();
+    let arg_ty: Vec<&syn::Type> = args.iter().map(|a| &a.ty).collect();
+    let arg_pat: Vec<TokenStream> = args
         .iter()
         .map(|a| bind_pat(&a.mutability, &a.ident))
         .collect();
-    let codegen = Codegen {
-        cfg: &cfg,
-        analysis: &analysis,
-        resume_bindings,
-        yield_ty,
-        ret_ty: &ret_ty,
-        start_pattern: quote!(State::Start { #(#arg_pat,)* .. }),
-    };
-    let drive_arms: Vec<TokenStream> = analysis.variants.iter().map(|v| codegen.arm(v)).collect();
 
-    // resume() permits only suspension variants; internal variants are
-    // reachable only through forged states (serde etc.).
-    let s_idents: Vec<&syn::Ident> = analysis
-        .variants
-        .iter()
-        .filter(|v| cfg.blocks[v.block].resume_point)
-        .map(|v| &v.ident)
-        .collect();
-    let has_internal = (0..cfg.blocks.len())
-        .any(|b| b != cfg.entry && !cfg.blocks[b].inline && !cfg.blocks[b].resume_point);
-    let poisoned_arm =
-        (n_yields > 0).then(|| quote!(State::Poisoned => ::core::panic!("Poisoned"),));
-    let invalid_arm = has_internal.then(|| quote!(_ => ::core::panic!("Invalid state"),));
-
-    let resume_body = if n_yields == 0 {
-        // Every resume is an error; the diverging match is the whole
-        // body so that no unreachable `__drive` call follows it.
-        quote! {
-            match self {
-                State::Start { .. } => ::core::panic!("Not started"),
-                State::Done => ::core::panic!("Already done"),
-                #invalid_arm
-            }
-        }
-    } else {
-        quote! {
-            match self {
-                #(State::#s_idents { .. } => {})*
-                State::Start { .. } => ::core::panic!("Not started"),
-                State::Done => ::core::panic!("Already done"),
-                #poisoned_arm
-                #invalid_arm
-            }
-            self.__drive(::core::option::Option::Some(_resume))
-        }
-    };
+    // Without yields the body is a single transition, so no panic can
+    // occur between a state write and the return: Done doubles as the
+    // placeholder, Poisoned is omitted, and every resume is
+    // unconditionally an error. `Suspension::new` is the only place that
+    // branches on that condition; everything downstream only sees the
+    // consequences.
+    let n_yields = cfg.blocks.iter().filter(|b| b.resume_point).count();
+    let suspension = Suspension::new(n_yields);
 
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let cx = ExpandCtx {
+        generics: &generics,
+        where_clause,
+        cfg: &cfg,
+        analysis: &analysis,
+        arg_ident: &arg_ident,
+        arg_ty: &arg_ty,
+        arg_pat: &arg_pat,
+        yield_ty,
+        ret_ty: &ret_ty,
+        resume_ty,
+    };
+
+    let StateEnum {
+        tokens: state_enum_tokens,
+        phantom_init,
+    } = build_state_enum(&cx, &derive_attrs, &suspension.poisoned_variant);
+    let resume_body = build_resume_dispatch(&cx, &suspension);
+    let drive_fn = build_drive_fn(&cx, &suspension.placeholder);
 
     Ok(quote! {
         #(#fn_attrs)*
@@ -187,13 +114,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
             #[allow(unused_imports)]
             use super::*;
 
-            #(#derive_attrs)*
-            pub enum State #generics #where_clause {
-                Start { #(#arg_ident: #arg_ty,)* #phantom_field },
-                #(#state_variants,)*
-                Done,
-                #poisoned_variant
-            }
+            #state_enum_tokens
 
             impl #impl_generics ::baregen::Coroutine<#resume_ty> for State #ty_generics
             #where_clause
@@ -218,28 +139,231 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
             }
 
             impl #impl_generics State #ty_generics #where_clause {
-                /// Runs the state machine until the next suspension point
-                /// or completion. Not visible outside the module.
-                #[allow(unused_mut, unreachable_code)]
-                fn __drive(
-                    &mut self,
-                    mut __resume: ::core::option::Option<#resume_ty>,
-                ) -> ::baregen::CoroutineState<#yield_ty, #ret_ty> {
-                    // Fields must be moved out through &mut self, so the
-                    // state is swapped for a placeholder up front; a
-                    // panic in user code leaves it behind.
-                    let mut __state = ::core::mem::replace(self, #placeholder);
-                    loop {
-                        __state = match __state {
-                            #(#drive_arms)*
-                            // Unreachable: start/resume checked the state.
-                            _ => ::core::panic!("Poisoned"),
-                        };
-                    }
-                }
+                #drive_fn
             }
         }
     })
+}
+
+// === Codegen assembly ===
+//
+// `expand` above parses and validates the source item, then hands off to
+// the four pieces below: the n_yields==0 special case (`Suspension`), the
+// `State` enum (`build_state_enum`), `resume()`'s dispatch
+// (`build_resume_dispatch`), and `__drive` (`build_drive_fn`).
+
+/// The pieces of the parsed item that the codegen-assembly functions below
+/// need but none of them owns.
+struct ExpandCtx<'a> {
+    generics: &'a syn::Generics,
+    where_clause: Option<&'a syn::WhereClause>,
+    cfg: &'a Cfg,
+    analysis: &'a Analysis,
+    arg_ident: &'a [&'a syn::Ident],
+    arg_ty: &'a [&'a syn::Type],
+    arg_pat: &'a [TokenStream],
+    yield_ty: &'a syn::Type,
+    ret_ty: &'a syn::Type,
+    resume_ty: &'a syn::Type,
+}
+
+/// Whether the coroutine ever suspends, and the codegen fallout of that:
+/// without yields, the body is a single transition, so no panic can occur
+/// between a state write and the return. `Done` then doubles as the
+/// placeholder, `Poisoned` is omitted, and (in `build_resume_dispatch`)
+/// every resume is unconditionally an error.
+struct Suspension {
+    poisoned_variant: TokenStream,
+    placeholder: TokenStream,
+    poisoned_arm: Option<TokenStream>,
+    has_yields: bool,
+}
+
+impl Suspension {
+    fn new(n_yields: usize) -> Self {
+        if n_yields == 0 {
+            Suspension {
+                poisoned_variant: quote!(),
+                placeholder: quote!(State::Done),
+                poisoned_arm: None,
+                has_yields: false,
+            }
+        } else {
+            Suspension {
+                poisoned_variant: quote!(Poisoned,),
+                placeholder: quote!(State::Poisoned),
+                poisoned_arm: Some(quote!(State::Poisoned => ::core::panic!("Poisoned"),)),
+                has_yields: true,
+            }
+        }
+    }
+}
+
+struct StateEnum {
+    /// The `enum State { .. }` item, ready to splice into `mod #name`.
+    tokens: TokenStream,
+    /// `PhantomData` field value used by the free-standing starter
+    /// function to build the initial `State::Start`.
+    phantom_init: Option<TokenStream>,
+}
+
+/// Builds the `enum State` declaration: variant list (in `BlockId` order,
+/// entry excluded since it becomes `Start`), the `PhantomData` field/init
+/// pair anchoring otherwise-unconstrained generic parameters, and
+/// `Poisoned`'s presence (`poisoned_variant`, from `Suspension`).
+fn build_state_enum(
+    cx: &ExpandCtx,
+    derive_attrs: &[&syn::Attribute],
+    poisoned_variant: &TokenStream,
+) -> StateEnum {
+    // Variant declarations in BlockId order: deterministic, and linear
+    // bodies produce a `Start, S1..Sn` layout.
+    let state_variants: Vec<TokenStream> = cx
+        .analysis
+        .variants
+        .iter()
+        .filter(|v| v.block != cx.cfg.entry)
+        .map(|v| {
+            let ident = &v.ident;
+            let field_defs = v.fields.iter().map(|f| {
+                let ident = &f.ident;
+                let ty = &f.ty;
+                quote!(#ident: #ty)
+            });
+            quote!(#ident { #(#field_defs),* })
+        })
+        .collect();
+
+    // A generic parameter used only inside the body would leave the enum
+    // with an unconstrained parameter (E0392); a PhantomData field in
+    // Start keeps such parameters anchored.
+    let all_field_tys = cx.arg_ty.iter().copied().chain(
+        cx.analysis
+            .variants
+            .iter()
+            .flat_map(|v| &v.fields)
+            .map(|f| &f.ty),
+    );
+    let phantom_ty = phantom_for_unused_params(cx.generics, all_field_tys);
+    let phantom_field = phantom_ty
+        .as_ref()
+        .map(|ty| quote!(__phantom: ::core::marker::PhantomData<#ty>,));
+    let phantom_init = phantom_ty
+        .as_ref()
+        .map(|_| quote!(__phantom: ::core::marker::PhantomData,));
+
+    let generics = cx.generics;
+    let where_clause = cx.where_clause;
+    let arg_ident = cx.arg_ident;
+    let arg_ty = cx.arg_ty;
+    let tokens = quote! {
+        #(#derive_attrs)*
+        pub enum State #generics #where_clause {
+            Start { #(#arg_ident: #arg_ty,)* #phantom_field },
+            #(#state_variants,)*
+            Done,
+            #poisoned_variant
+        }
+    };
+    StateEnum { tokens, phantom_init }
+}
+
+/// Builds `resume()`'s body: the pre-`__drive` state check, dispatched on
+/// whether the coroutine ever suspends (`suspension.has_yields`).
+fn build_resume_dispatch(cx: &ExpandCtx, suspension: &Suspension) -> TokenStream {
+    // resume() permits only suspension variants; internal variants are
+    // reachable only through forged states (serde etc.).
+    let s_idents: Vec<&syn::Ident> = cx
+        .analysis
+        .variants
+        .iter()
+        .filter(|v| cx.cfg.blocks[v.block].resume_point)
+        .map(|v| &v.ident)
+        .collect();
+    let has_internal = (0..cx.cfg.blocks.len())
+        .any(|b| b != cx.cfg.entry && !cx.cfg.blocks[b].inline && !cx.cfg.blocks[b].resume_point);
+    let invalid_arm = has_internal.then(|| quote!(_ => ::core::panic!("Invalid state"),));
+    let poisoned_arm = &suspension.poisoned_arm;
+
+    if !suspension.has_yields {
+        // Every resume is an error; the diverging match is the whole
+        // body so that no unreachable `__drive` call follows it.
+        quote! {
+            match self {
+                State::Start { .. } => ::core::panic!("Not started"),
+                State::Done => ::core::panic!("Already done"),
+                #invalid_arm
+            }
+        }
+    } else {
+        quote! {
+            match self {
+                #(State::#s_idents { .. } => {})*
+                State::Start { .. } => ::core::panic!("Not started"),
+                State::Done => ::core::panic!("Already done"),
+                #poisoned_arm
+                #invalid_arm
+            }
+            self.__drive(::core::option::Option::Some(_resume))
+        }
+    }
+}
+
+/// Builds the whole `fn __drive` definition: `Codegen` assembly, one
+/// dispatch arm per variant, and the placeholder-swap loop.
+fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
+    let mut resume_bindings: BTreeMap<BlockId, &lower::ResumeBinding> = BTreeMap::new();
+    for block in &cx.cfg.blocks {
+        if let Terminator::Yield {
+            resume_binding: Some(rb),
+            next,
+            ..
+        } = &block.terminator
+        {
+            resume_bindings.insert(*next, rb);
+        }
+    }
+
+    let arg_pat = cx.arg_pat;
+    let codegen = Codegen {
+        cfg: cx.cfg,
+        analysis: cx.analysis,
+        resume_bindings,
+        yield_ty: cx.yield_ty,
+        ret_ty: cx.ret_ty,
+        start_pattern: quote!(State::Start { #(#arg_pat,)* .. }),
+    };
+    let drive_arms: Vec<TokenStream> = cx
+        .analysis
+        .variants
+        .iter()
+        .map(|v| codegen.arm(v))
+        .collect();
+    let resume_ty = cx.resume_ty;
+    let yield_ty = cx.yield_ty;
+    let ret_ty = cx.ret_ty;
+
+    quote! {
+        /// Runs the state machine until the next suspension point
+        /// or completion. Not visible outside the module.
+        #[allow(unused_mut, unreachable_code)]
+        fn __drive(
+            &mut self,
+            mut __resume: ::core::option::Option<#resume_ty>,
+        ) -> ::baregen::CoroutineState<#yield_ty, #ret_ty> {
+            // Fields must be moved out through &mut self, so the
+            // state is swapped for a placeholder up front; a
+            // panic in user code leaves it behind.
+            let mut __state = ::core::mem::replace(self, #placeholder);
+            loop {
+                __state = match __state {
+                    #(#drive_arms)*
+                    // Unreachable: start/resume checked the state.
+                    _ => ::core::panic!("Poisoned"),
+                };
+            }
+        }
+    }
 }
 
 // === Dispatch-arm generation ===
