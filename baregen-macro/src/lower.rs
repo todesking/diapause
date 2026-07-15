@@ -1,9 +1,8 @@
-//! Lowers a coroutine body into a control-flow graph (v2 pipeline).
+//! Lowers a coroutine body into a control-flow graph.
 //!
-//! Replaces the segment-based IR of `parse.rs` (the switch happens in a
-//! later task). Only statements that transitively contain `yield_!` are
-//! expanded into CFG structure; every other statement — control flow
-//! included — is kept as an opaque statement inside a basic block.
+//! Only statements that transitively contain `yield_!` are expanded into
+//! CFG structure; every other statement — control flow included — is kept
+//! as an opaque statement inside a basic block.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -73,8 +72,7 @@ pub enum TySource {
     IterItem(BindingId),
 }
 
-/// Classification of a binding's initializer as a borrow (ported from
-/// v1's analyze.rs).
+/// Classification of a binding's initializer as a borrow.
 #[derive(Debug)]
 pub enum BorrowSource {
     NotABorrow,
@@ -397,21 +395,16 @@ impl Lowerer {
     }
 }
 
-// === Error messages (ported from v1 where marked) ===
+// === Error messages ===
 
 const ERR_STMT_POSITION: &str = "yield_! is only allowed in statement position: \
      `yield_!(expr);` or `let x = yield_!(expr);`";
-// v1 wording:
 const ERR_TRAILING_YIELD: &str =
     "yield_! as the trailing expression is not supported; add a semicolon";
-// v1 wording:
 const ERR_FOREIGN_MACRO: &str = "yield_! cannot appear inside another macro invocation";
-// v1 wording:
 const ERR_LET_ELSE: &str = "`let ... else` cannot be used with yield_!";
-// v1 wording:
 const ERR_SIMPLE_BINDING: &str =
     "the binding of `let ... = yield_!(...)` must be a simple identifier";
-// v1 wording:
 const ERR_YIELD_ARG: &str = "yield_! takes a single expression";
 const ERR_VALUE_POSITION: &str = "yield_! in value position is not supported; only \
      `yield_!(expr);` and `let x = yield_!(expr);` statements can suspend";
@@ -471,9 +464,9 @@ fn tokens_contain_yield(tokens: proc_macro2::TokenStream) -> bool {
 }
 
 /// Finds genuine `yield_!` invocations. Closures, async blocks, and
-/// nested items are separate scopes and pass through, as in v1. Foreign
-/// macros whose tokens mention yield_! do not count as containing a
-/// yield; they are rejected separately.
+/// nested items are separate scopes and pass through. Foreign macros
+/// whose tokens mention yield_! do not count as containing a yield;
+/// they are rejected separately.
 #[derive(Default)]
 struct ContainsYield {
     found: bool,
@@ -535,8 +528,8 @@ impl<'ast> Visit<'ast> for YieldBan<'_> {
 
 // === Small collectors ===
 
-/// Collects identifiers that may refer to local variables (ported from
-/// v1's analyze.rs). Overapproximates: every unqualified single-segment
+/// Collects identifiers that may refer to local variables. Overapproximates:
+/// every unqualified single-segment
 /// path counts, and all identifiers inside macro invocations are taken
 /// verbatim from the token stream.
 #[derive(Default)]
@@ -833,10 +826,10 @@ impl Lowerer {
     }
 
     /// Introduces the bindings of an opaque `let`, classifying the type
-    /// source and borrow kind of a simple-identifier binding (ported
-    /// from v1's collect_let_defs). Classification runs before the
-    /// bindings enter scope, so the initializer resolves against the
-    /// enclosing environment (`let x = x;` sees the outer `x`).
+    /// source and borrow kind of a simple-identifier binding.
+    /// Classification runs before the bindings enter scope, so the
+    /// initializer resolves against the enclosing environment
+    /// (`let x = x;` sees the outer `x`).
     fn define_local(&mut self, local: &syn::Local) {
         let init = local.init.as_ref().map(|i| &*i.expr);
         let (pat, annotation) = match &local.pat {
@@ -857,7 +850,7 @@ impl Lowerer {
                 b.borrow = borrow;
             }
             // Destructuring patterns: every bound identifier becomes a
-            // binding of unknown type (as in v1).
+            // binding of unknown type.
             other => self.define_pat_bindings(other, self.current, BindingKind::Local),
         }
     }
@@ -1381,7 +1374,7 @@ impl<'ast> Visit<'ast> for OpaqueChecker {
     }
 
     // Separate scopes: break/continue and yield_! inside these belong to
-    // them, not to the coroutine (same pass-through as v1).
+    // them, not to the coroutine.
     fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
     fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
     fn visit_item(&mut self, _: &'ast syn::Item) {}
@@ -1554,7 +1547,7 @@ mod tests {
         items.iter().copied().collect()
     }
 
-    // === Straight-line code (v1 parity) ===
+    // === Straight-line code ===
 
     #[test]
     fn no_yield_is_a_single_block() {
@@ -1572,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn straight_line_yields_match_v1_segments() {
+    fn straight_line_yields_split_into_expected_blocks() {
         let block: syn::Block = parse_quote!({
             let a = 1;
             yield_!(a);
@@ -2298,7 +2291,7 @@ mod tests {
             }
         });
         assert!(error_of(&block).to_string().contains("add a semicolon"));
-        // Bare trailing yield keeps the v1 message.
+        // Bare trailing yield uses the same message.
         let block: syn::Block = parse_quote!({
             yield_!(1)
         });

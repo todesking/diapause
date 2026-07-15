@@ -1,6 +1,5 @@
 //! CFG-based liveness analysis, type determination, and borrow
-//! reconstruction (v2 pipeline). Consumes the CFG built by `lower.rs`
-//! and replaces `analyze.rs` when the pipeline switches (task 13).
+//! reconstruction. Consumes the CFG built by `lower.rs`.
 //!
 //! Every block that is not inlined into its predecessor's arm becomes a
 //! state-enum variant; its fields are the bindings live at its entry.
@@ -583,7 +582,7 @@ mod tests {
         lower_analyze(&[], block, &unit()).1.unwrap_err()
     }
 
-    /// Resume-point blocks in yield order (v1's `S1..Sn`).
+    /// Resume-point blocks, in yield order.
     fn resume_ids(cfg: &Cfg) -> Vec<BlockId> {
         (0..cfg.blocks.len())
             .filter(|b| cfg.blocks[*b].resume_point)
@@ -609,12 +608,12 @@ mod tests {
             .unwrap_or_else(|| panic!("no field `{name}` in block {block}"))
     }
 
-    /// Fields of the k-th resume variant (v1's `states[k]`).
+    /// Fields of the k-th resume variant.
     fn resume_fields(cfg: &Cfg, a: &Analysis, k: usize) -> Vec<String> {
         field_names(a, resume_ids(cfg)[k])
     }
 
-    // === Ported from v1 analyze.rs ===
+    // === Liveness and borrow reconstruction ===
 
     #[test]
     fn unused_vars_are_not_stored() {
@@ -859,7 +858,7 @@ mod tests {
             .collect();
         assert_eq!(order, ["y", "z"]);
         // `let z = &y;` is dropped; `let y = &x;` stays because z's
-        // original statement scan still sees a use of y (as in v1).
+        // original statement scan still sees a use of y.
         assert_eq!(a.removed_stmts[cfg.entry], BTreeSet::from([2]));
     }
 

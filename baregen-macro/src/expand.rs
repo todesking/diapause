@@ -66,7 +66,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     let variant_idents = variant_idents(&cfg);
 
     // Variant declarations in BlockId order: deterministic, and linear
-    // (v1-style) bodies produce exactly v1's `Start, S1..Sn` layout.
+    // bodies produce a `Start, S1..Sn` layout.
     let state_variants: Vec<TokenStream> = (0..cfg.blocks.len())
         .filter(|&b| b != cfg.entry && !cfg.blocks[b].inline)
         .map(|b| {
@@ -97,7 +97,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
 
     // Without yields the body is a single transition, so no panic can
     // occur between a state write and the return: Done doubles as the
-    // placeholder and Poisoned is omitted (as in v1).
+    // placeholder and Poisoned is omitted.
     let n_yields = cfg.blocks.iter().filter(|b| b.resume_point).count();
     let (poisoned_variant, placeholder) = if n_yields == 0 {
         (quote!(), quote!(State::Done))
@@ -503,7 +503,7 @@ fn rewrite_early_exits(body: &mut syn::Block, ret_ty: &syn::Type) {
     Rewriter { ret_ty }.visit_block_mut(body);
 }
 
-// === Signature handling (unchanged from v1) ===
+// === Signature handling ===
 
 fn check_signature(sig: &syn::Signature) -> syn::Result<()> {
     let unsupported = |span_source: &dyn quote::ToTokens, what: &str| {
