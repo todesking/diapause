@@ -4,23 +4,29 @@ Coroutines/generators for stable Rust via code transformation — no
 `async`, no `Pin`, no allocation, no unsafe code.
 
 The `#[baregen::coroutine]` attribute rewrites a function into a state
-machine enum by splitting its body at each `yield_!` suspension point.
+machine enum: the body is analyzed as a control-flow graph and each
+`yield_!` suspension point becomes an enum variant holding the live
+variables.
 
 ```rust
 use baregen::{Coroutine, CoroutineState};
 
 #[baregen::coroutine(yield = u32, resume = u32)]
-fn running_total(start: u32) -> u32 {
-    let a = yield_!(start);
-    let b = yield_!(start + a);
-    start + a + b
+fn running_total(n: u32) -> u32 {
+    let mut sum: u32 = 0;
+    for i in 0u32..n {
+        let bonus = yield_!(sum);
+        sum += i + bonus;
+    }
+    sum
 }
 
 fn main() {
-    let mut c = running_total(100);
-    assert_eq!(c.start(), CoroutineState::Yielded(100));
-    assert_eq!(c.resume(1), CoroutineState::Yielded(101));
-    assert_eq!(c.resume(2), CoroutineState::Complete(103));
+    let mut c = running_total(3);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(10), CoroutineState::Yielded(10));
+    assert_eq!(c.resume(0), CoroutineState::Yielded(11));
+    assert_eq!(c.resume(5), CoroutineState::Complete(18));
 }
 ```
 
@@ -31,6 +37,11 @@ any code. `start()` runs the body up to the first `yield_!`; each
 
 ## Features
 
+- **Control flow**: `yield_!` works inside `if` / `match` / `loop` /
+  `while` / `while let` / `for`, at any nesting depth, mixed with
+  `break`, `continue` (including labeled forms), early `return`, and the
+  `?` operator on `Result` and `Option`. The generated `resume` is a
+  dispatch loop over basic blocks, so join points are never duplicated.
 - **Resume arguments** are ordinary values passed to `resume`, typed via
   the attribute (`resume = String`), with a separate argument-less
   `start()` so the first resume value has nowhere to be lost.
@@ -40,26 +51,108 @@ any code. `start()` runs the body up to the first `yield_!`; each
 - **Snapshots**: `#[derive(Clone)]` written under the attribute is moved
   to the state enum, so a suspended coroutine can be cloned and both
   copies resumed independently.
+- **Suspend-state persistence**: because the state enum stores concrete
+  types only (a `for` loop's iterator is stored as
+  `<T as IntoIterator>::IntoIter`, not boxed), serde derives work with
+  their ordinary semantics. A suspended coroutine can be serialized,
+  shipped to another process, deserialized, and resumed — something
+  async-based generator crates cannot do in principle.
 - **Panic safety**: a coroutine that panics mid-transition is left in a
   `Poisoned` state and panics on further use.
 
-## v1 limitations
+## Persisting a suspended coroutine
 
-- `yield_!` may only appear as a top-level statement of the function
-  body: `yield_!(expr);` or `let x = yield_!(expr);`. Yields inside
-  expressions or control flow (`if` / `match` / `loop` / `while` /
-  `for`) are compile errors. Control-flow support via CFG analysis is
-  planned for v2.
-- The macro works purely syntactically, so every variable held across a
-  `yield_!` needs a syntactically determinable type: an explicit
-  annotation, a suffixed or unambiguous literal (`123u8`, `true`), a
-  move from a variable of known type, or a function argument. Anything
-  else gets a "write a type annotation" error.
-- References are never stored in the state (the state machine is always
-  `Unpin`; there is no self-reference). A direct borrow (`let y = &x;`
-  / `let y = &mut x;`) crossing a yield is dropped and reconstructed
-  after resume; other reference-holding values crossing a yield are
-  compile errors.
+```rust
+use baregen::{Coroutine, CoroutineState};
+use serde::{Deserialize, Serialize};
+
+#[baregen::coroutine(yield = u32)]
+#[derive(Serialize, Deserialize)]
+fn countdown(n: u32) -> u32 {
+    let mut sum: u32 = 0;
+    for i in 0u32..n {
+        yield_!(i);
+        sum += i;
+    }
+    sum
+}
+
+fn main() {
+    let mut c = countdown(3);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+
+    // Persist mid-iteration: the state holds the Range cursor and sum.
+    let json = serde_json::to_string(&c).unwrap();
+
+    // Elsewhere, later: restore and resume.
+    let mut restored: countdown::State = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored.resume(()), CoroutineState::Yielded(1));
+    assert_eq!(restored.resume(()), CoroutineState::Yielded(2));
+    assert_eq!(restored.resume(()), CoroutineState::Complete(3));
+}
+```
+
+What serde works for follows from what the state stores:
+
+- Range-based iteration (`for i in 0u32..n`) round-trips fully — `Range`
+  has serde impls and the mid-iteration cursor is plain data.
+- Iterators without serde impls (closures, `map` adapters,
+  `vec::IntoIter`, …) fail at the derive bound, as they would in any
+  struct.
+- A coroutine with `impl Trait` arguments has an unnameable state type,
+  so it can be serialized but not deserialized.
+- Variant names (`S1..`, `B1..`) are assigned by yield order and block
+  order; editing the coroutine body can renumber them, so persisted
+  states are only compatible with the exact source they were built from.
+
+## Constraints
+
+The macro works purely syntactically — it never sees rustc's type
+information — and every state transition is a compile-time rewrite.
+That surfaces as the following rules; each unsupported construct is a
+dedicated compile error with the workaround in the message.
+
+- **`yield_!` is statement-position only**: `yield_!(expr);` or
+  `let x = yield_!(expr);`. It cannot appear inside expressions
+  (`f(yield_!(1))`), value-position control flow
+  (`let x = if c { yield_!(1); a } else { b };`), tail expressions,
+  conditions, match scrutinees or guards, `for`-head expressions,
+  assignments (`x = yield_!(..)` — resume values bind via `let` only),
+  `if let` (use `match`), or `unsafe` blocks. For value-position needs,
+  assign into an `Option` in each branch and `unwrap()` after the join.
+- **Syntactic types**: every variable held across a `yield_!` needs a
+  syntactically determinable type: an explicit annotation, a suffixed
+  or unambiguous literal (`123u8`, `true`), a move from a known
+  variable, a function argument, or a range of known endpoints
+  (`0u32..n`). Match-arm and destructuring-`for` bindings have no place
+  for an annotation, so if they cross a yield, rebind first:
+  `let v2: Type = v;` at the top of the arm or loop body.
+- **Borrows**: references are never stored in the state (the state
+  machine is always `Unpin`; there is no self-reference). A direct
+  borrow (`let y = &x;` / `let y = &mut x;`) crossing a yield is
+  reconstructed after resume; other reference-holding values crossing a
+  yield are compile errors. A `for` loop cannot iterate over a borrow
+  of a local (`for x in &local`) — iterate by value, or borrow an
+  argument.
+- **Jumps out of suspending loops**: a `break`/`continue` targeting a
+  loop that contains a `yield_!` must not sit inside a statement that
+  contains no `yield_!` (e.g. a plain `if done { break; }` after a
+  yield). Move the exit condition into the loop header via a flag
+  variable, or restructure so the jump shares a statement with a yield.
+  `break` with a value cannot target such a loop at all.
+- **`?` is supported on `Result` and `Option` only.** It is rewritten to
+  the internal `BareTry` / `BareFromResidual` traits (visible in error
+  messages when `?` is used on other types); implementing them for
+  custom types is not supported.
+- **A body whose every live path ends in an explicit `return`** (with
+  the diverging control flow containing yields) produces a puzzling
+  `E0308: expected <ret>, found ()` on the unreachable implicit tail.
+  Append `unreachable!()` as the tail expression.
+- **Visibility**: the generated state enum is as public as the function,
+  so argument and return types must be at least that visible or rustc
+  reports `E0446` (private type in public interface).
+- Variables not carried into the next state are dropped at the
+  transition, which can be earlier than their lexical scope end.
 
 ## Comparison with existing crates
 
@@ -71,6 +164,6 @@ machine itself instead:
 - no `Pin`: the generated states are plain enums and always `Unpin`;
 - resume arguments are real arguments, not channel tricks;
 - the state enum is an inspectable, nameable type that supports
-  `derive`d snapshots;
-- in exchange, only the v1 subset above is supported, whereas
-  async-based generators accept arbitrary control flow.
+  `derive`d snapshots and serde persistence of suspended coroutines;
+- in exchange, the body must stay within the syntactic rules above,
+  whereas async-based generators accept arbitrary control flow.

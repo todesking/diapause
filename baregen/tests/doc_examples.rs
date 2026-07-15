@@ -78,6 +78,29 @@ fn borrow_across_yield() {
     assert_eq!(c.resume(()), CoroutineState::Complete(99));
 }
 
+// "制御構文内のyield" — the v2 transformation example (also the design
+// document's `totals`): a while loop whose body yields, compiled to a
+// dispatch loop with a loop-header variant.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn totals(n: u32) -> u32 {
+    let mut sum: u32 = 0;
+    let mut i: u32 = 0;
+    while i < n {
+        let r = yield_!(sum);
+        sum += r;
+        i += 1;
+    }
+    sum
+}
+
+#[test]
+fn control_flow_yield() {
+    let mut c = totals(2);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(5), CoroutineState::Yielded(5));
+    assert_eq!(c.resume(7), CoroutineState::Complete(12));
+}
+
 // Combined features: generics + multiple yields + borrow reconstruction
 // + derive(Clone) snapshot.
 #[baregen::coroutine(yield = usize, resume = u32)]

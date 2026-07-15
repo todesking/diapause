@@ -2,8 +2,9 @@
 //!
 //! Annotate a function with [`macro@coroutine`] and it is rewritten into
 //! a state machine implementing the [`Coroutine`] trait. Suspension
-//! points are written as `yield_!(expr)`; the transformation is a plain
-//! AST rewrite — no `async`, no allocation, no unsafe code.
+//! points are written as `yield_!(expr)`; the body is analyzed as a
+//! control-flow graph and rewritten at compile time — no `async`, no
+//! allocation, no unsafe code.
 //!
 //! ```
 //! use baregen::{Coroutine, CoroutineState};
@@ -27,21 +28,21 @@
 //! suspension point, passing its argument as the value of the
 //! `let x = yield_!(..)` binding.
 //!
-//! # v1 limitations
+//! # Supported bodies
 //!
-//! - `yield_!` may only appear as a top-level statement of the function
-//!   body (`yield_!(expr);` or `let x = yield_!(expr);`) — not inside
-//!   expressions or control flow (`if`/`match`/`loop`/`while`/`for`).
-//!   Control-flow support is planned for v2.
-//! - The macro never sees rustc's type information, so a variable held
-//!   across a `yield_!` must have a syntactically determinable type: a
-//!   type annotation (`let x: T = ..;`), a suffixed or unambiguous
-//!   literal (`123u8`, `true`), a move from a known variable, or a
-//!   function argument.
-//! - References are never stored in the state. A direct borrow
-//!   (`let y = &x;` / `let y = &mut x;`) held across a `yield_!` is
-//!   reconstructed after resume instead; anything else holding a
-//!   reference across a suspension point is a compile error.
+//! `yield_!` works inside `if` / `match` / `loop` / `while` /
+//! `while let` / `for` at any nesting depth, mixed with `break`,
+//! `continue`, early `return`, and the `?` operator on `Result` and
+//! `Option`. Because the state enum stores concrete types only, serde
+//! derives work with their ordinary semantics and a suspended coroutine
+//! can be serialized, deserialized elsewhere, and resumed.
+//!
+//! The macro never sees rustc's type information and works purely
+//! syntactically, which imposes rules on the body: `yield_!` is
+//! statement-position only, variables held across a suspension point
+//! need syntactically determinable types, and only direct borrows may
+//! cross a yield. See [`macro@coroutine`] for the full constraint list
+//! with workarounds.
 //!
 //! # Comparison with async-based generators
 //!
@@ -49,8 +50,8 @@
 //! block. baregen instead generates the state machine itself, which
 //! means no `Pin` (states are always `Unpin`), resume arguments that
 //! are plain function arguments rather than shared-cell tricks, an
-//! inspectable state enum that supports `#[derive(Clone)]` snapshots —
-//! at the price of the v1 restrictions above.
+//! inspectable state enum that supports `#[derive(Clone)]` snapshots
+//! and serde persistence — at the price of the syntactic rules above.
 
 pub use baregen_macro::coroutine;
 
