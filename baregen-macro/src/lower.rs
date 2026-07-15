@@ -441,7 +441,7 @@ fn opaque_jump_err(kw: &str) -> String {
 
 // === Yield detection ===
 
-fn is_yield_macro(mac: &syn::Macro) -> bool {
+pub fn is_yield_macro(mac: &syn::Macro) -> bool {
     mac.path
         .segments
         .last()

@@ -33,11 +33,11 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     };
     check_return_type(&ret_ty)?;
 
-    // Early `return e` becomes a completion transition everywhere in the
-    // body, inside opaque statements included; the rewritten form only
-    // makes sense inside `__drive`, where `self` and `State` resolve.
+    // Early `return e` and `e?` become completion transitions everywhere
+    // in the body, inside opaque statements included; the rewritten form
+    // only makes sense inside `__drive`, where `self` and `State` resolve.
     let mut body = (*item.block).clone();
-    rewrite_early_returns(&mut body, &ret_ty);
+    rewrite_early_exits(&mut body, &ret_ty);
 
     let arg_idents: Vec<syn::Ident> = args.iter().map(|a| a.ident.clone()).collect();
     let cfg = lower::lower(&arg_idents, &body)?;
@@ -436,28 +436,64 @@ fn reverse_postorder(cfg: &Cfg) -> Vec<BlockId> {
     post
 }
 
-// === Early-return rewriting ===
+// === Early-exit rewriting (`return` and `?`) ===
 
-/// Rewrites `return e` anywhere in the body (inside opaque statements
-/// too; closures, async blocks, and nested items are separate scopes and
-/// excluded) into a completion transition. Valid at any expression
-/// position; the return value is evaluated before the state write so a
-/// panic inside it still poisons.
-fn rewrite_early_returns(body: &mut syn::Block, ret_ty: &syn::Type) {
+/// Rewrites `return e` and `e?` anywhere in the body (inside opaque
+/// statements and `yield_!` value expressions too; closures, async
+/// blocks, and nested items are separate scopes and excluded) into
+/// completion transitions. Valid at any expression position; the exit
+/// value is evaluated before the state write so a panic inside it (or
+/// inside a `From` conversion) still poisons.
+fn rewrite_early_exits(body: &mut syn::Block, ret_ty: &syn::Type) {
     struct Rewriter<'a> {
         ret_ty: &'a syn::Type,
     }
     impl VisitMut for Rewriter<'_> {
         fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
             syn::visit_mut::visit_expr_mut(self, e);
-            if let syn::Expr::Return(r) = e {
-                let ret_ty = self.ret_ty;
-                let value = r.expr.take().map_or_else(|| quote!(()), |v| quote!(#v));
-                *e = syn::parse_quote!({
-                    let __ret: #ret_ty = #value;
-                    *self = State::Done;
-                    return ::baregen::CoroutineState::Complete(__ret);
-                });
+            let ret_ty = self.ret_ty;
+            match e {
+                syn::Expr::Return(r) => {
+                    let value = r.expr.take().map_or_else(|| quote!(()), |v| quote!(#v));
+                    *e = syn::parse_quote!({
+                        let __ret: #ret_ty = #value;
+                        *self = State::Done;
+                        return ::baregen::CoroutineState::Complete(__ret);
+                    });
+                }
+                syn::Expr::Try(t) => {
+                    let operand = &t.expr;
+                    // Spanning the generated tokens to the `?` makes a
+                    // trait-bound error (unsupported operand type, or a
+                    // Result/Option mismatch) point at the offending `?`
+                    // instead of the whole attribute.
+                    let span = t.question_token.span();
+                    *e = syn::parse_quote_spanned!(span =>
+                        match ::baregen::BareTry::branch(#operand) {
+                            ::core::ops::ControlFlow::Continue(__v) => __v,
+                            ::core::ops::ControlFlow::Break(__r) => {
+                                let __ret: #ret_ty =
+                                    ::baregen::BareFromResidual::from_residual(__r);
+                                *self = State::Done;
+                                return ::baregen::CoroutineState::Complete(__ret);
+                            }
+                        }
+                    );
+                }
+                _ => {}
+            }
+        }
+        // syn does not parse macro token streams, so a `yield_!` value
+        // expression must be rewritten explicitly; foreign macro tokens
+        // stay untouched (as with `?` outside coroutines, `?` inside
+        // them is not visible to us).
+        fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
+            if !lower::is_yield_macro(mac) || mac.tokens.is_empty() {
+                return;
+            }
+            if let Ok(mut value) = mac.parse_body::<syn::Expr>() {
+                self.visit_expr_mut(&mut value);
+                mac.tokens = quote!(#value);
             }
         }
         fn visit_expr_closure_mut(&mut self, _: &mut syn::ExprClosure) {}
@@ -699,5 +735,58 @@ fn collect_idents(tokens: TokenStream, out: &mut HashSet<String>) {
             proc_macro2::TokenTree::Group(g) => collect_idents(g.stream(), out),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    fn rewritten(mut block: syn::Block) -> String {
+        let ret_ty: syn::Type = parse_quote!(Result<u32, E>);
+        rewrite_early_exits(&mut block, &ret_ty);
+        quote!(#block).to_string()
+    }
+
+    #[test]
+    fn try_becomes_a_branch_match() {
+        let out = rewritten(parse_quote!({
+            let x = f()?;
+        }));
+        assert!(out.contains(":: baregen :: BareTry :: branch (f ())"));
+        assert!(out.contains(":: baregen :: BareFromResidual :: from_residual"));
+        assert!(out.contains("* self = State :: Done ;"));
+        assert!(!out.contains('?'));
+    }
+
+    #[test]
+    fn nested_try_operands_are_rewritten() {
+        let out = rewritten(parse_quote!({
+            g(f()?)?;
+        }));
+        assert!(!out.contains('?'));
+        assert_eq!(out.matches("BareTry :: branch").count(), 2);
+    }
+
+    #[test]
+    fn try_inside_yield_macro_tokens_is_rewritten() {
+        let out = rewritten(parse_quote!({
+            let x = yield_!(f()?);
+        }));
+        assert!(out.contains("yield_ ! (match :: baregen :: BareTry :: branch (f ())"));
+    }
+
+    #[test]
+    fn closures_and_nested_items_are_untouched() {
+        let out = rewritten(parse_quote!({
+            let c = |v: Option<u32>| Some(v? + 1);
+            fn helper(v: Option<u32>) -> Option<u32> {
+                Some(v? + 1)
+            }
+            foreign!(f()?);
+        }));
+        assert!(!out.contains("BareTry"));
+        assert_eq!(out.matches('?').count(), 3);
     }
 }

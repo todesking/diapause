@@ -110,6 +110,69 @@ pub trait Coroutine<R = ()> {
     fn start(&mut self) -> CoroutineState<Self::Yield, Self::Return>;
 }
 
+/// Desugaring target for `?` inside a `#[baregen::coroutine]` function.
+///
+/// The coroutine transformation rewrites `expr?` into a `branch` call so
+/// that `?` works on stable without `std::ops::Try`. Supported operand
+/// types are `Result` and `Option`, exactly as with `?` in a plain
+/// function. This trait shows up in rustc error messages when `?` is
+/// used on an unsupported type, but it is an internal implementation
+/// detail: implementing it for other types is not supported.
+#[doc(hidden)]
+pub trait BareTry {
+    type Output;
+    type Residual;
+    fn branch(self) -> core::ops::ControlFlow<Self::Residual, Self::Output>;
+}
+
+/// Companion of [`BareTry`]: rebuilds the coroutine's return value from
+/// the residual carried out by an early-exiting `?`.
+///
+/// Like `BareTry`, this is an internal implementation detail that only
+/// exists in error messages; implementing it is not supported.
+#[doc(hidden)]
+pub trait BareFromResidual<R> {
+    fn from_residual(r: R) -> Self;
+}
+
+impl<T, E> BareTry for Result<T, E> {
+    type Output = T;
+    type Residual = E;
+    fn branch(self) -> core::ops::ControlFlow<E, T> {
+        match self {
+            Ok(v) => core::ops::ControlFlow::Continue(v),
+            Err(e) => core::ops::ControlFlow::Break(e),
+        }
+    }
+}
+
+// The `From` bound mirrors `?`'s error conversion in plain functions.
+impl<T, E, E2> BareFromResidual<E2> for Result<T, E>
+where
+    E: From<E2>,
+{
+    fn from_residual(r: E2) -> Self {
+        Err(E::from(r))
+    }
+}
+
+impl<T> BareTry for Option<T> {
+    type Output = T;
+    type Residual = ();
+    fn branch(self) -> core::ops::ControlFlow<(), T> {
+        match self {
+            Some(v) => core::ops::ControlFlow::Continue(v),
+            None => core::ops::ControlFlow::Break(()),
+        }
+    }
+}
+
+impl<T> BareFromResidual<()> for Option<T> {
+    fn from_residual((): ()) -> Self {
+        None
+    }
+}
+
 /// Marks a suspension point inside a `#[baregen::coroutine]` function.
 ///
 /// `yield_!(expr)` suspends the coroutine, yielding `expr` to the caller.
