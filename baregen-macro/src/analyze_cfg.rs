@@ -123,6 +123,28 @@ impl<'a> Context<'a> {
 
 // === Borrow substitution and liveness ===
 
+/// Applies `step` to every index yielded by `order`, repeating full passes
+/// until a pass leaves every index unchanged. `step` reports per-index
+/// whether it changed anything; `order` is re-walked from the start on
+/// each pass, so its iteration sequence is part of the fixed point being
+/// computed and must be chosen deliberately by callers.
+fn fixpoint<I>(order: I, mut step: impl FnMut(usize) -> bool)
+where
+    I: IntoIterator<Item = usize> + Clone,
+{
+    loop {
+        let mut changed = false;
+        for i in order.clone() {
+            if step(i) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 impl Context<'_> {
     /// Rewrites the per-block use sets so that a use of a direct-borrow
     /// binding outside its defining region counts as a use of the
@@ -134,32 +156,27 @@ impl Context<'_> {
             self.cfg.blocks.iter().map(|b| b.uses.clone()).collect();
         let mut rebuilds: Vec<BTreeSet<BindingId>> =
             vec![BTreeSet::new(); self.cfg.blocks.len()];
-        loop {
+        fixpoint(0..self.cfg.blocks.len(), |b| {
+            let root = self.region[b];
+            let foreign: Vec<BindingId> = uses[b]
+                .iter()
+                .copied()
+                .filter(|id| self.is_foreign_borrow(*id, root))
+                .collect();
             let mut changed = false;
-            for (b, block_uses) in uses.iter_mut().enumerate() {
-                let root = self.region[b];
-                let foreign: Vec<BindingId> = block_uses
-                    .iter()
-                    .copied()
-                    .filter(|id| self.is_foreign_borrow(*id, root))
-                    .collect();
-                for t in foreign {
-                    block_uses.remove(&t);
-                    rebuilds[root].insert(t);
-                    let BorrowSource::Direct { source, .. } = &self.cfg.bindings[t.0].borrow
-                    else {
-                        unreachable!()
-                    };
-                    if let Some(s) = source {
-                        block_uses.insert(*s);
-                    }
-                    changed = true;
+            for t in foreign {
+                uses[b].remove(&t);
+                rebuilds[root].insert(t);
+                let BorrowSource::Direct { source, .. } = &self.cfg.bindings[t.0].borrow else {
+                    unreachable!()
+                };
+                if let Some(s) = source {
+                    uses[b].insert(*s);
                 }
+                changed = true;
             }
-            if !changed {
-                break;
-            }
-        }
+            changed
+        });
         (uses, rebuilds)
     }
 
@@ -177,26 +194,22 @@ impl Context<'_> {
     fn liveness(&self, uses: &[BTreeSet<BindingId>]) -> Vec<BTreeSet<BindingId>> {
         let n = self.cfg.blocks.len();
         let mut live_in: Vec<BTreeSet<BindingId>> = vec![BTreeSet::new(); n];
-        loop {
-            let mut changed = false;
-            for b in (0..n).rev() {
-                let mut set = BTreeSet::new();
-                for s in self.cfg.blocks[b].terminator.successors() {
-                    set.extend(live_in[s].iter().copied());
-                }
-                for d in &self.cfg.blocks[b].defs {
-                    set.remove(d);
-                }
-                set.extend(uses[b].iter().copied());
-                if set != live_in[b] {
-                    live_in[b] = set;
-                    changed = true;
-                }
+        fixpoint((0..n).rev(), |b| {
+            let mut set = BTreeSet::new();
+            for s in self.cfg.blocks[b].terminator.successors() {
+                set.extend(live_in[s].iter().copied());
             }
-            if !changed {
-                break;
+            for d in &self.cfg.blocks[b].defs {
+                set.remove(d);
             }
-        }
+            set.extend(uses[b].iter().copied());
+            if set != live_in[b] {
+                live_in[b] = set;
+                true
+            } else {
+                false
+            }
+        });
         live_in
     }
 
