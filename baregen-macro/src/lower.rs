@@ -857,8 +857,7 @@ impl Lowerer {
 
     /// Syntactic type inference for an initializer expression.
     fn infer_ty_source(&self, expr: &syn::Expr) -> TySource {
-        match expr {
-            syn::Expr::Paren(p) => self.infer_ty_source(&p.expr),
+        match strip_parens(expr) {
             // Negation of a suffixed numeric literal keeps its type.
             syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => match &*u.expr {
                 syn::Expr::Lit(_) => self.infer_ty_source(&u.expr),
@@ -884,10 +883,7 @@ impl Lowerer {
     }
 
     fn classify_borrow(&self, init: Option<&syn::Expr>, annotated: Option<&syn::Type>) -> BorrowSource {
-        let mut init = init;
-        while let Some(syn::Expr::Paren(p)) = init {
-            init = Some(&p.expr);
-        }
+        let init = init.map(strip_parens);
         match init {
             Some(syn::Expr::Reference(r)) => match &*r.expr {
                 syn::Expr::Path(p) if p.qself.is_none() && p.path.get_ident().is_some() => {
@@ -913,6 +909,15 @@ impl Lowerer {
             _ => BorrowSource::NotABorrow,
         }
     }
+}
+
+/// Unwraps nested `(expr)` parenthesization down to the innermost expression.
+fn strip_parens(expr: &syn::Expr) -> &syn::Expr {
+    let mut expr = expr;
+    while let syn::Expr::Paren(p) = expr {
+        expr = &p.expr;
+    }
+    expr
 }
 
 /// The manifest type of a literal: an explicit suffix (`123u8`, `1.5f32`)
@@ -1215,10 +1220,7 @@ impl Lowerer {
     /// state and are fine; method calls (`local.iter()`) are left to
     /// borrowck.
     fn check_for_local_borrow(&mut self, expr: &syn::Expr) {
-        let mut e = expr;
-        while let syn::Expr::Paren(p) = e {
-            e = &p.expr;
-        }
+        let e = strip_parens(expr);
         if let syn::Expr::Reference(r) = e
             && let syn::Expr::Path(p) = &*r.expr
             && p.qself.is_none()
