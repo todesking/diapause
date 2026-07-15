@@ -43,20 +43,21 @@ any code. `start()` runs the body up to the first `yield_!`; each
   `?` operator on `Result` and `Option`. The generated `resume` is a
   dispatch loop over basic blocks, so join points are never duplicated.
 - **Resume arguments** are ordinary values passed to `resume`, typed via
-  the attribute (`resume = String`), with a separate argument-less
-  `start()` so the first resume value has nowhere to be lost.
+  the attribute (`resume = String`), with a separate zero-argument
+  `start()` so no resume value can be silently dropped on the first
+  call.
 - **Generics, where clauses, reference arguments, and `impl Trait`
   arguments** are carried over to the generated state enum. Elided
   lifetimes are named automatically.
 - **Snapshots**: `#[derive(Clone)]` written under the attribute is moved
   to the state enum, so a suspended coroutine can be cloned and both
   copies resumed independently.
-- **Suspend-state persistence**: because the state enum stores concrete
-  types only (a `for` loop's iterator is stored as
+- **Suspend-state persistence**: because the state enum stores only
+  concrete types (a `for` loop's iterator is stored as
   `<T as IntoIterator>::IntoIter`, not boxed), serde derives work with
   their ordinary semantics. A suspended coroutine can be serialized,
   shipped to another process, deserialized, and resumed — something
-  async-based generator crates cannot do in principle.
+  that is fundamentally impossible for async-based generator crates.
 - **Panic safety**: a coroutine that panics mid-transition is left in a
   `Poisoned` state and panics on further use.
 
@@ -92,7 +93,7 @@ fn main() {
 }
 ```
 
-What serde works for follows from what the state stores:
+Serde support follows directly from what the state stores:
 
 - Range-based iteration (`for i in 0u32..n`) round-trips fully — `Range`
   has serde impls and the mid-iteration cursor is plain data.
@@ -109,7 +110,7 @@ What serde works for follows from what the state stores:
 
 The macro works purely syntactically — it never sees rustc's type
 information — and every state transition is a compile-time rewrite.
-That surfaces as the following rules; each unsupported construct is a
+This shows up as the following rules; each unsupported construct is a
 dedicated compile error with the workaround in the message.
 
 - **`yield_!` is statement-position only**: `yield_!(expr);` or
@@ -118,14 +119,15 @@ dedicated compile error with the workaround in the message.
   (`let x = if c { yield_!(1); a } else { b };`), tail expressions,
   conditions, match scrutinees or guards, `for`-head expressions,
   assignments (`x = yield_!(..)` — resume values bind via `let` only),
-  `if let` (use `match`), or `unsafe` blocks. For value-position needs,
-  assign into an `Option` in each branch and `unwrap()` after the join.
+  `if let` (use `match`), or `unsafe` blocks. If you need the value in
+  expression position, assign into an `Option` in each branch and
+  `unwrap()` after the join.
 - **Syntactic types**: every variable held across a `yield_!` needs a
   syntactically determinable type: an explicit annotation, a suffixed
   or unambiguous literal (`123u8`, `true`), a move from a known
   variable, a function argument, or a range of known endpoints
-  (`0u32..n`). Match-arm and destructuring-`for` bindings have no place
-  for an annotation, so if they cross a yield, rebind first:
+  (`0u32..n`). Match-arm and destructuring-`for` bindings have nowhere
+  to write a type annotation, so if they cross a yield, rebind first:
   `let v2: Type = v;` at the top of the arm or loop body.
 - **Borrows**: references are never stored in the state (the state
   machine is always `Unpin`; there is no self-reference). A direct
@@ -135,24 +137,24 @@ dedicated compile error with the workaround in the message.
   of a local (`for x in &local`) — iterate by value, or borrow an
   argument.
 - **Jumps out of suspending loops**: a `break`/`continue` targeting a
-  loop that contains a `yield_!` must not sit inside a statement that
-  contains no `yield_!` (e.g. a plain `if done { break; }` after a
-  yield). Move the exit condition into the loop header via a flag
+  loop that contains a `yield_!` must sit inside a statement that also
+  contains a `yield_!`; a plain `if done { break; }` after a yield is
+  an error. Move the exit condition into the loop header via a flag
   variable, or restructure so the jump shares a statement with a yield.
   `break` with a value cannot target such a loop at all.
 - **`?` is supported on `Result` and `Option` only.** It is rewritten to
   the internal `BareTry` / `BareFromResidual` traits (visible in error
   messages when `?` is used on other types); implementing them for
   custom types is not supported.
-- **A body whose every live path ends in an explicit `return`** (with
-  the diverging control flow containing yields) produces a puzzling
+- **A body in which every live path ends in an explicit `return`**
+  (where the paths that diverge contain yields) produces a puzzling
   `E0308: expected <ret>, found ()` on the unreachable implicit tail.
   Append `unreachable!()` as the tail expression.
 - **Visibility**: the generated state enum is as public as the function,
   so argument and return types must be at least that visible or rustc
   reports `E0446` (private type in public interface).
 - Variables not carried into the next state are dropped at the
-  transition, which can be earlier than their lexical scope end.
+  transition, which can be earlier than the end of their lexical scope.
 
 ## Comparison with existing crates
 
@@ -165,5 +167,5 @@ machine itself instead:
 - resume arguments are real arguments, not channel tricks;
 - the state enum is an inspectable, nameable type that supports
   `derive`d snapshots and serde persistence of suspended coroutines;
-- in exchange, the body must stay within the syntactic rules above,
-  whereas async-based generators accept arbitrary control flow.
+- the trade-off is that the body must stick to the syntactic rules
+  above, whereas async-based generators accept arbitrary control flow.
