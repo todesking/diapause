@@ -33,7 +33,7 @@
 //! `yield_!` works inside `if` / `match` / `loop` / `while` /
 //! `while let` / `for` at any nesting depth, mixed with `break`,
 //! `continue`, early `return`, and the `?` operator on `Result` and
-//! `Option`. Because the state enum stores concrete types only, serde
+//! `Option`. Because the state enum stores only concrete types, serde
 //! derives work with their ordinary semantics and a suspended coroutine
 //! can be serialized, deserialized elsewhere, and resumed.
 //!

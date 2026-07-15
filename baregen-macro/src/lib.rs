@@ -57,8 +57,8 @@ mod lower;
 ///   conditions, match scrutinees or guards, `for`-head expressions,
 ///   assignments (`x = yield_!(..)` — resume values bind via `let`
 ///   only), `if let` (use `match`), `unsafe` blocks, or other macro
-///   invocations. For value-position needs, assign into an
-///   `Option<T>` in each branch and `unwrap()` after the join.
+///   invocations. If you need the value in expression position, assign
+///   into an `Option<T>` in each branch and `unwrap()` after the join.
 /// - **Syntactic types.** A variable held across a `yield_!` must have
 ///   a syntactically determinable type: an explicit annotation, a
 ///   suffixed or unambiguous literal (`123u8`, `true`), a move from a
@@ -66,7 +66,7 @@ mod lower;
 ///   endpoint (`0u32..n`). This includes the iterator of a `for` loop
 ///   whose body yields: iterate over something with a known type.
 /// - **Pattern bindings crossing a yield.** Match-arm bindings and
-///   destructuring `for`-pattern bindings have no place for a type
+///   destructuring `for`-pattern bindings have nowhere to write a type
 ///   annotation, so they must not cross a yield; rebind first
 ///   (`let v2: Type = v;`) at the top of the arm or loop body.
 /// - **Borrows.** References are never stored in the state. A direct

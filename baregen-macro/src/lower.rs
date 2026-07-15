@@ -37,7 +37,7 @@ pub enum BindingKind {
     /// Resume binding of `let r = yield_!(..);`; its type defaults to
     /// the coroutine's resume type.
     Resume,
-    /// Bound by a `match`/`while let` arm pattern. There is no place to
+    /// Bound by a `match`/`while let` arm pattern. There is nowhere to
     /// write a type annotation, so it must not cross a state boundary.
     ArmPat,
     /// Synthetic `__iter{k}` binding holding a `for` loop's iterator.
@@ -623,7 +623,7 @@ impl Lowerer {
             TailCtx::FnReturn => {
                 if contains_yield_expr(e) {
                     // The trailing expression is the return value, so a
-                    // yield inside it is value-position yield. Lower the
+                    // yield inside it is a value-position yield. Lower the
                     // statement anyway to surface the most specific
                     // error; if it lowers cleanly the only problem is
                     // its tail position.

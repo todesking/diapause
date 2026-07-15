@@ -34,7 +34,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     check_return_type(&ret_ty)?;
 
     // Early `return e` and `e?` become completion transitions everywhere
-    // in the body, inside opaque statements included; the rewritten form
+    // in the body, including inside opaque statements; the rewritten form
     // only makes sense inside `__drive`, where `self` and `State` resolve.
     let mut body = (*item.block).clone();
     rewrite_early_exits(&mut body, &ret_ty);
@@ -96,7 +96,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
         .map(|_| quote!(__phantom: ::core::marker::PhantomData,));
 
     // Without yields the body is a single transition, so no panic can
-    // strike between a state write and the return: Done doubles as the
+    // occur between a state write and the return: Done doubles as the
     // placeholder and Poisoned is omitted (as in v1).
     let n_yields = cfg.blocks.iter().filter(|b| b.resume_point).count();
     let (poisoned_variant, placeholder) = if n_yields == 0 {

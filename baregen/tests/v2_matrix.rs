@@ -96,7 +96,7 @@ fn while_inside_match_arm() {
     assert_eq!(c.resume(()), CoroutineState::Complete(10));
 }
 
-/// while inside for: each item is retried until the resume value accepts
+/// while inside for: each item is retried until a resume value accepts
 /// it, then the outer for advances. The exit condition lives in the
 /// while header via a flag (a bare `if ok { break; }` would be a jump
 /// from a yield-free statement, which is rejected).
