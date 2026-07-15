@@ -9,6 +9,8 @@ mod args;
 mod cfg;
 mod expand;
 mod lower;
+#[cfg(test)]
+mod test_util;
 mod ty_infer;
 
 /// Transforms a function into a coroutine state machine.

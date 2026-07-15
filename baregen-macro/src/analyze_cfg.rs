@@ -622,7 +622,7 @@ fn terminator_exprs(t: &Terminator) -> Vec<&syn::Expr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lower::lower;
+    use crate::test_util::lower_args;
     use syn::parse_quote;
 
     fn unit() -> syn::Type {
@@ -634,10 +634,8 @@ mod tests {
         block: &syn::Block,
         resume_ty: &syn::Type,
     ) -> (Cfg, syn::Result<Analysis>) {
-        let idents: Vec<syn::Ident> = args
-            .iter()
-            .map(|(n, _)| syn::Ident::new(n, proc_macro2::Span::call_site()))
-            .collect();
+        let names: Vec<&str> = args.iter().map(|(n, _)| *n).collect();
+        let cfg = lower_args(&names, block);
         let infos: Vec<ArgInfo> = args
             .iter()
             .map(|(_, t)| ArgInfo {
@@ -645,7 +643,6 @@ mod tests {
                 ty: syn::parse_str(t).unwrap(),
             })
             .collect();
-        let cfg = lower(&idents, block).unwrap();
         let result = analyze(&cfg, &infos, resume_ty);
         (cfg, result)
     }

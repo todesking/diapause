@@ -1221,15 +1221,8 @@ fn wrap_arm_body(body: &syn::Expr) -> syn::Stmt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::lower_args;
     use syn::parse_quote;
-
-    fn lower_args(args: &[&str], block: &syn::Block) -> Cfg {
-        let idents: Vec<syn::Ident> = args
-            .iter()
-            .map(|a| syn::Ident::new(a, proc_macro2::Span::call_site()))
-            .collect();
-        lower(&idents, block).unwrap()
-    }
 
     fn lower_ok(block: &syn::Block) -> Cfg {
         lower_args(&[], block)
