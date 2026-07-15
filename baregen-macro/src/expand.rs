@@ -11,7 +11,8 @@ use syn::visit_mut::VisitMut;
 
 use crate::analyze_cfg::{self, Analysis, ArgInfo, Variant};
 use crate::args::MacroArgs;
-use crate::lower::{self, skip_nested_scopes, BlockId, Cfg, ErrorSink, Terminator};
+use crate::cfg::{BlockId, Cfg, ResumeBinding, Terminator};
+use crate::lower::{self, skip_nested_scopes, ErrorSink};
 
 /// A function argument (simple-identifier pattern only). Carries the
 /// `ident` needed to emit code, unlike `analyze_cfg::ArgInfo`, which drops
@@ -312,7 +313,7 @@ fn build_resume_dispatch(cx: &ExpandCtx, suspension: &Suspension) -> TokenStream
 /// Builds the whole `fn __drive` definition: `Codegen` assembly, one
 /// dispatch arm per variant, and the placeholder-swap loop.
 fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
-    let mut resume_bindings: BTreeMap<BlockId, &lower::ResumeBinding> = BTreeMap::new();
+    let mut resume_bindings: BTreeMap<BlockId, &ResumeBinding> = BTreeMap::new();
     for block in &cx.cfg.blocks {
         if let Terminator::Yield {
             resume_binding: Some(rb),
@@ -371,7 +372,7 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
 struct Codegen<'a> {
     cfg: &'a Cfg,
     analysis: &'a Analysis,
-    resume_bindings: BTreeMap<BlockId, &'a lower::ResumeBinding>,
+    resume_bindings: BTreeMap<BlockId, &'a ResumeBinding>,
     yield_ty: &'a syn::Type,
     ret_ty: &'a syn::Type,
     start_pattern: TokenStream,

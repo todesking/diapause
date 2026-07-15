@@ -6,8 +6,10 @@ use proc_macro::TokenStream;
 
 mod analyze_cfg;
 mod args;
+mod cfg;
 mod expand;
 mod lower;
+mod ty_infer;
 
 /// Transforms a function into a coroutine state machine.
 ///

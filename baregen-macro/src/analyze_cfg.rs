@@ -12,10 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use quote::format_ident;
 use syn::visit::Visit;
 
-use crate::lower::{
-    BindingId, BindingKind, BlockId, BorrowSource, Cfg, ErrorSink, Terminator, TySource,
-    UseCollector,
-};
+use crate::cfg::{BindingId, BindingKind, BlockId, BorrowSource, Cfg, Terminator, TySource};
+use crate::lower::{ErrorSink, UseCollector};
 
 /// Signature-level information about one function argument, parallel to
 /// `BindingId(0)..BindingId(args.len())`. Built from `expand::ArgVar` (via

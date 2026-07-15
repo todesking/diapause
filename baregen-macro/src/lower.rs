@@ -9,168 +9,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-pub type BlockId = usize;
-
-/// Identifies one binding (argument, `let`, resume binding, or pattern
-/// binding) uniquely across shadowing and scopes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BindingId(pub usize);
-
-#[derive(Debug)]
-pub struct Binding {
-    pub ident: syn::Ident,
-    pub mutability: Option<syn::Token![mut]>,
-    pub kind: BindingKind,
-    /// Syntactic type information; resolved recursively by the analysis.
-    pub ty: TySource,
-    pub borrow: BorrowSource,
-    /// Index into the defining block's `stmts` of the `let` statement
-    /// that introduced this binding, if it was introduced by one (as
-    /// opposed to a function argument, a resume binding, or a
-    /// match/`for` pattern).
-    pub def_stmt: Option<usize>,
-}
-
-/// How a binding was introduced.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BindingKind {
-    /// Function argument; its type comes from the signature.
-    Arg,
-    /// Bound by a `let` statement (simple or destructuring).
-    Local,
-    /// Resume binding of `let r = yield_!(..);`; its type defaults to
-    /// the coroutine's resume type.
-    Resume,
-    /// Bound by a `match`/`while let` arm pattern. There is nowhere to
-    /// write a type annotation, so it must not cross a state boundary.
-    ArmPat,
-    /// Synthetic `__iter{k}` binding holding a `for` loop's iterator.
-    ForIter,
-    /// Bound by a destructuring `for` loop pattern. Component types
-    /// cannot be derived, so it must not cross a state boundary.
-    ForPat,
-}
-
-/// Syntactically determined type of a binding.
-// One instance per binding; keeping the syn type inline is simpler than
-// boxing it (same trade-off as Terminator).
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-pub enum TySource {
-    Unknown,
-    /// Explicit annotation, literal suffix, or unambiguous literal kind.
-    Known(syn::Type),
-    /// `let y = x;`: the type follows the moved binding.
-    Moved(BindingId),
-    /// `a..b` / `a..=b`: `Range<T>` / `RangeInclusive<T>` where `T` is
-    /// the first endpoint whose type is known.
-    Range {
-        inclusive: bool,
-        start: Box<TySource>,
-        end: Box<TySource>,
-    },
-    /// A `for` loop's iterator: `<T as IntoIterator>::IntoIter` where
-    /// the inner source is the type of the iterated expression.
-    IntoIter(Box<TySource>),
-    /// A `for` loop's variable: `<I as Iterator>::Item` where `I` is
-    /// the type of the loop's `__iter{k}` binding.
-    IterItem(BindingId),
-}
-
-/// Classification of a binding's initializer as a borrow.
-#[derive(Debug)]
-pub enum BorrowSource {
-    NotABorrow,
-    /// `let y = &x;` / `let y = &mut x;` with a plain identifier source.
-    /// `source` is `None` when the identifier is not a local binding
-    /// (e.g. a static); the borrow is still rebuilt by name.
-    Direct {
-        source_ident: syn::Ident,
-        source: Option<BindingId>,
-        mutable: bool,
-    },
-    /// A reference that cannot be reconstructed; the message explains why.
-    NonReconstructible { why: &'static str },
-}
-
-#[derive(Debug)]
-pub struct Cfg {
-    pub blocks: Vec<Block>,
-    pub entry: BlockId,
-    /// All bindings, indexed by `BindingId`; the function arguments come
-    /// first, in declaration order.
-    pub bindings: Vec<Binding>,
-}
-
-#[derive(Debug)]
-pub struct Block {
-    /// Opaque statements: anything that does not contain `yield_!`.
-    pub stmts: Vec<syn::Stmt>,
-    pub terminator: Terminator,
-    /// Bindings read in this block before any local redefinition,
-    /// over-approximated for opaque statements.
-    pub uses: BTreeSet<BindingId>,
-    /// Bindings introduced in this block.
-    pub defs: BTreeSet<BindingId>,
-    /// Resume entry point after a yield; always becomes an enum variant.
-    pub resume_point: bool,
-    /// Set by simplification: the block has a unique predecessor and is
-    /// emitted inline in that predecessor's transition arm instead of
-    /// becoming an enum variant.
-    pub inline: bool,
-}
-
-// A CFG holds a handful of terminators per coroutine; keeping the syn
-// expressions inline is simpler than boxing them.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-pub enum Terminator {
-    /// Unconditional transfer (join points, loop back edges).
-    Goto(BlockId),
-    /// From `if`; an `if` without `else` points `else_` at the join.
-    Branch {
-        cond: syn::Expr,
-        then_: BlockId,
-        else_: BlockId,
-    },
-    /// From `match` and `while let`.
-    Match {
-        scrutinee: syn::Expr,
-        arms: Vec<MatchArm>,
-    },
-    /// Suspension point.
-    Yield {
-        value: syn::Expr,
-        resume_binding: Option<ResumeBinding>,
-        next: BlockId,
-    },
-    /// From `for` loops: calls `next()` on the stored iterator and
-    /// matches `Some(pat) => body / None => exit`.
-    IterNext {
-        iter: syn::Ident,
-        pat: Box<syn::Pat>,
-        body: BlockId,
-        exit: BlockId,
-    },
-    /// End of the coroutine body; the value is the trailing expression
-    /// or `()`. Early `return` is handled by expression rewriting, not
-    /// by this terminator.
-    Return(syn::Expr),
-}
-
-#[derive(Debug)]
-pub struct MatchArm {
-    pub pat: syn::Pat,
-    pub guard: Option<syn::Expr>,
-    pub body: BlockId,
-}
-
-#[derive(Debug)]
-pub struct ResumeBinding {
-    pub binding: BindingId,
-    pub mutability: Option<syn::Token![mut]>,
-    pub ty: Option<syn::Type>,
-}
+use crate::cfg::{
+    Binding, BindingId, BindingKind, Block, BlockId, BorrowSource, Cfg, MatchArm, ResumeBinding,
+    Terminator, TySource, simplify,
+};
+use crate::ty_infer::strip_parens;
 
 /// The syntactic form of a `yield_!` resume binding, before it has been
 /// assigned a `BindingId`.
@@ -178,54 +21,6 @@ struct ResumeBindingSpec {
     ident: syn::Ident,
     mutability: Option<syn::Token![mut]>,
     ty: Option<syn::Type>,
-}
-
-impl Terminator {
-    /// Successor block ids, in the order a `match`/`if` would evaluate
-    /// them. Allocation-free: fixed-arity terminators pack their targets
-    /// into a small array, and `Match` walks its arms slice directly.
-    pub fn successors(&self) -> Successors<'_> {
-        match self {
-            Terminator::Goto(b) => Successors::Fixed([Some(*b), None].into_iter()),
-            Terminator::Branch { then_, else_, .. } => {
-                Successors::Fixed([Some(*then_), Some(*else_)].into_iter())
-            }
-            Terminator::Match { arms, .. } => Successors::Match(arms.iter()),
-            Terminator::Yield { next, .. } => Successors::Fixed([Some(*next), None].into_iter()),
-            Terminator::IterNext { body, exit, .. } => {
-                Successors::Fixed([Some(*body), Some(*exit)].into_iter())
-            }
-            Terminator::Return(_) => Successors::Fixed([None, None].into_iter()),
-        }
-    }
-}
-
-/// Iterator over a terminator's successor block ids. `Fixed` covers
-/// terminators with at most two successors (the `None` slots are
-/// skipped); `Match` has one successor per arm.
-pub enum Successors<'a> {
-    Fixed(std::array::IntoIter<Option<BlockId>, 2>),
-    Match(std::slice::Iter<'a, MatchArm>),
-}
-
-impl Iterator for Successors<'_> {
-    type Item = BlockId;
-
-    fn next(&mut self) -> Option<BlockId> {
-        match self {
-            Successors::Fixed(it) => it.find_map(|s| s),
-            Successors::Match(it) => it.next().map(|a| a.body),
-        }
-    }
-}
-
-impl DoubleEndedIterator for Successors<'_> {
-    fn next_back(&mut self) -> Option<BlockId> {
-        match self {
-            Successors::Fixed(it) => it.rfind(|s| s.is_some()).flatten(),
-            Successors::Match(it) => it.next_back().map(|a| a.body),
-        }
-    }
 }
 
 /// Accumulates zero or more `syn::Error`s, combining them in push order
@@ -299,7 +94,9 @@ struct Frame {
     exit: BlockId,
 }
 
-struct Lowerer {
+/// `pub(crate)` so that `ty_infer.rs` can add an `impl Lowerer` block of
+/// its own.
+pub(crate) struct Lowerer {
     blocks: Vec<DraftBlock>,
     bindings: Vec<Binding>,
     scopes: Vec<HashMap<String, BindingId>>,
@@ -404,7 +201,9 @@ impl Lowerer {
         self.blocks[self.current].terminator.is_some()
     }
 
-    fn resolve(&self, name: &str) -> Option<BindingId> {
+    /// `pub(crate)` for `ty_infer.rs`'s inference and borrow-classification
+    /// methods.
+    pub(crate) fn resolve(&self, name: &str) -> Option<BindingId> {
         self.scopes
             .iter()
             .rev()
@@ -963,92 +762,6 @@ impl Lowerer {
         }
     }
 
-    /// Syntactic type inference for an initializer expression.
-    fn infer_ty_source(&self, expr: &syn::Expr) -> TySource {
-        match strip_parens(expr) {
-            // Negation of a suffixed numeric literal keeps its type.
-            syn::Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => match &*u.expr {
-                syn::Expr::Lit(_) => self.infer_ty_source(&u.expr),
-                _ => TySource::Unknown,
-            },
-            syn::Expr::Lit(lit) => infer_lit_ty(&lit.lit).map_or(TySource::Unknown, TySource::Known),
-            // Move propagation: `let y = x;` follows x's type.
-            syn::Expr::Path(p) if p.qself.is_none() => p
-                .path
-                .get_ident()
-                .and_then(|i| self.resolve(&i.to_string()))
-                .map_or(TySource::Unknown, TySource::Moved),
-            syn::Expr::Range(r) => match (&r.start, &r.end) {
-                (Some(start), Some(end)) => TySource::Range {
-                    inclusive: matches!(r.limits, syn::RangeLimits::Closed(_)),
-                    start: Box::new(self.infer_ty_source(start)),
-                    end: Box::new(self.infer_ty_source(end)),
-                },
-                _ => TySource::Unknown,
-            },
-            _ => TySource::Unknown,
-        }
-    }
-
-    fn classify_borrow(&self, init: Option<&syn::Expr>, annotated: Option<&syn::Type>) -> BorrowSource {
-        let init = init.map(strip_parens);
-        match init {
-            Some(syn::Expr::Reference(r)) => match &*r.expr {
-                syn::Expr::Path(p) if p.qself.is_none() && p.path.get_ident().is_some() => {
-                    let source_ident = p.path.get_ident().unwrap().clone();
-                    BorrowSource::Direct {
-                        source: self.resolve(&source_ident.to_string()),
-                        source_ident,
-                        mutable: r.mutability.is_some(),
-                    }
-                }
-                _ => BorrowSource::NonReconstructible {
-                    why: "is held across yield_! but borrows a non-trivial place; only direct \
-                          borrows of local variables (`let y = &x;` / `let y = &mut x;`) can be \
-                          reconstructed after resume",
-                },
-            },
-            _ if matches!(annotated, Some(syn::Type::Reference(_))) => {
-                BorrowSource::NonReconstructible {
-                    why: "has a reference type but is not a direct borrow (`let y = &x;` / \
-                          `let y = &mut x;`), so it cannot be held across yield_!",
-                }
-            }
-            _ => BorrowSource::NotABorrow,
-        }
-    }
-}
-
-/// Unwraps nested `(expr)` parenthesization down to the innermost expression.
-fn strip_parens(expr: &syn::Expr) -> &syn::Expr {
-    let mut expr = expr;
-    while let syn::Expr::Paren(p) = expr {
-        expr = &p.expr;
-    }
-    expr
-}
-
-/// The manifest type of a literal: an explicit suffix (`123u8`, `1.5f32`)
-/// or an unambiguous literal kind (`true`, `'c'`, `b'x'`). Unsuffixed
-/// numeric literals are NOT given the i32/f64 default: the actual type
-/// may be inferred differently by rustc, and guessing wrong would surface
-/// as a confusing error in generated code.
-fn infer_lit_ty(lit: &syn::Lit) -> Option<syn::Type> {
-    let suffix_ty = |suffix: &str, span: proc_macro2::Span| -> Option<syn::Type> {
-        if suffix.is_empty() {
-            return None;
-        }
-        let ident = syn::Ident::new(suffix, span);
-        Some(syn::parse_quote!(#ident))
-    };
-    match lit {
-        syn::Lit::Int(i) => suffix_ty(i.suffix(), i.span()),
-        syn::Lit::Float(f) => suffix_ty(f.suffix(), f.span()),
-        syn::Lit::Bool(_) => Some(syn::parse_quote!(bool)),
-        syn::Lit::Char(_) => Some(syn::parse_quote!(char)),
-        syn::Lit::Byte(_) => Some(syn::parse_quote!(u8)),
-        _ => None,
-    }
 }
 
 fn is_block_like(e: &syn::Expr) -> bool {
@@ -1496,121 +1209,6 @@ impl<'ast> Visit<'ast> for OpaqueChecker {
     // Separate scopes: break/continue and yield_! inside these belong to
     // them, not to the coroutine.
     skip_nested_scopes!(Visit);
-}
-
-// === CFG simplification ===
-
-/// Merges single-predecessor `Goto` chains, drops unreachable blocks,
-/// and marks the remaining single-predecessor blocks (branch/match arm
-/// targets) as inline. Resume points always stay separate blocks: they
-/// are the state-machine's resume entry variants.
-fn simplify(cfg: &mut Cfg) {
-    remove_unreachable(cfg);
-    merge_goto_chains(cfg);
-    remove_unreachable(cfg);
-    let preds = pred_edge_counts(&cfg.blocks);
-    for (i, b) in cfg.blocks.iter_mut().enumerate() {
-        b.inline = i != cfg.entry && !b.resume_point && preds[i] == 1;
-    }
-}
-
-fn pred_edge_counts(blocks: &[Block]) -> Vec<usize> {
-    let mut counts = vec![0usize; blocks.len()];
-    for b in blocks {
-        for s in b.terminator.successors() {
-            counts[s] += 1;
-        }
-    }
-    counts
-}
-
-fn merge_goto_chains(cfg: &mut Cfg) {
-    loop {
-        let preds = pred_edge_counts(&cfg.blocks);
-        let mut pair = None;
-        for (b, blk) in cfg.blocks.iter().enumerate() {
-            if let Terminator::Goto(c) = &blk.terminator {
-                let c = *c;
-                if c != b && c != cfg.entry && preds[c] == 1 && !cfg.blocks[c].resume_point {
-                    pair = Some((b, c));
-                    break;
-                }
-            }
-        }
-        let Some((b, c)) = pair else { break };
-        // Absorb c into b; c becomes an unreachable tombstone that the
-        // caller removes afterwards.
-        let mut stmts = std::mem::take(&mut cfg.blocks[c].stmts);
-        let term = std::mem::replace(
-            &mut cfg.blocks[c].terminator,
-            Terminator::Return(syn::parse_quote!(())),
-        );
-        let uses = std::mem::take(&mut cfg.blocks[c].uses);
-        let defs = std::mem::take(&mut cfg.blocks[c].defs);
-        let bb = &mut cfg.blocks[b];
-        bb.stmts.append(&mut stmts);
-        bb.terminator = term;
-        for u in uses {
-            if !bb.defs.contains(&u) {
-                bb.uses.insert(u);
-            }
-        }
-        bb.defs.extend(defs);
-    }
-}
-
-fn remove_unreachable(cfg: &mut Cfg) {
-    let mut reachable = vec![false; cfg.blocks.len()];
-    let mut stack = vec![cfg.entry];
-    while let Some(b) = stack.pop() {
-        if std::mem::replace(&mut reachable[b], true) {
-            continue;
-        }
-        stack.extend(cfg.blocks[b].terminator.successors());
-    }
-    if reachable.iter().all(|r| *r) {
-        return;
-    }
-    let mut remap = vec![usize::MAX; cfg.blocks.len()];
-    let mut next = 0;
-    for (i, r) in reachable.iter().enumerate() {
-        if *r {
-            remap[i] = next;
-            next += 1;
-        }
-    }
-    let blocks = std::mem::take(&mut cfg.blocks);
-    cfg.blocks = blocks
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| reachable[*i])
-        .map(|(_, b)| b)
-        .collect();
-    for b in &mut cfg.blocks {
-        retarget(&mut b.terminator, &remap);
-    }
-    cfg.entry = remap[cfg.entry];
-}
-
-fn retarget(t: &mut Terminator, remap: &[usize]) {
-    match t {
-        Terminator::Goto(b) => *b = remap[*b],
-        Terminator::Branch { then_, else_, .. } => {
-            *then_ = remap[*then_];
-            *else_ = remap[*else_];
-        }
-        Terminator::Match { arms, .. } => {
-            for arm in arms {
-                arm.body = remap[arm.body];
-            }
-        }
-        Terminator::Yield { next, .. } => *next = remap[*next],
-        Terminator::IterNext { body, exit, .. } => {
-            *body = remap[*body];
-            *exit = remap[*exit];
-        }
-        Terminator::Return(_) => {}
-    }
 }
 
 /// Turns a match arm body into a statement for lowering: the arm's value
