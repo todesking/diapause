@@ -168,14 +168,49 @@ pub struct ResumeBinding {
 }
 
 impl Terminator {
-    pub fn successors(&self) -> Vec<BlockId> {
+    /// Successor block ids, in the order a `match`/`if` would evaluate
+    /// them. Allocation-free: fixed-arity terminators pack their targets
+    /// into a small array, and `Match` walks its arms slice directly.
+    pub fn successors(&self) -> Successors<'_> {
         match self {
-            Terminator::Goto(b) => vec![*b],
-            Terminator::Branch { then_, else_, .. } => vec![*then_, *else_],
-            Terminator::Match { arms, .. } => arms.iter().map(|a| a.body).collect(),
-            Terminator::Yield { next, .. } => vec![*next],
-            Terminator::IterNext { body, exit, .. } => vec![*body, *exit],
-            Terminator::Return(_) => vec![],
+            Terminator::Goto(b) => Successors::Fixed([Some(*b), None].into_iter()),
+            Terminator::Branch { then_, else_, .. } => {
+                Successors::Fixed([Some(*then_), Some(*else_)].into_iter())
+            }
+            Terminator::Match { arms, .. } => Successors::Match(arms.iter()),
+            Terminator::Yield { next, .. } => Successors::Fixed([Some(*next), None].into_iter()),
+            Terminator::IterNext { body, exit, .. } => {
+                Successors::Fixed([Some(*body), Some(*exit)].into_iter())
+            }
+            Terminator::Return(_) => Successors::Fixed([None, None].into_iter()),
+        }
+    }
+}
+
+/// Iterator over a terminator's successor block ids. `Fixed` covers
+/// terminators with at most two successors (the `None` slots are
+/// skipped); `Match` has one successor per arm.
+pub enum Successors<'a> {
+    Fixed(std::array::IntoIter<Option<BlockId>, 2>),
+    Match(std::slice::Iter<'a, MatchArm>),
+}
+
+impl Iterator for Successors<'_> {
+    type Item = BlockId;
+
+    fn next(&mut self) -> Option<BlockId> {
+        match self {
+            Successors::Fixed(it) => it.find_map(|s| s),
+            Successors::Match(it) => it.next().map(|a| a.body),
+        }
+    }
+}
+
+impl DoubleEndedIterator for Successors<'_> {
+    fn next_back(&mut self) -> Option<BlockId> {
+        match self {
+            Successors::Fixed(it) => it.rfind(|s| s.is_some()).flatten(),
+            Successors::Match(it) => it.next_back().map(|a| a.body),
         }
     }
 }

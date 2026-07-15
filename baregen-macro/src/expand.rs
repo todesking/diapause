@@ -426,7 +426,7 @@ fn reverse_postorder(cfg: &Cfg) -> Vec<BlockId> {
             continue;
         }
         stack.push((b, true));
-        for s in cfg.blocks[b].terminator.successors().into_iter().rev() {
+        for s in cfg.blocks[b].terminator.successors().rev() {
             if !visited[s] {
                 stack.push((s, false));
             }
