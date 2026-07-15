@@ -167,6 +167,14 @@ pub struct ResumeBinding {
     pub ty: Option<syn::Type>,
 }
 
+/// The syntactic form of a `yield_!` resume binding, before it has been
+/// assigned a `BindingId`.
+struct ResumeBindingSpec {
+    ident: syn::Ident,
+    mutability: Option<syn::Token![mut]>,
+    ty: Option<syn::Type>,
+}
+
 impl Terminator {
     /// Successor block ids, in the order a `match`/`if` would evaluate
     /// them. Allocation-free: fixed-arity terminators pack their targets
@@ -773,9 +781,11 @@ impl Lowerer {
             other => (other, None),
         };
         let binding = match pat {
-            syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
-                (pi.ident.clone(), pi.mutability, ty)
-            }
+            syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => ResumeBindingSpec {
+                ident: pi.ident.clone(),
+                mutability: pi.mutability,
+                ty,
+            },
             other => {
                 return self.err(syn::Error::new_spanned(other, ERR_SIMPLE_BINDING));
             }
@@ -785,11 +795,7 @@ impl Lowerer {
 
     /// Ends the current block with a `Yield` terminator and switches to
     /// the resume-point continuation block.
-    fn lower_yield(
-        &mut self,
-        mac: &syn::Macro,
-        binding: Option<(syn::Ident, Option<syn::Token![mut]>, Option<syn::Type>)>,
-    ) {
+    fn lower_yield(&mut self, mac: &syn::Macro, binding: Option<ResumeBindingSpec>) {
         let value: syn::Expr = if mac.tokens.is_empty() {
             syn::parse_quote!(())
         } else {
@@ -806,17 +812,17 @@ impl Lowerer {
         self.check_no_yield(&value, ERR_STMT_POSITION);
         self.record_expr_uses(&value, self.current);
         let next = self.new_block(true);
-        let resume_binding = binding.map(|(ident, mutability, ty)| {
-            let id = self.define(&ident, next, BindingKind::Resume);
+        let resume_binding = binding.map(|spec| {
+            let id = self.define(&spec.ident, next, BindingKind::Resume);
             let b = &mut self.bindings[id.0];
-            b.mutability = mutability;
-            if let Some(t) = &ty {
+            b.mutability = spec.mutability;
+            if let Some(t) = &spec.ty {
                 b.ty = TySource::Known(t.clone());
             }
             ResumeBinding {
                 binding: id,
-                mutability,
-                ty,
+                mutability: spec.mutability,
+                ty: spec.ty,
             }
         });
         self.terminate(Terminator::Yield {
@@ -832,7 +838,7 @@ impl Lowerer {
             Some(l) => self.find_labeled_frame(&l.ident.to_string()),
             None => self.innermost_loop_frame(),
         };
-        let Some((_, exit)) = frame else {
+        let Some(frame) = frame else {
             return self.err(syn::Error::new_spanned(
                 b,
                 match &b.label {
@@ -841,6 +847,7 @@ impl Lowerer {
                 },
             ));
         };
+        let exit = frame.exit;
         if let Some(value) = &b.expr {
             self.err(syn::Error::new_spanned(value, ERR_BREAK_VALUE));
         }
@@ -855,7 +862,7 @@ impl Lowerer {
             Some(l) => self.find_labeled_frame(&l.ident.to_string()),
             None => self.innermost_loop_frame(),
         };
-        let Some((header, _)) = frame else {
+        let Some(frame) = frame else {
             return self.err(syn::Error::new_spanned(
                 c,
                 match &c.label {
@@ -864,7 +871,7 @@ impl Lowerer {
                 },
             ));
         };
-        let Some(header) = header else {
+        let Some(header) = frame.header else {
             return self.err(syn::Error::new_spanned(
                 c,
                 "`continue` cannot target a labeled block",
@@ -874,20 +881,15 @@ impl Lowerer {
         self.current = self.new_block(false);
     }
 
-    fn find_labeled_frame(&self, name: &str) -> Option<(Option<BlockId>, BlockId)> {
+    fn find_labeled_frame(&self, name: &str) -> Option<&Frame> {
         self.labels
             .iter()
             .rev()
             .find(|f| f.label.as_deref() == Some(name))
-            .map(|f| (f.header, f.exit))
     }
 
-    fn innermost_loop_frame(&self) -> Option<(Option<BlockId>, BlockId)> {
-        self.labels
-            .iter()
-            .rev()
-            .find(|f| f.header.is_some())
-            .map(|f| (f.header, f.exit))
+    fn innermost_loop_frame(&self) -> Option<&Frame> {
+        self.labels.iter().rev().find(|f| f.header.is_some())
     }
 
     /// Appends a statement without yield_! to the current block.
