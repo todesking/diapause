@@ -7,13 +7,13 @@
 //! the borrowed binding instead, and the borrow is re-established at the
 //! head of every arm (region) that uses it outside its defining region.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use syn::visit::Visit;
 
 use crate::lower::{
-    BindingId, BindingKind, BlockId, BorrowSource, Cfg, ErrorSink, PatBindingCollector, Terminator,
-    TySource, UseCollector,
+    BindingId, BindingKind, BlockId, BorrowSource, Cfg, ErrorSink, Terminator, TySource,
+    UseCollector,
 };
 
 /// Signature-level information about one function argument, parallel to
@@ -212,11 +212,10 @@ impl Context<'_> {
     /// statement is dropped unless the binding is still used within its
     /// own region after the definition (borrows have no side effects).
     fn removed_statements(&self, rebuilds: &[BTreeSet<BindingId>]) -> Vec<BTreeSet<usize>> {
-        let def_stmt = self.def_stmt_indices();
         let mut out: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); self.cfg.blocks.len()];
         let crossed: BTreeSet<BindingId> = rebuilds.iter().flatten().copied().collect();
         for t in crossed {
-            let (Some(d), Some(i)) = (self.def_block[t.0], def_stmt[t.0]) else {
+            let (Some(d), Some(i)) = (self.def_block[t.0], self.cfg.bindings[t.0].def_stmt) else {
                 continue;
             };
             let name = self.cfg.bindings[t.0].ident.to_string();
@@ -235,38 +234,6 @@ impl Context<'_> {
                 });
             if !used_later {
                 out[d].insert(i);
-            }
-        }
-        out
-    }
-
-    /// Maps each `let`-bound binding to its defining statement index.
-    /// Within one block, `let` definitions of a name occur in statement
-    /// order and BindingId order, so a per-name queue matches them up.
-    fn def_stmt_indices(&self) -> Vec<Option<usize>> {
-        let mut out = vec![None; self.cfg.bindings.len()];
-        for block in &self.cfg.blocks {
-            let mut queues: BTreeMap<String, VecDeque<BindingId>> = BTreeMap::new();
-            for id in &block.defs {
-                let b = &self.cfg.bindings[id.0];
-                if b.kind == BindingKind::Local {
-                    queues.entry(b.ident.to_string()).or_default().push_back(*id);
-                }
-            }
-            for (i, stmt) in block.stmts.iter().enumerate() {
-                let syn::Stmt::Local(local) = stmt else {
-                    continue;
-                };
-                let mut c = PatBindingCollector::default();
-                c.visit_pat(&local.pat);
-                for (ident, _) in c.bindings {
-                    if let Some(id) = queues
-                        .get_mut(&ident.to_string())
-                        .and_then(VecDeque::pop_front)
-                    {
-                        out[id.0] = Some(i);
-                    }
-                }
             }
         }
         out

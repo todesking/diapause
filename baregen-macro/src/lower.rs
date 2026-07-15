@@ -24,6 +24,11 @@ pub struct Binding {
     /// Syntactic type information; resolved recursively by the analysis.
     pub ty: TySource,
     pub borrow: BorrowSource,
+    /// Index into the defining block's `stmts` of the `let` statement
+    /// that introduced this binding, if it was introduced by one (as
+    /// opposed to a function argument, a resume binding, or a
+    /// match/`for` pattern).
+    pub def_stmt: Option<usize>,
 }
 
 /// How a binding was introduced.
@@ -324,6 +329,7 @@ impl Lowerer {
                 kind: BindingKind::Arg,
                 ty: TySource::Unknown,
                 borrow: BorrowSource::NotABorrow,
+                def_stmt: None,
             });
             lw.scopes[0].insert(arg.to_string(), id);
         }
@@ -401,8 +407,16 @@ impl Lowerer {
 
     /// Introduces a fresh binding into the innermost scope and records
     /// its definition in `block`. Mutability, type, and borrow details
-    /// are filled in by the caller where known.
-    fn define(&mut self, ident: &syn::Ident, block: BlockId, kind: BindingKind) -> BindingId {
+    /// are filled in by the caller where known. `def_stmt` is the index
+    /// of the `let` statement that introduces this binding within
+    /// `block`'s `stmts`, if any.
+    fn define(
+        &mut self,
+        ident: &syn::Ident,
+        block: BlockId,
+        kind: BindingKind,
+        def_stmt: Option<usize>,
+    ) -> BindingId {
         let id = BindingId(self.bindings.len());
         self.bindings.push(Binding {
             ident: ident.clone(),
@@ -410,6 +424,7 @@ impl Lowerer {
             kind,
             ty: TySource::Unknown,
             borrow: BorrowSource::NotABorrow,
+            def_stmt,
         });
         self.scopes
             .last_mut()
@@ -446,11 +461,17 @@ impl Lowerer {
 
     /// Introduces every identifier bound by `pat` as a fresh binding
     /// defined in `block`.
-    fn define_pat_bindings(&mut self, pat: &syn::Pat, block: BlockId, kind: BindingKind) {
+    fn define_pat_bindings(
+        &mut self,
+        pat: &syn::Pat,
+        block: BlockId,
+        kind: BindingKind,
+        def_stmt: Option<usize>,
+    ) {
         let mut c = PatBindingCollector::default();
         c.visit_pat(pat);
         for (ident, mutability) in c.bindings {
-            let id = self.define(&ident, block, kind);
+            let id = self.define(&ident, block, kind, def_stmt);
             self.bindings[id.0].mutability = mutability;
         }
     }
@@ -649,9 +670,7 @@ pub(crate) fn collect_token_idents(tokens: proc_macro2::TokenStream, out: &mut H
     }
 }
 
-/// Collects the identifiers a pattern binds, in visit order. The order
-/// matches the BindingId assignment order, which the analysis relies on
-/// to match `let` statements back to their bindings.
+/// Collects the identifiers a pattern binds, in visit order.
 #[derive(Default)]
 pub(crate) struct PatBindingCollector {
     pub(crate) bindings: Vec<(syn::Ident, Option<syn::Token![mut]>)>,
@@ -813,7 +832,7 @@ impl Lowerer {
         self.record_expr_uses(&value, self.current);
         let next = self.new_block(true);
         let resume_binding = binding.map(|spec| {
-            let id = self.define(&spec.ident, next, BindingKind::Resume);
+            let id = self.define(&spec.ident, next, BindingKind::Resume, None);
             let b = &mut self.bindings[id.0];
             b.mutability = spec.mutability;
             if let Some(t) = &spec.ty {
@@ -897,7 +916,10 @@ impl Lowerer {
         self.validate_opaque(stmt);
         self.record_stmt_uses(stmt);
         if let syn::Stmt::Local(local) = stmt {
-            self.define_local(local);
+            // The statement is not pushed yet, so its future index in
+            // `stmts` is the current length.
+            let stmt_idx = self.blocks[self.current].stmts.len();
+            self.define_local(local, stmt_idx);
         }
         self.blocks[self.current].stmts.push(stmt.clone());
     }
@@ -906,8 +928,9 @@ impl Lowerer {
     /// source and borrow kind of a simple-identifier binding.
     /// Classification runs before the bindings enter scope, so the
     /// initializer resolves against the enclosing environment
-    /// (`let x = x;` sees the outer `x`).
-    fn define_local(&mut self, local: &syn::Local) {
+    /// (`let x = x;` sees the outer `x`). `stmt_idx` is this `let`'s
+    /// index within the current block's `stmts`.
+    fn define_local(&mut self, local: &syn::Local, stmt_idx: usize) {
         let init = local.init.as_ref().map(|i| &*i.expr);
         let (pat, annotation) = match &local.pat {
             syn::Pat::Type(pt) => (&*pt.pat, Some(&*pt.ty)),
@@ -920,7 +943,7 @@ impl Lowerer {
                     None => init.map_or(TySource::Unknown, |e| self.infer_ty_source(e)),
                 };
                 let borrow = self.classify_borrow(init, annotation);
-                let id = self.define(&pi.ident, self.current, BindingKind::Local);
+                let id = self.define(&pi.ident, self.current, BindingKind::Local, Some(stmt_idx));
                 let b = &mut self.bindings[id.0];
                 b.mutability = pi.mutability;
                 b.ty = ty;
@@ -928,7 +951,9 @@ impl Lowerer {
             }
             // Destructuring patterns: every bound identifier becomes a
             // binding of unknown type.
-            other => self.define_pat_bindings(other, self.current, BindingKind::Local),
+            other => {
+                self.define_pat_bindings(other, self.current, BindingKind::Local, Some(stmt_idx))
+            }
         }
     }
 
@@ -1128,7 +1153,7 @@ impl Lowerer {
             let body_bb = self.new_block(false);
             self.current = body_bb;
             self.scopes.push(HashMap::new());
-            self.define_pat_bindings(&arm.pat, body_bb, BindingKind::ArmPat);
+            self.define_pat_bindings(&arm.pat, body_bb, BindingKind::ArmPat, None);
             let body_stmt = wrap_arm_body(&arm.body);
             self.lower_stmt_list(std::slice::from_ref(&body_stmt), TailCtx::Discard);
             self.scopes.pop();
@@ -1230,7 +1255,7 @@ impl Lowerer {
         });
         self.current = body;
         self.scopes.push(HashMap::new());
-        self.define_pat_bindings(&el.pat, body, BindingKind::ArmPat);
+        self.define_pat_bindings(&el.pat, body, BindingKind::ArmPat, None);
         self.lower_stmt_list(&ew.body.stmts, TailCtx::Discard);
         self.scopes.pop();
         self.terminate(Terminator::Goto(header));
@@ -1257,7 +1282,7 @@ impl Lowerer {
         };
         self.blocks[self.current].stmts.push(stmt);
         let head_ty = self.infer_ty_source(head);
-        let iter_id = self.define(&iter_ident, self.current, BindingKind::ForIter);
+        let iter_id = self.define(&iter_ident, self.current, BindingKind::ForIter, None);
         let b = &mut self.bindings[iter_id.0];
         b.mutability = Some(syn::Token![mut](ef.expr.span()));
         b.ty = TySource::IntoIter(Box::new(head_ty));
@@ -1289,12 +1314,14 @@ impl Lowerer {
             // type; destructured components have no derivable type and
             // must not cross a state boundary.
             syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
-                let id = self.define(&pi.ident, body, BindingKind::Local);
+                // Bound by the `IterNext` terminator's pattern, not a
+                // `let` statement, so it has no `def_stmt`.
+                let id = self.define(&pi.ident, body, BindingKind::Local, None);
                 let b = &mut self.bindings[id.0];
                 b.mutability = pi.mutability;
                 b.ty = TySource::IterItem(iter_id);
             }
-            other => self.define_pat_bindings(other, body, BindingKind::ForPat),
+            other => self.define_pat_bindings(other, body, BindingKind::ForPat, None),
         }
         self.lower_stmt_list(&ef.body.stmts, TailCtx::Discard);
         self.scopes.pop();
