@@ -28,9 +28,6 @@ pub struct ArgInfo {
 /// A field of a state variant.
 #[derive(Debug)]
 pub struct StateField {
-    // Not consumed by codegen yet; kept for `for` support (task 14).
-    #[allow(dead_code)]
-    pub binding: BindingId,
     pub ident: syn::Ident,
     pub mutability: Option<syn::Token![mut]>,
     pub ty: syn::Type,
@@ -363,6 +360,20 @@ impl Context<'_> {
                     }
                     continue;
                 }
+                if binding.kind == BindingKind::ForPat {
+                    if reported.insert(*id) {
+                        self.err(
+                            binding.ident.span(),
+                            format!(
+                                "`{name}` is bound by a destructuring `for` pattern and must be \
+                                 stored across a state boundary, but its type cannot be derived; \
+                                 rebind it at the top of the loop body: \
+                                 `let {name}2: Type = {name};`"
+                            ),
+                        );
+                    }
+                    continue;
+                }
                 match self.resolve_binding_ty(*id) {
                     Some(ty) => {
                         let base = if binding.kind == BindingKind::Arg {
@@ -374,7 +385,6 @@ impl Context<'_> {
                             .contains(id)
                             .then(|| syn::Token![mut](binding.ident.span()));
                         fields.push(StateField {
-                            binding: *id,
                             ident: binding.ident.clone(),
                             mutability: base.or(forced),
                             ty,
@@ -382,14 +392,21 @@ impl Context<'_> {
                     }
                     None => {
                         if reported.insert(*id) {
-                            self.err(
-                                binding.ident.span(),
+                            let msg = if binding.kind == BindingKind::ForIter {
+                                // The span points at the `for` head expression.
+                                "cannot determine the type of this `for` loop's iterator, \
+                                 which is held across yield_!; iterate over a variable with \
+                                 an explicit type annotation: \
+                                 `let items: Type = ...; for x in items { ... }`"
+                                    .to_string()
+                            } else {
                                 format!(
                                     "cannot determine the type of `{name}`, which is held across \
                                      yield_!; write an explicit type annotation: \
                                      `let {name}: Type = ...`"
-                                ),
-                            );
+                                )
+                            };
+                            self.err(binding.ident.span(), msg);
                         }
                     }
                 }
@@ -459,6 +476,14 @@ impl Context<'_> {
                 } else {
                     syn::parse_quote!(::core::ops::Range<#t>)
                 })
+            }
+            TySource::IntoIter(inner) => {
+                let t = self.resolve_ty_source(inner)?;
+                Some(syn::parse_quote!(<#t as ::core::iter::IntoIterator>::IntoIter))
+            }
+            TySource::IterItem(iter) => {
+                let t = self.resolve_binding_ty(*iter)?;
+                Some(syn::parse_quote!(<#t as ::core::iter::Iterator>::Item))
             }
         }
     }
@@ -1028,6 +1053,89 @@ mod tests {
             f(r);
         });
         assert!(error_of(&block).to_string().contains("type annotation"));
+    }
+
+    // === for loops ===
+
+    #[test]
+    fn for_iterator_and_loop_var_get_projected_types() {
+        let block: syn::Block = parse_quote!({
+            let mut sum: u32 = 0;
+            for i in 0u32..n {
+                yield_!(sum);
+                sum += i;
+            }
+            sum
+        });
+        let (cfg, a) = run_args(&[("n", "u32")], &block, &unit());
+        let s1 = resume_ids(&cfg)[0];
+        // n is consumed by the range in the entry block.
+        assert_eq!(field_names(&a, s1), ["sum", "__iter0", "i"]);
+        let iter_ty: syn::Type = parse_quote!(
+            <::core::ops::Range<u32> as ::core::iter::IntoIterator>::IntoIter
+        );
+        let item_ty: syn::Type = parse_quote!(
+            <<::core::ops::Range<u32> as ::core::iter::IntoIterator>::IntoIter
+                as ::core::iter::Iterator>::Item
+        );
+        assert_eq!(field(&a, s1, "__iter0").ty, iter_ty);
+        assert!(field(&a, s1, "__iter0").mutability.is_some());
+        assert_eq!(field(&a, s1, "i").ty, item_ty);
+    }
+
+    #[test]
+    fn for_head_type_comes_from_an_annotated_variable() {
+        let block: syn::Block = parse_quote!({
+            let items: [u32; 3] = [1, 2, 3];
+            for x in items {
+                yield_!(x);
+            }
+        });
+        let (cfg, a) = run(&block);
+        let s1 = resume_ids(&cfg)[0];
+        // x is consumed by the yield value; only the iterator crosses.
+        assert_eq!(field_names(&a, s1), ["__iter0"]);
+        let iter_ty: syn::Type =
+            parse_quote!(<[u32; 3] as ::core::iter::IntoIterator>::IntoIter);
+        assert_eq!(field(&a, s1, "__iter0").ty, iter_ty);
+    }
+
+    #[test]
+    fn for_head_of_unknown_type_is_a_dedicated_error() {
+        let block: syn::Block = parse_quote!({
+            for x in items() {
+                yield_!(1);
+            }
+        });
+        let msg = error_of(&block).to_string();
+        assert!(msg.contains("`for` loop's iterator"), "got: {msg}");
+        assert!(!msg.contains("__iter"), "no synthetic names: {msg}");
+    }
+
+    #[test]
+    fn for_destructuring_binding_crossing_a_yield_is_an_error() {
+        let block: syn::Block = parse_quote!({
+            let pairs: [(u32, u32); 2] = [(1, 2), (3, 4)];
+            for (a, b) in pairs {
+                yield_!(a);
+                f(b);
+            }
+        });
+        let msg = error_of(&block).to_string();
+        assert!(msg.contains("destructuring `for` pattern"), "got: {msg}");
+        assert!(msg.contains("let b2: Type = b;"), "got: {msg}");
+    }
+
+    #[test]
+    fn for_destructuring_consumed_before_the_yield_is_fine() {
+        let block: syn::Block = parse_quote!({
+            let pairs: [(u32, u32); 2] = [(1, 2), (3, 4)];
+            for (a, b) in pairs {
+                yield_!(a + b);
+            }
+        });
+        let (_, result) = lower_analyze(&[], &block, &unit());
+        assert!(result.is_ok());
     }
 
     // === New error cases ===

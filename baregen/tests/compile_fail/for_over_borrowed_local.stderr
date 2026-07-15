@@ -1,0 +1,5 @@
+error: cannot iterate over a borrow of the local variable `v`: the iterator would be stored in the coroutine state alongside `v` itself, making the state self-referential; iterate by value instead
+ --> tests/compile_fail/for_over_borrowed_local.rs:4:14
+  |
+4 |     for x in &v {
+  |              ^^

@@ -1,0 +1,5 @@
+error: cannot determine the type of this `for` loop's iterator, which is held across yield_!; iterate over a variable with an explicit type annotation: `let items: Type = ...; for x in items { ... }`
+ --> tests/compile_fail/for_head_unknown_type.rs:7:14
+  |
+7 |     for x in items() {
+  |              ^^^^^

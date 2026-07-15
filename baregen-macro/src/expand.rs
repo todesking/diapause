@@ -339,8 +339,20 @@ impl Codegen<'_> {
                     return ::baregen::CoroutineState::Complete(__ret);
                 }
             }
-            Terminator::IterNext { .. } => {
-                unreachable!("BUG: IterNext is not produced by lowering yet")
+            Terminator::IterNext {
+                iter, pat, body, exit,
+            } => {
+                // The iterator was moved out of the state by the variant
+                // unpack (or defined by the preheader `let`); it moves
+                // back into the next state wherever it is still live.
+                let some_edge = self.edge(*body);
+                let none_edge = self.edge(*exit);
+                quote! {
+                    match ::core::iter::Iterator::next(&mut #iter) {
+                        ::core::option::Option::Some(#pat) => { #some_edge }
+                        ::core::option::Option::None => { #none_edge }
+                    }
+                }
             }
         }
     }

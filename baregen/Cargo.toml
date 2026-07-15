@@ -7,4 +7,6 @@ edition.workspace = true
 baregen-macro = { path = "../baregen-macro" }
 
 [dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 trybuild = "1"

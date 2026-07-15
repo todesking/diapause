@@ -40,6 +40,11 @@ pub enum BindingKind {
     /// Bound by a `match`/`while let` arm pattern. There is no place to
     /// write a type annotation, so it must not cross a state boundary.
     ArmPat,
+    /// Synthetic `__iter{k}` binding holding a `for` loop's iterator.
+    ForIter,
+    /// Bound by a destructuring `for` loop pattern. Component types
+    /// cannot be derived, so it must not cross a state boundary.
+    ForPat,
 }
 
 /// Syntactically determined type of a binding.
@@ -60,6 +65,12 @@ pub enum TySource {
         start: Box<TySource>,
         end: Box<TySource>,
     },
+    /// A `for` loop's iterator: `<T as IntoIterator>::IntoIter` where
+    /// the inner source is the type of the iterated expression.
+    IntoIter(Box<TySource>),
+    /// A `for` loop's variable: `<I as Iterator>::Item` where `I` is
+    /// the type of the loop's `__iter{k}` binding.
+    IterItem(BindingId),
 }
 
 /// Classification of a binding's initializer as a borrow (ported from
@@ -130,9 +141,8 @@ pub enum Terminator {
         resume_binding: Option<ResumeBinding>,
         next: BlockId,
     },
-    /// From `for` loops; defined ahead of time but not produced by
-    /// lowering yet (`for` containing yield_! is still an error).
-    #[allow(dead_code)]
+    /// From `for` loops: calls `next()` on the stored iterator and
+    /// matches `Some(pat) => body / None => exit`.
     IterNext {
         iter: syn::Ident,
         pat: Box<syn::Pat>,
@@ -213,6 +223,8 @@ struct Lowerer {
     labels: Vec<Frame>,
     errors: Option<syn::Error>,
     current: BlockId,
+    /// Number of `__iter{k}` bindings created so far.
+    for_count: usize,
 }
 
 impl Lowerer {
@@ -224,6 +236,7 @@ impl Lowerer {
             labels: Vec::new(),
             errors: None,
             current: 0,
+            for_count: 0,
         };
         for arg in args {
             let id = BindingId(lw.bindings.len());
@@ -408,9 +421,16 @@ const ERR_SCRUTINEE: &str = "yield_! in a match scrutinee is not supported";
 const ERR_GUARD: &str = "yield_! in a match guard is not supported";
 const ERR_UNSAFE: &str = "yield_! inside an unsafe block is not supported";
 const ERR_IF_LET: &str = "yield_! inside `if let` is not supported; use `match` instead";
-const ERR_FOR: &str =
-    "yield_! inside a `for` loop is not supported yet; iterate with `loop`/`while` instead";
+const ERR_FOR_HEAD: &str = "yield_! in a `for` loop's iterator expression is not supported";
 const ERR_BREAK_VALUE: &str = "`break` with a value cannot target a loop containing yield_!";
+
+fn for_local_borrow_err(name: &syn::Ident) -> String {
+    format!(
+        "cannot iterate over a borrow of the local variable `{name}`: the iterator would be \
+         stored in the coroutine state alongside `{name}` itself, making the state \
+         self-referential; iterate by value instead"
+    )
+}
 
 fn opaque_jump_err(kw: &str) -> String {
     format!(
@@ -949,7 +969,7 @@ impl Lowerer {
             syn::Expr::Match(em) => self.lower_match(em),
             syn::Expr::Loop(el) => self.lower_loop(el),
             syn::Expr::While(ew) => self.lower_while(ew),
-            syn::Expr::ForLoop(ef) => self.err(syn::Error::new_spanned(ef.for_token, ERR_FOR)),
+            syn::Expr::ForLoop(ef) => self.lower_for(ef),
             syn::Expr::Block(eb) => self.lower_block_stmt(eb),
             syn::Expr::Unsafe(eu) => {
                 self.err(syn::Error::new_spanned(eu.unsafe_token, ERR_UNSAFE));
@@ -1129,6 +1149,92 @@ impl Lowerer {
         self.terminate(Terminator::Goto(header));
         self.labels.pop();
         self.current = exit;
+    }
+
+    /// Expands `for pat in EXPR { .. }`: the preheader (current block)
+    /// gains a synthetic `let mut __iter{k} = IntoIterator::into_iter(EXPR);`
+    /// statement and the header dispatches on `__iter{k}.next()` via an
+    /// `IterNext` terminator. The iterator is stored in the state with
+    /// the concrete type `<T as IntoIterator>::IntoIter`, so `T` (the
+    /// type of EXPR) must be syntactically known when the loop crosses
+    /// a suspension point.
+    fn lower_for(&mut self, ef: &syn::ExprForLoop) {
+        self.check_no_yield(&ef.expr, ERR_FOR_HEAD);
+        self.check_for_local_borrow(&ef.expr);
+        self.record_expr_uses(&ef.expr, self.current);
+        let iter_ident = syn::Ident::new(&format!("__iter{}", self.for_count), ef.expr.span());
+        self.for_count += 1;
+        let head = &*ef.expr;
+        let stmt: syn::Stmt = syn::parse_quote! {
+            let mut #iter_ident = ::core::iter::IntoIterator::into_iter(#head);
+        };
+        self.blocks[self.current].stmts.push(stmt);
+        let head_ty = self.infer_ty_source(head);
+        let iter_id = self.define(&iter_ident, self.current, BindingKind::ForIter);
+        let b = &mut self.bindings[iter_id.0];
+        b.mutability = Some(syn::Token![mut](ef.expr.span()));
+        b.ty = TySource::IntoIter(Box::new(head_ty));
+
+        let header = self.new_block(false);
+        self.terminate(Terminator::Goto(header));
+        let body = self.new_block(false);
+        let exit = self.new_block(false);
+        // The `next()` call consumes the iterator at the header.
+        self.blocks[header].uses.insert(iter_id);
+        self.set_terminator(
+            header,
+            Terminator::IterNext {
+                iter: iter_ident,
+                pat: Box::new((*ef.pat).clone()),
+                body,
+                exit,
+            },
+        );
+        self.labels.push(Frame {
+            label: ef.label.as_ref().map(|l| l.name.ident.to_string()),
+            header: Some(header),
+            exit,
+        });
+        self.current = body;
+        self.scopes.push(HashMap::new());
+        match &*ef.pat {
+            // A simple-identifier loop variable gets the iterator's item
+            // type; destructured components have no derivable type and
+            // must not cross a state boundary.
+            syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
+                let id = self.define(&pi.ident, body, BindingKind::Local);
+                let b = &mut self.bindings[id.0];
+                b.mutability = pi.mutability;
+                b.ty = TySource::IterItem(iter_id);
+            }
+            other => self.define_pat_bindings(other, body, BindingKind::ForPat),
+        }
+        self.lower_stmt_list(&ef.body.stmts, TailCtx::Discard);
+        self.scopes.pop();
+        self.terminate(Terminator::Goto(header));
+        self.labels.pop();
+        self.current = exit;
+    }
+
+    /// Rejects `for x in &local` / `for x in &mut local` where `local`
+    /// is a body-local binding: the stored iterator would borrow another
+    /// field of the same state. Borrows of arguments point outside the
+    /// state and are fine; method calls (`local.iter()`) are left to
+    /// borrowck.
+    fn check_for_local_borrow(&mut self, expr: &syn::Expr) {
+        let mut e = expr;
+        while let syn::Expr::Paren(p) = e {
+            e = &p.expr;
+        }
+        if let syn::Expr::Reference(r) = e
+            && let syn::Expr::Path(p) = &*r.expr
+            && p.qself.is_none()
+            && let Some(ident) = p.path.get_ident()
+            && let Some(id) = self.resolve(&ident.to_string())
+            && self.bindings[id.0].kind != BindingKind::Arg
+        {
+            self.err(syn::Error::new_spanned(expr, for_local_borrow_err(ident)));
+        }
     }
 
     /// A block statement: the contents are lowered in place. A labeled
@@ -1777,6 +1883,131 @@ mod tests {
         ));
     }
 
+    // === for loops ===
+
+    #[test]
+    fn for_loop_matches_design_shape() {
+        let block: syn::Block = parse_quote!({
+            let mut sum: u32 = 0;
+            for i in 0u32..n {
+                yield_!(i);
+                sum += i;
+            }
+            sum
+        });
+        let cfg = lower_args(&["n"], &block);
+        // entry [let sum; let __iter0; Goto header], header [IterNext],
+        // body (inline) [Yield], resume [sum += i; Goto header],
+        // exit (inline) [Return sum].
+        assert_eq!(cfg.blocks.len(), 5);
+        let (n, sum, it, i) = (
+            binding(&cfg, "n"),
+            binding(&cfg, "sum"),
+            binding(&cfg, "__iter0"),
+            binding(&cfg, "i"),
+        );
+        let b0 = &cfg.blocks[0];
+        assert_eq!(b0.stmts.len(), 2, "preheader adds the iterator let");
+        assert_eq!(b0.uses, ids(&[n]));
+        assert_eq!(b0.defs, ids(&[sum, it]));
+        let Terminator::Goto(header) = b0.terminator else {
+            panic!("entry should fall into the header");
+        };
+        let hb = &cfg.blocks[header];
+        assert!(!hb.inline, "loop header must stay a variant");
+        assert_eq!(hb.uses, ids(&[it]), "next() consumes the iterator");
+        let Terminator::IterNext { iter, body, exit, .. } = &hb.terminator else {
+            panic!("for header must be IterNext: {:?}", hb.terminator);
+        };
+        assert_eq!(iter, "__iter0");
+        // The iterator binding: synthetic, mutable, IntoIter of the head.
+        let ib = &cfg.bindings[it.0];
+        assert_eq!(ib.kind, BindingKind::ForIter);
+        assert!(ib.mutability.is_some());
+        assert!(matches!(
+            &ib.ty,
+            TySource::IntoIter(inner) if matches!(**inner, TySource::Range { .. })
+        ));
+        // The loop variable: item type of the iterator.
+        assert!(matches!(cfg.bindings[i.0].ty, TySource::IterItem(id) if id == it));
+        let bb = &cfg.blocks[*body];
+        assert!(bb.inline);
+        assert_eq!(bb.defs, ids(&[i]));
+        let Terminator::Yield { next, .. } = bb.terminator else {
+            panic!("loop body should yield");
+        };
+        let resume = &cfg.blocks[next];
+        assert!(resume.resume_point);
+        assert_eq!(resume.uses, ids(&[sum, i]));
+        assert!(matches!(resume.terminator, Terminator::Goto(h) if h == header));
+        let eb = &cfg.blocks[*exit];
+        assert!(eb.inline);
+        assert!(matches!(&eb.terminator, Terminator::Return(_)));
+    }
+
+    #[test]
+    fn for_break_and_continue_target_exit_and_header() {
+        let block: syn::Block = parse_quote!({
+            for i in 0u32..3 {
+                let stop = yield_!(i);
+                if stop {
+                    yield_!(9);
+                    break;
+                }
+                yield_!(8);
+                continue;
+            }
+            after();
+        });
+        let cfg = lower_ok(&block);
+        let header = cfg
+            .blocks
+            .iter()
+            .position(|b| matches!(b.terminator, Terminator::IterNext { .. }))
+            .unwrap();
+        let Terminator::IterNext { exit, .. } = cfg.blocks[header].terminator else {
+            unreachable!()
+        };
+        // break resume -> exit, continue resume -> header.
+        let gotos: Vec<BlockId> = cfg
+            .blocks
+            .iter()
+            .filter(|b| b.resume_point)
+            .filter_map(|b| match b.terminator {
+                Terminator::Goto(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(gotos.contains(&exit));
+        assert!(gotos.contains(&header));
+    }
+
+    #[test]
+    fn labeled_for_break_crosses_inner_for() {
+        let block: syn::Block = parse_quote!({
+            'outer: for i in 0u32..3 {
+                for j in 0u32..3 {
+                    yield_!(i + j);
+                    break 'outer;
+                }
+            }
+        });
+        let cfg = lower_ok(&block);
+        // Distinct synthetic iterators per loop.
+        binding(&cfg, "__iter0");
+        binding(&cfg, "__iter1");
+        let outer_exit = cfg
+            .blocks
+            .iter()
+            .find_map(|b| match &b.terminator {
+                Terminator::IterNext { iter, exit, .. } if iter == "__iter0" => Some(*exit),
+                _ => None,
+            })
+            .unwrap();
+        let resume = cfg.blocks.iter().find(|b| b.resume_point).unwrap();
+        assert!(matches!(resume.terminator, Terminator::Goto(t) if t == outer_exit));
+    }
+
     // === break / continue and simplification ===
 
     #[test]
@@ -2095,13 +2326,46 @@ mod tests {
     }
 
     #[test]
-    fn yield_in_for_loop_is_rejected() {
+    fn yield_in_for_head_expression_is_rejected() {
         let block: syn::Block = parse_quote!({
-            for x in items {
-                yield_!(x);
+            for x in f(yield_!(1)) {
+                g(x);
             }
         });
-        assert!(error_of(&block).to_string().contains("for"));
+        assert!(
+            error_of(&block)
+                .to_string()
+                .contains("iterator expression")
+        );
+    }
+
+    #[test]
+    fn for_over_a_borrowed_local_is_rejected() {
+        let block: syn::Block = parse_quote!({
+            let v: [u32; 3] = [1, 2, 3];
+            for x in &v {
+                yield_!(*x);
+            }
+        });
+        assert!(error_of(&block).to_string().contains("self-referential"));
+        let block: syn::Block = parse_quote!({
+            let mut v: [u32; 3] = [1, 2, 3];
+            for x in &mut v {
+                yield_!(*x);
+            }
+        });
+        assert!(error_of(&block).to_string().contains("self-referential"));
+    }
+
+    #[test]
+    fn for_over_a_borrowed_argument_is_allowed() {
+        let block: syn::Block = parse_quote!({
+            for x in &xs {
+                yield_!(1);
+            }
+        });
+        let idents = [syn::Ident::new("xs", proc_macro2::Span::call_site())];
+        assert!(lower(&idents, &block).is_ok());
     }
 
     #[test]
