@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use syn::visit::Visit;
 
 use crate::lower::{
-    BindingId, BindingKind, BlockId, BorrowSource, Cfg, PatBindingCollector, Terminator, TySource,
-    UseCollector,
+    BindingId, BindingKind, BlockId, BorrowSource, Cfg, ErrorSink, PatBindingCollector, Terminator,
+    TySource, UseCollector,
 };
 
 /// Signature-level information about one function argument, parallel to
@@ -80,7 +80,7 @@ struct Context<'a> {
     /// The block whose entry defines each binding; `None` for arguments
     /// (in scope from entry) and bindings in removed unreachable blocks.
     def_block: Vec<Option<BlockId>>,
-    errors: Option<syn::Error>,
+    errors: ErrorSink,
 }
 
 impl<'a> Context<'a> {
@@ -91,16 +91,12 @@ impl<'a> Context<'a> {
             resume_ty,
             region: region_roots(cfg),
             def_block: def_blocks(cfg),
-            errors: None,
+            errors: ErrorSink::default(),
         }
     }
 
     fn err(&mut self, span: proc_macro2::Span, msg: String) {
-        let e = syn::Error::new(span, msg);
-        match &mut self.errors {
-            Some(prev) => prev.combine(e),
-            None => self.errors = Some(e),
-        }
+        self.errors.push(syn::Error::new(span, msg));
     }
 
     fn run(mut self) -> syn::Result<Analysis> {
@@ -109,15 +105,12 @@ impl<'a> Context<'a> {
         let removed_stmts = self.removed_statements(&rebuilds);
         let variant_fields = self.check_and_build_fields(&live_in, &rebuilds);
         let reborrows = self.build_reborrows(&rebuilds);
-        match self.errors {
-            Some(e) => Err(e),
-            None => Ok(Analysis {
-                variant_fields,
-                reborrows,
-                removed_stmts,
-                live_in,
-            }),
-        }
+        self.errors.into_result(Analysis {
+            variant_fields,
+            reborrows,
+            removed_stmts,
+            live_in,
+        })
     }
 }
 

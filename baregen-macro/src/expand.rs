@@ -11,7 +11,7 @@ use syn::visit_mut::VisitMut;
 
 use crate::analyze_cfg::{self, Analysis, ArgInfo};
 use crate::args::MacroArgs;
-use crate::lower::{self, BlockId, Cfg, Terminator};
+use crate::lower::{self, BlockId, Cfg, ErrorSink, Terminator};
 
 /// A function argument (simple-identifier pattern only).
 struct ArgVar {
@@ -534,14 +534,11 @@ fn check_signature(sig: &syn::Signature) -> syn::Result<()> {
 /// elision and `impl Trait` are not available.
 fn check_return_type(ty: &syn::Type) -> syn::Result<()> {
     struct Check {
-        error: Option<syn::Error>,
+        error: ErrorSink,
     }
     impl Check {
         fn record(&mut self, e: syn::Error) {
-            match &mut self.error {
-                Some(prev) => prev.combine(e),
-                None => self.error = Some(e),
-            }
+            self.error.push(e);
         }
     }
     impl<'ast> Visit<'ast> for Check {
@@ -571,12 +568,11 @@ fn check_return_type(ty: &syn::Type) -> syn::Result<()> {
             ));
         }
     }
-    let mut check = Check { error: None };
+    let mut check = Check {
+        error: ErrorSink::default(),
+    };
     check.visit_type(ty);
-    match check.error {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    check.error.into_result(())
 }
 
 fn parse_args(sig: &syn::Signature) -> syn::Result<Vec<ArgVar>> {

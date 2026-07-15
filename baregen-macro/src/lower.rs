@@ -215,6 +215,43 @@ impl DoubleEndedIterator for Successors<'_> {
     }
 }
 
+/// Accumulates zero or more `syn::Error`s, combining them in push order
+/// so the emitted `compile_error!`s appear in the order the errors were
+/// found.
+#[derive(Default)]
+pub struct ErrorSink {
+    error: Option<syn::Error>,
+    count: usize,
+}
+
+impl ErrorSink {
+    pub fn push(&mut self, e: syn::Error) {
+        match &mut self.error {
+            Some(prev) => prev.combine(e),
+            None => self.error = Some(e),
+        }
+        self.count += 1;
+    }
+
+    /// Number of errors pushed into the sink so far.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn into_option(self) -> Option<syn::Error> {
+        self.error
+    }
+
+    /// Consumes the sink: `Err` with the combined error if non-empty,
+    /// `Ok(ok)` otherwise.
+    pub fn into_result<T>(self, ok: T) -> syn::Result<T> {
+        match self.error {
+            Some(e) => Err(e),
+            None => Ok(ok),
+        }
+    }
+}
+
 /// Lowers a coroutine body to a simplified CFG. `args` are the function
 /// argument names; they become `BindingId(0)..` and are in scope from
 /// the entry block without being defined by it.
@@ -254,7 +291,7 @@ struct Lowerer {
     bindings: Vec<Binding>,
     scopes: Vec<HashMap<String, BindingId>>,
     labels: Vec<Frame>,
-    errors: Option<syn::Error>,
+    errors: ErrorSink,
     current: BlockId,
     /// Number of `__iter{k}` bindings created so far.
     for_count: usize,
@@ -267,7 +304,7 @@ impl Lowerer {
             bindings: Vec::new(),
             scopes: vec![HashMap::new()],
             labels: Vec::new(),
-            errors: None,
+            errors: ErrorSink::default(),
             current: 0,
             for_count: 0,
         };
@@ -294,7 +331,7 @@ impl Lowerer {
     }
 
     fn finish(self) -> syn::Result<Cfg> {
-        if let Some(e) = self.errors {
+        if let Some(e) = self.errors.into_option() {
             return Err(e);
         }
         let blocks = self
@@ -319,16 +356,7 @@ impl Lowerer {
     }
 
     fn err(&mut self, e: syn::Error) {
-        match &mut self.errors {
-            Some(prev) => prev.combine(e),
-            None => self.errors = Some(e),
-        }
-    }
-
-    fn error_count(&self) -> usize {
-        self.errors
-            .as_ref()
-            .map_or(0, |e| e.clone().into_iter().count())
+        self.errors.push(e);
     }
 
     fn new_block(&mut self, resume_point: bool) -> BlockId {
@@ -422,9 +450,12 @@ impl Lowerer {
     /// Rejects any `yield_!` inside `expr` (with `msg`) and any foreign
     /// macro whose tokens mention `yield_!`.
     fn check_no_yield(&mut self, expr: &syn::Expr, msg: &str) {
-        let mut checker = YieldBan { msg, error: None };
+        let mut checker = YieldBan {
+            msg,
+            error: ErrorSink::default(),
+        };
         checker.visit_expr(expr);
-        if let Some(e) = checker.error {
+        if let Some(e) = checker.error.into_option() {
             self.err(e);
         }
     }
@@ -535,15 +566,12 @@ fn contains_yield_expr(expr: &syn::Expr) -> bool {
 /// foreign macro carrying yield_! tokens.
 struct YieldBan<'a> {
     msg: &'a str,
-    error: Option<syn::Error>,
+    error: ErrorSink,
 }
 
 impl YieldBan<'_> {
     fn record(&mut self, e: syn::Error) {
-        match &mut self.error {
-            Some(prev) => prev.combine(e),
-            None => self.error = Some(e),
-        }
+        self.error.push(e);
     }
 }
 
@@ -655,9 +683,9 @@ impl Lowerer {
                     // statement anyway to surface the most specific
                     // error; if it lowers cleanly the only problem is
                     // its tail position.
-                    let before = self.error_count();
+                    let before = self.errors.len();
                     self.lower_stmt(stmt);
-                    if self.error_count() == before {
+                    if self.errors.len() == before {
                         self.err(syn::Error::new_spanned(e, ERR_TAIL));
                     }
                 } else {
@@ -1317,10 +1345,10 @@ impl Lowerer {
             in_expanded_loop: self.labels.iter().any(|f| f.header.is_some()),
             local_loop_depth: 0,
             local_labels: Vec::new(),
-            error: None,
+            error: ErrorSink::default(),
         };
         checker.visit_stmt(stmt);
-        if let Some(e) = checker.error {
+        if let Some(e) = checker.error.into_option() {
             self.err(e);
         }
     }
@@ -1335,15 +1363,12 @@ struct OpaqueChecker {
     local_loop_depth: usize,
     /// Labels declared within the statement (shadow expanded ones).
     local_labels: Vec<String>,
-    error: Option<syn::Error>,
+    error: ErrorSink,
 }
 
 impl OpaqueChecker {
     fn record(&mut self, e: syn::Error) {
-        match &mut self.error {
-            Some(prev) => prev.combine(e),
-            None => self.error = Some(e),
-        }
+        self.error.push(e);
     }
 
     fn enter_loop<F: FnOnce(&mut Self)>(&mut self, label: &Option<syn::Label>, f: F) {
