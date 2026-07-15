@@ -13,11 +13,22 @@ use crate::analyze_cfg::{self, Analysis, ArgInfo};
 use crate::args::MacroArgs;
 use crate::lower::{self, BlockId, Cfg, ErrorSink, Terminator};
 
-/// A function argument (simple-identifier pattern only).
+/// A function argument (simple-identifier pattern only). Carries the
+/// `ident` needed to emit code, unlike `analyze_cfg::ArgInfo`, which drops
+/// it because that crate identifies arguments by `BindingId` instead.
 struct ArgVar {
     ident: syn::Ident,
     mutability: Option<syn::Token![mut]>,
     ty: syn::Type,
+}
+
+impl From<&ArgVar> for ArgInfo {
+    fn from(arg: &ArgVar) -> Self {
+        ArgInfo {
+            mutability: arg.mutability,
+            ty: arg.ty.clone(),
+        }
+    }
 }
 
 pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> {
@@ -41,13 +52,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
 
     let arg_idents: Vec<syn::Ident> = args.iter().map(|a| a.ident.clone()).collect();
     let cfg = lower::lower(&arg_idents, &body)?;
-    let arg_infos: Vec<ArgInfo> = args
-        .iter()
-        .map(|a| ArgInfo {
-            mutability: a.mutability,
-            ty: a.ty.clone(),
-        })
-        .collect();
+    let arg_infos: Vec<ArgInfo> = args.iter().map(ArgInfo::from).collect();
     let analysis = analyze_cfg::analyze(&cfg, &arg_infos, &macro_args.resume_ty)?;
 
     // `#[derive(...)]` written below the coroutine attribute applies to

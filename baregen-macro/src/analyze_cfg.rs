@@ -17,7 +17,9 @@ use crate::lower::{
 };
 
 /// Signature-level information about one function argument, parallel to
-/// `BindingId(0)..BindingId(args.len())`.
+/// `BindingId(0)..BindingId(args.len())`. Built from `expand::ArgVar` (via
+/// its `From` impl), minus the `ident`, since arguments are identified by
+/// position here rather than by name.
 #[derive(Debug)]
 pub struct ArgInfo {
     pub mutability: Option<syn::Token![mut]>,
