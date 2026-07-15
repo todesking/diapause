@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use quote::format_ident;
 use syn::visit::Visit;
 
 use crate::lower::{
@@ -44,24 +45,42 @@ pub struct Reborrow {
     pub mutable: bool,
 }
 
+/// A block that becomes a coroutine state (an enum variant): a non-inline
+/// block, its name, the fields holding its live-in bindings (after borrow
+/// substitution), and the borrows to rebuild at the head of its arm, in
+/// definition order (chains rebuild sources before their dependents).
+#[derive(Debug)]
+pub struct Variant {
+    pub block: BlockId,
+    pub ident: syn::Ident,
+    pub fields: Vec<StateField>,
+    pub reborrows: Vec<Reborrow>,
+}
+
 #[derive(Debug)]
 pub struct Analysis {
-    /// Indexed by `BlockId`: `Some(fields)` for blocks that become enum
-    /// variants (non-inline blocks, including the entry), `None` for
-    /// blocks emitted inline in their predecessor's arm.
-    pub variant_fields: Vec<Option<Vec<StateField>>>,
-    /// Indexed by `BlockId`: borrows to rebuild at the head of this
-    /// block's arm. Non-empty only for non-inline blocks, in definition
-    /// order (chains rebuild sources before their dependents).
-    pub reborrows: Vec<Vec<Reborrow>>,
+    /// One entry per non-inline block (including the entry block), in
+    /// ascending `BlockId` order.
+    pub variants: Vec<Variant>,
     /// Indexed by `BlockId`: statement indices to omit from codegen
     /// (original borrow `let`s whose binding is only used in other arms).
     pub removed_stmts: Vec<BTreeSet<usize>>,
     /// Indexed by `BlockId`: bindings live at block entry, after borrow
     /// substitution.
-    // Consumed by the unit tests; codegen uses `variant_fields`.
+    // Consumed by the unit tests; codegen uses `variants`.
     #[allow(dead_code)]
     pub live_in: Vec<BTreeSet<BindingId>>,
+}
+
+impl Analysis {
+    /// The variant for `block`, or `None` if `block` is inlined into its
+    /// predecessor's arm.
+    pub fn variant(&self, block: BlockId) -> Option<&Variant> {
+        self.variants
+            .binary_search_by_key(&block, |v| v.block)
+            .ok()
+            .map(|i| &self.variants[i])
+    }
 }
 
 /// Analyzes a lowered coroutine CFG. `args` describes the function
@@ -105,11 +124,9 @@ impl<'a> Context<'a> {
         let (uses, rebuilds) = self.substitute_borrows();
         let live_in = self.liveness(&uses);
         let removed_stmts = self.removed_statements(&rebuilds);
-        let variant_fields = self.check_and_build_fields(&live_in, &rebuilds);
-        let reborrows = self.build_reborrows(&rebuilds);
+        let variants = self.build_variants(&live_in, &rebuilds);
         self.errors.into_result(Analysis {
-            variant_fields,
-            reborrows,
+            variants,
             removed_stmts,
             live_in,
         })
@@ -239,29 +256,25 @@ impl Context<'_> {
         out
     }
 
-    fn build_reborrows(&self, rebuilds: &[BTreeSet<BindingId>]) -> Vec<Vec<Reborrow>> {
-        rebuilds
-            .iter()
-            .map(|set| {
-                set.iter()
-                    .map(|t| {
-                        let b = &self.cfg.bindings[t.0];
-                        let BorrowSource::Direct {
-                            source_ident,
-                            mutable,
-                            ..
-                        } = &b.borrow
-                        else {
-                            unreachable!("BUG: rebuild of a non-borrow binding")
-                        };
-                        Reborrow {
-                            target: b.ident.clone(),
-                            target_mut: b.mutability,
-                            source: source_ident.clone(),
-                            mutable: *mutable,
-                        }
-                    })
-                    .collect()
+    /// Reborrows to rebuild for one block's rebuilt-binding set.
+    fn build_reborrows_for(&self, ids: &BTreeSet<BindingId>) -> Vec<Reborrow> {
+        ids.iter()
+            .map(|t| {
+                let b = &self.cfg.bindings[t.0];
+                let BorrowSource::Direct {
+                    source_ident,
+                    mutable,
+                    ..
+                } = &b.borrow
+                else {
+                    unreachable!("BUG: rebuild of a non-borrow binding")
+                };
+                Reborrow {
+                    target: b.ident.clone(),
+                    target_mut: b.mutability,
+                    source: source_ident.clone(),
+                    mutable: *mutable,
+                }
             })
             .collect()
     }
@@ -270,18 +283,21 @@ impl Context<'_> {
 // === Variant fields, type determination, and errors ===
 
 impl Context<'_> {
-    fn check_and_build_fields(
+    /// Builds the `Variant` list: one entry per non-inline block, in
+    /// ascending `BlockId` order, combining its fields, its reborrows, and
+    /// the name assigned by `variant_idents`.
+    fn build_variants(
         &mut self,
         live_in: &[BTreeSet<BindingId>],
         rebuilds: &[BTreeSet<BindingId>],
-    ) -> Vec<Option<Vec<StateField>>> {
+    ) -> Vec<Variant> {
         let forced_mut = self.compute_forced_mut(rebuilds);
         let mut reported: BTreeSet<BindingId> = BTreeSet::new();
         let mut collisions: BTreeSet<(BindingId, BindingId)> = BTreeSet::new();
-        let mut variant_fields = Vec::with_capacity(self.cfg.blocks.len());
-        for (b, block) in self.cfg.blocks.iter().enumerate() {
-            if block.inline {
-                variant_fields.push(None);
+        let idents = variant_idents(self.cfg);
+        let mut variants = Vec::new();
+        for b in 0..self.cfg.blocks.len() {
+            if self.cfg.blocks[b].inline {
                 continue;
             }
             let fields = self.build_fields_for_block(
@@ -290,9 +306,19 @@ impl Context<'_> {
                 &mut reported,
                 &mut collisions,
             );
-            variant_fields.push(Some(fields));
+            let reborrows = self.build_reborrows_for(&rebuilds[b]);
+            let ident = idents
+                .get(&b)
+                .cloned()
+                .expect("BUG: every non-inline block must have a variant name");
+            variants.push(Variant {
+                block: b,
+                ident,
+                fields,
+                reborrows,
+            });
         }
-        variant_fields
+        variants
     }
 
     /// Bindings whose mutable borrow is rebuilt in some arm must be
@@ -529,6 +555,57 @@ fn def_blocks(cfg: &Cfg) -> Vec<Option<BlockId>> {
     out
 }
 
+// === Variant naming ===
+
+/// Assigns variant names: `Start` for the entry, `S{k}` for resume points
+/// (source yield order = block creation order, which block ids preserve),
+/// `B{k}` for the remaining variant blocks (reverse postorder). Inline
+/// blocks get no name. Both numberings are deterministic for a given
+/// source, which serde representations rely on.
+fn variant_idents(cfg: &Cfg) -> BTreeMap<BlockId, syn::Ident> {
+    let mut idents = BTreeMap::new();
+    idents.insert(cfg.entry, format_ident!("Start"));
+    let mut s = 0;
+    for (b, block) in cfg.blocks.iter().enumerate() {
+        if block.resume_point {
+            s += 1;
+            idents.insert(b, format_ident!("S{s}"));
+        }
+    }
+    let mut k = 0;
+    for b in reverse_postorder(cfg) {
+        if !idents.contains_key(&b) && !cfg.blocks[b].inline {
+            k += 1;
+            idents.insert(b, format_ident!("B{k}"));
+        }
+    }
+    idents
+}
+
+fn reverse_postorder(cfg: &Cfg) -> Vec<BlockId> {
+    let mut visited = vec![false; cfg.blocks.len()];
+    let mut post = Vec::new();
+    // Iterative DFS; `true` marks a node whose successors are done.
+    let mut stack = vec![(cfg.entry, false)];
+    while let Some((b, expanded)) = stack.pop() {
+        if expanded {
+            post.push(b);
+            continue;
+        }
+        if std::mem::replace(&mut visited[b], true) {
+            continue;
+        }
+        stack.push((b, true));
+        for s in cfg.blocks[b].terminator.successors().rev() {
+            if !visited[s] {
+                stack.push((s, false));
+            }
+        }
+    }
+    post.reverse();
+    post
+}
+
 /// The expressions a terminator evaluates in its own block (before any
 /// transition), for statement-level use scans.
 fn terminator_exprs(t: &Terminator) -> Vec<&syn::Expr> {
@@ -601,18 +678,18 @@ mod tests {
 
     /// Field names of the variant for `block`, in field order.
     fn field_names(a: &Analysis, block: BlockId) -> Vec<String> {
-        a.variant_fields[block]
-            .as_ref()
+        a.variant(block)
             .expect("expected a variant block")
+            .fields
             .iter()
             .map(|f| f.ident.to_string())
             .collect()
     }
 
     fn field<'a>(a: &'a Analysis, block: BlockId, name: &str) -> &'a StateField {
-        a.variant_fields[block]
-            .as_ref()
+        a.variant(block)
             .unwrap()
+            .fields
             .iter()
             .find(|f| f.ident == name)
             .unwrap_or_else(|| panic!("no field `{name}` in block {block}"))
@@ -621,6 +698,11 @@ mod tests {
     /// Fields of the k-th resume variant.
     fn resume_fields(cfg: &Cfg, a: &Analysis, k: usize) -> Vec<String> {
         field_names(a, resume_ids(cfg)[k])
+    }
+
+    /// Reborrows of the variant for `block`.
+    fn reborrows(a: &Analysis, block: BlockId) -> &[Reborrow] {
+        &a.variant(block).expect("expected a variant block").reborrows
     }
 
     // === Liveness and borrow reconstruction ===
@@ -710,7 +792,7 @@ mod tests {
             parse_quote!(bool),
             parse_quote!(char),
         ];
-        let fields = a.variant_fields[resume_ids(&cfg)[0]].as_ref().unwrap();
+        let fields = &a.variant(resume_ids(&cfg)[0]).unwrap().fields;
         for (f, ty) in fields.iter().zip(&tys) {
             assert_eq!(&f.ty, ty);
         }
@@ -813,10 +895,10 @@ mod tests {
         // y is reconstructed, x is stored (bound mutably for the reborrow)
         assert_eq!(field_names(&a, s1), ["x"]);
         assert!(field(&a, s1, "x").mutability.is_some());
-        assert_eq!(a.reborrows[s1].len(), 1);
-        assert_eq!(a.reborrows[s1][0].target, "y");
-        assert_eq!(a.reborrows[s1][0].source, "x");
-        assert!(a.reborrows[s1][0].mutable);
+        assert_eq!(reborrows(&a, s1).len(), 1);
+        assert_eq!(reborrows(&a, s1)[0].target, "y");
+        assert_eq!(reborrows(&a, s1)[0].source, "x");
+        assert!(reborrows(&a, s1)[0].mutable);
         // the original `let y = &mut x;` (stmt 1 of the entry) is dropped
         assert!(a.removed_stmts[cfg.entry].contains(&1));
     }
@@ -832,7 +914,7 @@ mod tests {
         });
         let (cfg, a) = run(&block);
         assert!(a.removed_stmts[cfg.entry].is_empty());
-        assert_eq!(a.reborrows[resume_ids(&cfg)[0]].len(), 1);
+        assert_eq!(reborrows(&a, resume_ids(&cfg)[0]).len(), 1);
     }
 
     #[test]
@@ -847,7 +929,7 @@ mod tests {
         let s1 = resume_ids(&cfg)[0];
         assert_eq!(field_names(&a, s1), ["x"]);
         assert!(field(&a, s1, "x").mutability.is_none());
-        assert!(!a.reborrows[s1][0].mutable);
+        assert!(!reborrows(&a, s1)[0].mutable);
     }
 
     #[test]
@@ -862,7 +944,7 @@ mod tests {
         let (cfg, a) = run(&block);
         let s1 = resume_ids(&cfg)[0];
         assert_eq!(field_names(&a, s1), ["x"]);
-        let order: Vec<_> = a.reborrows[s1]
+        let order: Vec<_> = reborrows(&a, s1)
             .iter()
             .map(|r| r.target.to_string())
             .collect();
@@ -901,7 +983,7 @@ mod tests {
         });
         let (cfg, a) = run(&block);
         assert!(resume_fields(&cfg, &a, 0).is_empty());
-        assert!(a.reborrows.iter().all(Vec::is_empty));
+        assert!(a.variants.iter().all(|v| v.reborrows.is_empty()));
         assert!(a.removed_stmts.iter().all(BTreeSet::is_empty));
     }
 
@@ -987,8 +1069,8 @@ mod tests {
         let s1 = resume_ids(&cfg)[0];
         // The borrow is defined in the header's arm and used after the
         // yield: reconstructed at the resume arm, every iteration.
-        assert_eq!(a.reborrows[s1].len(), 1);
-        assert_eq!(a.reborrows[s1][0].target, "y");
+        assert_eq!(reborrows(&a, s1).len(), 1);
+        assert_eq!(reborrows(&a, s1)[0].target, "y");
         assert_eq!(a.removed_stmts[header], BTreeSet::from([0]));
         assert_eq!(field_names(&a, header), ["x"]);
         assert_eq!(field_names(&a, s1), ["x"]);
@@ -1007,8 +1089,8 @@ mod tests {
         });
         let (cfg, a) = run(&block);
         let s1 = resume_ids(&cfg)[0];
-        assert_eq!(a.reborrows[s1].len(), 1);
-        assert_eq!(a.reborrows[s1][0].target, "y");
+        assert_eq!(reborrows(&a, s1).len(), 1);
+        assert_eq!(reborrows(&a, s1)[0].target, "y");
         assert_eq!(a.removed_stmts[cfg.entry], BTreeSet::from([1]));
         assert_eq!(field_names(&a, s1), ["x"]);
     }
@@ -1030,9 +1112,9 @@ mod tests {
         };
         assert_eq!(field_names(&a, s1), ["x"]);
         assert_eq!(field_names(&a, join), ["x"]);
-        assert_eq!(a.reborrows[join].len(), 1);
-        assert_eq!(a.reborrows[join][0].target, "y");
-        assert!(a.reborrows[s1].is_empty());
+        assert_eq!(reborrows(&a, join).len(), 1);
+        assert_eq!(reborrows(&a, join)[0].target, "y");
+        assert!(reborrows(&a, s1).is_empty());
         assert_eq!(a.removed_stmts[cfg.entry], BTreeSet::from([1]));
     }
 

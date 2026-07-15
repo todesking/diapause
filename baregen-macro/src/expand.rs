@@ -4,12 +4,12 @@
 use std::collections::{BTreeMap, HashSet};
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+use quote::quote;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
-use crate::analyze_cfg::{self, Analysis, ArgInfo};
+use crate::analyze_cfg::{self, Analysis, ArgInfo, Variant};
 use crate::args::MacroArgs;
 use crate::lower::{self, skip_nested_scopes, BlockId, Cfg, ErrorSink, Terminator};
 
@@ -68,15 +68,15 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     let arg_ident: Vec<_> = args.iter().map(|a| &a.ident).collect();
     let arg_ty: Vec<_> = args.iter().map(|a| &a.ty).collect();
 
-    let variant_idents = variant_idents(&cfg);
-
     // Variant declarations in BlockId order: deterministic, and linear
     // bodies produce a `Start, S1..Sn` layout.
-    let state_variants: Vec<TokenStream> = (0..cfg.blocks.len())
-        .filter(|&b| b != cfg.entry && !cfg.blocks[b].inline)
-        .map(|b| {
-            let ident = variant_idents[b].as_ref().unwrap();
-            let field_defs = analysis.variant_fields[b].as_ref().unwrap().iter().map(|f| {
+    let state_variants: Vec<TokenStream> = analysis
+        .variants
+        .iter()
+        .filter(|v| v.block != cfg.entry)
+        .map(|v| {
+            let ident = &v.ident;
+            let field_defs = v.fields.iter().map(|f| {
                 let ident = &f.ident;
                 let ty = &f.ty;
                 quote!(#ident: #ty)
@@ -91,7 +91,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     let all_field_tys = arg_ty
         .iter()
         .copied()
-        .chain(analysis.variant_fields.iter().flatten().flatten().map(|f| &f.ty));
+        .chain(analysis.variants.iter().flat_map(|v| &v.fields).map(|f| &f.ty));
     let phantom_ty = phantom_for_unused_params(&generics, all_field_tys);
     let phantom_field = phantom_ty
         .as_ref()
@@ -129,22 +129,20 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     let codegen = Codegen {
         cfg: &cfg,
         analysis: &analysis,
-        variant_idents: &variant_idents,
         resume_bindings,
         yield_ty,
         ret_ty: &ret_ty,
         start_pattern: quote!(State::Start { #(#arg_pat,)* .. }),
     };
-    let drive_arms: Vec<TokenStream> = (0..cfg.blocks.len())
-        .filter(|&b| !cfg.blocks[b].inline)
-        .map(|b| codegen.arm(b))
-        .collect();
+    let drive_arms: Vec<TokenStream> = analysis.variants.iter().map(|v| codegen.arm(v)).collect();
 
     // resume() permits only suspension variants; internal variants are
     // reachable only through forged states (serde etc.).
-    let s_idents: Vec<&syn::Ident> = (0..cfg.blocks.len())
-        .filter(|&b| cfg.blocks[b].resume_point)
-        .map(|b| variant_idents[b].as_ref().unwrap())
+    let s_idents: Vec<&syn::Ident> = analysis
+        .variants
+        .iter()
+        .filter(|v| cfg.blocks[v.block].resume_point)
+        .map(|v| &v.ident)
         .collect();
     let has_internal = (0..cfg.blocks.len())
         .any(|b| b != cfg.entry && !cfg.blocks[b].inline && !cfg.blocks[b].resume_point);
@@ -249,7 +247,6 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
 struct Codegen<'a> {
     cfg: &'a Cfg,
     analysis: &'a Analysis,
-    variant_idents: &'a [Option<syn::Ident>],
     resume_bindings: BTreeMap<BlockId, &'a lower::ResumeBinding>,
     yield_ty: &'a syn::Type,
     ret_ty: &'a syn::Type,
@@ -257,23 +254,19 @@ struct Codegen<'a> {
 }
 
 impl Codegen<'_> {
-    /// One dispatch arm for a non-inline block: unpack the variant,
-    /// rebind the resume value, then run the block.
-    fn arm(&self, b: BlockId) -> TokenStream {
-        let pattern = if b == self.cfg.entry {
+    /// One dispatch arm for a variant: unpack it, rebind the resume value,
+    /// then run the block.
+    fn arm(&self, v: &Variant) -> TokenStream {
+        let pattern = if v.block == self.cfg.entry {
             self.start_pattern.clone()
         } else {
-            let ident = self.variant_idents[b].as_ref().unwrap();
-            let pats = self.analysis.variant_fields[b]
-                .as_ref()
-                .unwrap()
-                .iter()
-                .map(|f| bind_pat(&f.mutability, &f.ident));
+            let ident = &v.ident;
+            let pats = v.fields.iter().map(|f| bind_pat(&f.mutability, &f.ident));
             quote!(State::#ident { #(#pats),* })
         };
         // A resume-point variant's only predecessor is its yield, so the
         // take() runs exactly once per __drive call and cannot fail.
-        let resume_stmt = self.resume_bindings.get(&b).map(|rb| {
+        let resume_stmt = self.resume_bindings.get(&v.block).map(|rb| {
             let mutability = &rb.mutability;
             let ident = &self.cfg.bindings[rb.binding.0].ident;
             let ty = rb.ty.as_ref().map(|ty| quote!(: #ty));
@@ -282,20 +275,26 @@ impl Codegen<'_> {
                     __resume.take().expect("BUG: resume value already consumed");
             }
         });
-        let body = self.block_code(b);
+        let body = self.block_code(v.block);
         quote!(#pattern => { #resume_stmt #body })
     }
 
     /// A block's statements and transition, with crossed borrows
     /// re-established first and removed original borrow `let`s omitted.
+    /// `b` may be inline (no reborrows of its own) or a variant block.
     fn block_code(&self, b: BlockId) -> TokenStream {
-        let reborrows = self.analysis.reborrows[b].iter().map(|rb| {
-            let target_mut = &rb.target_mut;
-            let target = &rb.target;
-            let source = &rb.source;
-            let mut_tok = rb.mutable.then(|| quote!(mut));
-            quote!(let #target_mut #target = & #mut_tok #source;)
-        });
+        let reborrows = self
+            .analysis
+            .variant(b)
+            .map_or(&[][..], |v| &v.reborrows)
+            .iter()
+            .map(|rb| {
+                let target_mut = &rb.target_mut;
+                let target = &rb.target;
+                let source = &rb.source;
+                let mut_tok = rb.mutable.then(|| quote!(mut));
+                quote!(let #target_mut #target = & #mut_tok #source;)
+            });
         let stmts = self.cfg.blocks[b]
             .stmts
             .iter()
@@ -374,12 +373,14 @@ impl Codegen<'_> {
     }
 
     fn state_value(&self, b: BlockId) -> TokenStream {
-        let ident = self.variant_idents[b].as_ref().unwrap();
-        let fields = self.analysis.variant_fields[b]
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|f| &f.ident);
+        // `edge` only calls this for non-inline targets, and `Yield`'s
+        // `next` is always a resume point (never inline).
+        let v = self
+            .analysis
+            .variant(b)
+            .expect("BUG: state_value called for an inline block");
+        let ident = &v.ident;
+        let fields = v.fields.iter().map(|f| &f.ident);
         quote!(State::#ident { #(#fields),* })
     }
 }
@@ -388,57 +389,6 @@ impl Codegen<'_> {
 /// stored variable mutably when the state is unpacked.
 fn bind_pat(mutability: &Option<syn::Token![mut]>, ident: &syn::Ident) -> TokenStream {
     quote!(#mutability #ident)
-}
-
-// === Variant naming ===
-
-/// Assigns variant names: `Start` for the entry, `S{k}` for resume
-/// points (source yield order = block creation order, which block ids
-/// preserve), `B{k}` for the remaining variant blocks (reverse
-/// postorder). Inline blocks get none. Both numberings are deterministic
-/// for a given source, which serde representations rely on.
-fn variant_idents(cfg: &Cfg) -> Vec<Option<syn::Ident>> {
-    let mut idents = vec![None; cfg.blocks.len()];
-    idents[cfg.entry] = Some(format_ident!("Start"));
-    let mut s = 0;
-    for (b, block) in cfg.blocks.iter().enumerate() {
-        if block.resume_point {
-            s += 1;
-            idents[b] = Some(format_ident!("S{s}"));
-        }
-    }
-    let mut k = 0;
-    for b in reverse_postorder(cfg) {
-        if idents[b].is_none() && !cfg.blocks[b].inline {
-            k += 1;
-            idents[b] = Some(format_ident!("B{k}"));
-        }
-    }
-    idents
-}
-
-fn reverse_postorder(cfg: &Cfg) -> Vec<BlockId> {
-    let mut visited = vec![false; cfg.blocks.len()];
-    let mut post = Vec::new();
-    // Iterative DFS; `true` marks a node whose successors are done.
-    let mut stack = vec![(cfg.entry, false)];
-    while let Some((b, expanded)) = stack.pop() {
-        if expanded {
-            post.push(b);
-            continue;
-        }
-        if std::mem::replace(&mut visited[b], true) {
-            continue;
-        }
-        stack.push((b, true));
-        for s in cfg.blocks[b].terminator.successors().rev() {
-            if !visited[s] {
-                stack.push((s, false));
-            }
-        }
-    }
-    post.reverse();
-    post
 }
 
 // === Early-exit rewriting (`return` and `?`) ===
