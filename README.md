@@ -52,7 +52,7 @@ any code. `start()` runs the body up to the first `yield_!`; each
 - **Snapshots**: `#[derive(Clone)]` written under the attribute is moved
   to the state enum, so a suspended coroutine can be cloned and both
   copies resumed independently.
-- **Suspend-state persistence**: because the state enum stores only
+- **Suspended-state persistence**: because the state enum stores only
   concrete types (a `for` loop's iterator is stored as
   `<T as IntoIterator>::IntoIter`, not boxed), serde derives work with
   their ordinary semantics. A suspended coroutine can be serialized,
@@ -102,7 +102,7 @@ Serde support follows directly from what the state stores:
   struct.
 - A coroutine with `impl Trait` arguments has an unnameable state type,
   so it can be serialized but not deserialized.
-- Variant names (`S1..`, `B1..`) are assigned by yield order and block
+- Variant names (`S1..`, `B1..`) are assigned in yield and block
   order; editing the coroutine body can renumber them, so persisted
   states are only compatible with the exact source they were built from.
 
@@ -110,8 +110,8 @@ Serde support follows directly from what the state stores:
 
 The macro works purely syntactically — it never sees rustc's type
 information — and every state transition is a compile-time rewrite.
-This shows up as the following rules; each unsupported construct is a
-dedicated compile error with the workaround in the message.
+This shows up as the following rules; each unsupported construct
+produces a dedicated compile error with the workaround in the message.
 
 - **`yield_!` is statement-position only**: `yield_!(expr);` or
   `let x = yield_!(expr);`. It cannot appear inside expressions
@@ -125,7 +125,7 @@ dedicated compile error with the workaround in the message.
 - **Syntactic types**: every variable held across a `yield_!` needs a
   syntactically determinable type: an explicit annotation, a suffixed
   or unambiguous literal (`123u8`, `true`), a move from a known
-  variable, a function argument, or a range of known endpoints
+  variable, a function argument, or a range with known endpoints
   (`0u32..n`). Match-arm and destructuring-`for` bindings have nowhere
   to write a type annotation, so if they cross a yield, rebind first:
   `let v2: Type = v;` at the top of the arm or loop body.
@@ -142,12 +142,12 @@ dedicated compile error with the workaround in the message.
   an error. Move the exit condition into the loop header via a flag
   variable, or restructure so the jump shares a statement with a yield.
   `break` with a value cannot target such a loop at all.
-- **`?` is supported on `Result` and `Option` only.** It is rewritten to
-  the internal `BareTry` / `BareFromResidual` traits (visible in error
-  messages when `?` is used on other types); implementing them for
-  custom types is not supported.
-- **A body in which every live path ends in an explicit `return`**
-  (where the paths that diverge contain yields) produces a puzzling
+- **`?` is supported on `Result` and `Option` only.** It desugars to
+  calls on the internal `BareTry` / `BareFromResidual` traits (visible
+  in error messages when `?` is used on other types); implementing them
+  for custom types is not supported.
+- **A body whose every reachable path ends in an explicit `return`** —
+  with the diverging paths containing yields — produces a puzzling
   `E0308: expected <ret>, found ()` on the unreachable implicit tail.
   Append `unreachable!()` as the tail expression.
 - **Visibility**: the generated state enum is as public as the function,
