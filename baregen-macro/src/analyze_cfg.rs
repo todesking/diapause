@@ -28,6 +28,8 @@ pub struct ArgInfo {
 /// A field of a state variant.
 #[derive(Debug)]
 pub struct StateField {
+    // Not consumed by codegen yet; kept for `for` support (task 14).
+    #[allow(dead_code)]
     pub binding: BindingId,
     pub ident: syn::Ident,
     pub mutability: Option<syn::Token![mut]>,
@@ -59,6 +61,8 @@ pub struct Analysis {
     pub removed_stmts: Vec<BTreeSet<usize>>,
     /// Indexed by `BlockId`: bindings live at block entry, after borrow
     /// substitution.
+    // Consumed by the unit tests; codegen uses `variant_fields`.
+    #[allow(dead_code)]
     pub live_in: Vec<BTreeSet<BindingId>>,
 }
 

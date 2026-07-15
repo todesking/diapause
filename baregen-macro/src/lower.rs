@@ -132,6 +132,7 @@ pub enum Terminator {
     },
     /// From `for` loops; defined ahead of time but not produced by
     /// lowering yet (`for` containing yield_! is still an error).
+    #[allow(dead_code)]
     IterNext {
         iter: syn::Ident,
         pat: Box<syn::Pat>,

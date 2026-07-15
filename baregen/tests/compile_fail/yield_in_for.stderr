@@ -1,0 +1,5 @@
+error: yield_! inside a `for` loop is not supported yet; iterate with `loop`/`while` instead
+ --> tests/compile_fail/yield_in_for.rs:3:5
+  |
+3 |     for _i in 0..3 {
+  |     ^^^

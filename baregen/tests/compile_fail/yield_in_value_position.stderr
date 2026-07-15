@@ -1,0 +1,10 @@
+error: yield_! in value position is not supported; only `yield_!(expr);` and `let x = yield_!(expr);` statements can suspend
+ --> tests/compile_fail/yield_in_value_position.rs:3:5
+  |
+3 | /     let x = if c {
+4 | |         yield_!(1);
+5 | |         1
+6 | |     } else {
+7 | |         2
+8 | |     };
+  | |______^

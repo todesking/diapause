@@ -1,0 +1,5 @@
+error: cannot determine the type of `acc`, which is held across yield_!; write an explicit type annotation: `let acc: Type = ...`
+ --> tests/compile_fail/loop_crossing_unknown_type.rs:7:13
+  |
+7 |     let mut acc = compute();
+  |             ^^^

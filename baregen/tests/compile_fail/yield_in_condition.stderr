@@ -1,0 +1,17 @@
+error: yield_! in a condition expression is not supported
+ --> tests/compile_fail/yield_in_condition.rs:5:8
+  |
+5 |     if yield_!(1) {
+  |        ^^^^^^^^^^
+
+error: yield_! in a condition expression is not supported
+  --> tests/compile_fail/yield_in_condition.rs:12:11
+   |
+12 |     while yield_!(2) {
+   |           ^^^^^^^^^^
+
+error: yield_! in a match scrutinee is not supported
+  --> tests/compile_fail/yield_in_condition.rs:19:11
+   |
+19 |     match yield_!(3) {
+   |           ^^^^^^^^^^

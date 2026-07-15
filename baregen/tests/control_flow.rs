@@ -1,0 +1,249 @@
+//! Yields inside control flow (the v2 CFG pipeline): branches, loops,
+//! break/continue, nesting, and early return.
+
+use baregen::{Coroutine, CoroutineState};
+
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn add_if(c: bool) -> u32 {
+    let mut acc: u32 = 1;
+    if c {
+        let r = yield_!(acc);
+        acc += r;
+    }
+    acc * 10
+}
+
+#[test]
+fn yield_in_if_taken() {
+    let mut c = add_if(true);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(5), CoroutineState::Complete(60));
+}
+
+#[test]
+fn yield_in_if_skipped() {
+    let mut c = add_if(false);
+    assert_eq!(c.start(), CoroutineState::Complete(10));
+}
+
+/// The two branches keep different variables alive across their yields.
+#[baregen::coroutine(yield = u32)]
+fn branch_liveness(c: bool) -> u64 {
+    let mut out: u64 = 0;
+    if c {
+        let a: u32 = 3;
+        yield_!(1);
+        out += a as u64;
+    } else {
+        let b2: u64 = 40;
+        yield_!(2);
+        out += b2;
+    }
+    out
+}
+
+#[test]
+fn branches_with_differing_live_sets() {
+    let mut c = branch_liveness(true);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(3));
+
+    let mut c = branch_liveness(false);
+    assert_eq!(c.start(), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(()), CoroutineState::Complete(40));
+}
+
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn match_yield(x: u32) -> u32 {
+    let mut out: u32 = 0;
+    match x {
+        0 => {
+            let r = yield_!(10);
+            out += r;
+        }
+        _ => {
+            let r = yield_!(20);
+            out += r * 2;
+        }
+    }
+    out
+}
+
+#[test]
+fn yield_in_match_arms() {
+    let mut c = match_yield(0);
+    assert_eq!(c.start(), CoroutineState::Yielded(10));
+    assert_eq!(c.resume(7), CoroutineState::Complete(7));
+
+    let mut c = match_yield(9);
+    assert_eq!(c.start(), CoroutineState::Yielded(20));
+    assert_eq!(c.resume(7), CoroutineState::Complete(14));
+}
+
+// The design document's `totals` example.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn totals(n: u32) -> u32 {
+    let mut sum: u32 = 0;
+    let mut i: u32 = 0;
+    while i < n {
+        let r = yield_!(sum);
+        sum += r;
+        i += 1;
+    }
+    sum
+}
+
+#[test]
+fn yield_in_while() {
+    let mut c = totals(2);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(5), CoroutineState::Yielded(5));
+    assert_eq!(c.resume(7), CoroutineState::Complete(12));
+}
+
+#[test]
+fn while_condition_false_from_the_start() {
+    let mut c = totals(0);
+    assert_eq!(c.start(), CoroutineState::Complete(0));
+}
+
+#[baregen::coroutine(yield = u32, resume = bool)]
+fn until_stop() -> u32 {
+    let mut count: u32 = 0;
+    loop {
+        let stop = yield_!(count);
+        if stop {
+            yield_!(999);
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+#[test]
+fn loop_with_break_in_nested_if() {
+    let mut c = until_stop();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(false), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(true), CoroutineState::Yielded(999));
+    assert_eq!(c.resume(false), CoroutineState::Complete(1));
+}
+
+#[baregen::coroutine(yield = u32, resume = bool)]
+fn skipper() -> u32 {
+    let mut i: u32 = 0;
+    loop {
+        i += 1;
+        let again = yield_!(i);
+        if again {
+            yield_!(0);
+            continue;
+        }
+        break;
+    }
+    i
+}
+
+#[test]
+fn continue_restarts_the_loop() {
+    let mut c = skipper();
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(true), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(false), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(false), CoroutineState::Complete(2));
+}
+
+#[baregen::coroutine(yield = u32)]
+fn nested_loops() -> u32 {
+    let mut n: u32 = 0;
+    'outer: loop {
+        loop {
+            yield_!(n);
+            n += 1;
+            if n >= 3 {
+                yield_!(100);
+                break 'outer;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn labeled_break_from_nested_loops() {
+    let mut c = nested_loops();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(()), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(()), CoroutineState::Yielded(100));
+    assert_eq!(c.resume(()), CoroutineState::Complete(3));
+}
+
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn early(limit: u32) -> u32 {
+    let r = yield_!(limit);
+    if r > limit {
+        return 0;
+    }
+    let r2 = yield_!(r);
+    r + r2
+}
+
+#[test]
+fn early_return_completes() {
+    let mut c = early(10);
+    assert_eq!(c.start(), CoroutineState::Yielded(10));
+    assert_eq!(c.resume(20), CoroutineState::Complete(0));
+}
+
+#[test]
+fn early_return_not_taken() {
+    let mut c = early(10);
+    assert_eq!(c.start(), CoroutineState::Yielded(10));
+    assert_eq!(c.resume(3), CoroutineState::Yielded(3));
+    assert_eq!(c.resume(4), CoroutineState::Complete(7));
+}
+
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn early_in_loop() -> u32 {
+    let mut total: u32 = 0;
+    loop {
+        let r = yield_!(total);
+        if r == 0 {
+            return total * 2;
+        }
+        total += r;
+    }
+}
+
+#[test]
+fn early_return_from_inside_a_loop() {
+    let mut c = early_in_loop();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(5), CoroutineState::Yielded(5));
+    assert_eq!(c.resume(0), CoroutineState::Complete(10));
+}
+
+/// A borrow taken inside the loop body and used after the yield is
+/// re-established on every iteration.
+#[baregen::coroutine(yield = i32, resume = i32)]
+fn loop_borrow() -> i32 {
+    let mut x: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 2 {
+        let p = &mut x;
+        let r = yield_!(*p);
+        *p += r;
+        i += 1;
+    }
+    x
+}
+
+#[test]
+fn borrow_across_loop_yield_is_rebuilt_each_iteration() {
+    let mut c = loop_borrow();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(5), CoroutineState::Yielded(5));
+    assert_eq!(c.resume(6), CoroutineState::Complete(11));
+}
