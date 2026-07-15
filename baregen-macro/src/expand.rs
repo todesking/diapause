@@ -11,7 +11,7 @@ use syn::visit_mut::VisitMut;
 
 use crate::analyze_cfg::{self, Analysis, ArgInfo};
 use crate::args::MacroArgs;
-use crate::lower::{self, BlockId, Cfg, ErrorSink, Terminator};
+use crate::lower::{self, skip_nested_scopes, BlockId, Cfg, ErrorSink, Terminator};
 
 /// A function argument (simple-identifier pattern only). Carries the
 /// `ident` needed to emit code, unlike `analyze_cfg::ArgInfo`, which drops
@@ -501,9 +501,7 @@ fn rewrite_early_exits(body: &mut syn::Block, ret_ty: &syn::Type) {
                 mac.tokens = quote!(#value);
             }
         }
-        fn visit_expr_closure_mut(&mut self, _: &mut syn::ExprClosure) {}
-        fn visit_expr_async_mut(&mut self, _: &mut syn::ExprAsync) {}
-        fn visit_item_mut(&mut self, _: &mut syn::Item) {}
+        skip_nested_scopes!(VisitMut);
     }
     Rewriter { ret_ty }.visit_block_mut(body);
 }

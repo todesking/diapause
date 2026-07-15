@@ -529,6 +529,25 @@ fn tokens_contain_yield(tokens: proc_macro2::TokenStream) -> bool {
     false
 }
 
+/// Skips closures, async blocks, and nested items when visiting a
+/// coroutine body: they are separate scopes, so `yield_!`, `?`, and
+/// break/continue inside them must not be attributed to the enclosing
+/// coroutine. Works for both `syn::visit::Visit` and
+/// `syn::visit_mut::VisitMut` impls.
+macro_rules! skip_nested_scopes {
+    (Visit) => {
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+        fn visit_item(&mut self, _: &'ast syn::Item) {}
+    };
+    (VisitMut) => {
+        fn visit_expr_closure_mut(&mut self, _: &mut syn::ExprClosure) {}
+        fn visit_expr_async_mut(&mut self, _: &mut syn::ExprAsync) {}
+        fn visit_item_mut(&mut self, _: &mut syn::Item) {}
+    };
+}
+pub(crate) use skip_nested_scopes;
+
 /// Finds genuine `yield_!` invocations. Closures, async blocks, and
 /// nested items are separate scopes and pass through. Foreign macros
 /// whose tokens mention yield_! do not count as containing a yield;
@@ -545,9 +564,7 @@ impl<'ast> Visit<'ast> for ContainsYield {
         }
     }
 
-    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
-    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
-    fn visit_item(&mut self, _: &'ast syn::Item) {}
+    skip_nested_scopes!(Visit);
 }
 
 fn contains_yield_stmt(stmt: &syn::Stmt) -> bool {
@@ -584,9 +601,7 @@ impl<'ast> Visit<'ast> for YieldBan<'_> {
         }
     }
 
-    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
-    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
-    fn visit_item(&mut self, _: &'ast syn::Item) {}
+    skip_nested_scopes!(Visit);
 }
 
 // === Small collectors ===
@@ -1446,9 +1461,7 @@ impl<'ast> Visit<'ast> for OpaqueChecker {
 
     // Separate scopes: break/continue and yield_! inside these belong to
     // them, not to the coroutine.
-    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
-    fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
-    fn visit_item(&mut self, _: &'ast syn::Item) {}
+    skip_nested_scopes!(Visit);
 }
 
 // === CFG simplification ===
