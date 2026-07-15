@@ -275,9 +275,30 @@ impl Context<'_> {
         live_in: &[BTreeSet<BindingId>],
         rebuilds: &[BTreeSet<BindingId>],
     ) -> Vec<Option<Vec<StateField>>> {
-        // Bindings whose mutable borrow is rebuilt in some arm must be
-        // unpacked `mut` so the reborrow can take `&mut`.
-        let forced_mut: BTreeSet<BindingId> = rebuilds
+        let forced_mut = self.compute_forced_mut(rebuilds);
+        let mut reported: BTreeSet<BindingId> = BTreeSet::new();
+        let mut collisions: BTreeSet<(BindingId, BindingId)> = BTreeSet::new();
+        let mut variant_fields = Vec::with_capacity(self.cfg.blocks.len());
+        for (b, block) in self.cfg.blocks.iter().enumerate() {
+            if block.inline {
+                variant_fields.push(None);
+                continue;
+            }
+            let fields = self.build_fields_for_block(
+                &live_in[b],
+                &forced_mut,
+                &mut reported,
+                &mut collisions,
+            );
+            variant_fields.push(Some(fields));
+        }
+        variant_fields
+    }
+
+    /// Bindings whose mutable borrow is rebuilt in some arm must be
+    /// unpacked `mut` so the reborrow can take `&mut`.
+    fn compute_forced_mut(&self, rebuilds: &[BTreeSet<BindingId>]) -> BTreeSet<BindingId> {
+        rebuilds
             .iter()
             .flatten()
             .filter_map(|t| match &self.cfg.bindings[t.0].borrow {
@@ -288,106 +309,108 @@ impl Context<'_> {
                 } => Some(*s),
                 _ => None,
             })
-            .collect();
+            .collect()
+    }
 
-        let mut reported: BTreeSet<BindingId> = BTreeSet::new();
-        let mut collisions: BTreeSet<(BindingId, BindingId)> = BTreeSet::new();
-        let mut variant_fields = Vec::with_capacity(self.cfg.blocks.len());
-        for (b, block) in self.cfg.blocks.iter().enumerate() {
-            if block.inline {
-                variant_fields.push(None);
+    /// Builds the state fields for one non-inline block's live-in set,
+    /// reporting a name collision or a per-binding error (at most once
+    /// per binding) in place of a field where the binding can't become
+    /// one.
+    fn build_fields_for_block(
+        &mut self,
+        live: &BTreeSet<BindingId>,
+        forced_mut: &BTreeSet<BindingId>,
+        reported: &mut BTreeSet<BindingId>,
+        collisions: &mut BTreeSet<(BindingId, BindingId)>,
+    ) -> Vec<StateField> {
+        self.check_name_collisions(live, collisions);
+        let mut fields = Vec::new();
+        for id in live {
+            let binding = &self.cfg.bindings[id.0];
+            let name = binding.ident.to_string();
+            match &binding.borrow {
+                // Substituted by its source during liveness.
+                BorrowSource::Direct { .. } => {
+                    debug_assert!(
+                        self.def_block[id.0].is_none(),
+                        "BUG: direct borrow live at a variant entry"
+                    );
+                    continue;
+                }
+                BorrowSource::NonReconstructible { why } => {
+                    if reported.insert(*id) {
+                        self.err(binding.ident.span(), format!("`{name}` {why}"));
+                    }
+                    continue;
+                }
+                BorrowSource::NotABorrow => {}
+            }
+            if binding.kind == BindingKind::ArmPat {
+                if reported.insert(*id) {
+                    self.err(
+                        binding.ident.span(),
+                        unannotatable_binding_error(
+                            &name,
+                            "a match arm pattern",
+                            "arm patterns cannot be annotated with a type",
+                            "the arm",
+                        ),
+                    );
+                }
                 continue;
             }
-            self.check_name_collisions(&live_in[b], &mut collisions);
-            let mut fields = Vec::new();
-            for id in &live_in[b] {
-                let binding = &self.cfg.bindings[id.0];
-                let name = binding.ident.to_string();
-                match &binding.borrow {
-                    // Substituted by its source during liveness.
-                    BorrowSource::Direct { .. } => {
-                        debug_assert!(
-                            self.def_block[id.0].is_none(),
-                            "BUG: direct borrow live at a variant entry"
-                        );
-                        continue;
-                    }
-                    BorrowSource::NonReconstructible { why } => {
-                        if reported.insert(*id) {
-                            self.err(binding.ident.span(), format!("`{name}` {why}"));
-                        }
-                        continue;
-                    }
-                    BorrowSource::NotABorrow => {}
+            if binding.kind == BindingKind::ForPat {
+                if reported.insert(*id) {
+                    self.err(
+                        binding.ident.span(),
+                        unannotatable_binding_error(
+                            &name,
+                            "a destructuring `for` pattern",
+                            "its type cannot be derived",
+                            "the loop body",
+                        ),
+                    );
                 }
-                if binding.kind == BindingKind::ArmPat {
+                continue;
+            }
+            match self.resolve_binding_ty(*id) {
+                Some(ty) => {
+                    let base = if binding.kind == BindingKind::Arg {
+                        self.args[id.0].mutability
+                    } else {
+                        binding.mutability
+                    };
+                    let forced = forced_mut
+                        .contains(id)
+                        .then(|| syn::Token![mut](binding.ident.span()));
+                    fields.push(StateField {
+                        ident: binding.ident.clone(),
+                        mutability: base.or(forced),
+                        ty,
+                    });
+                }
+                None => {
                     if reported.insert(*id) {
-                        self.err(
-                            binding.ident.span(),
-                            format!(
-                                "`{name}` is bound by a match arm pattern and must be stored \
-                                 across a state boundary, but arm patterns cannot be annotated \
-                                 with a type; rebind it at the top of the arm: \
-                                 `let {name}2: Type = {name};`"
-                            ),
-                        );
-                    }
-                    continue;
-                }
-                if binding.kind == BindingKind::ForPat {
-                    if reported.insert(*id) {
-                        self.err(
-                            binding.ident.span(),
-                            format!(
-                                "`{name}` is bound by a destructuring `for` pattern and must be \
-                                 stored across a state boundary, but its type cannot be derived; \
-                                 rebind it at the top of the loop body: \
-                                 `let {name}2: Type = {name};`"
-                            ),
-                        );
-                    }
-                    continue;
-                }
-                match self.resolve_binding_ty(*id) {
-                    Some(ty) => {
-                        let base = if binding.kind == BindingKind::Arg {
-                            self.args[id.0].mutability
+                        let msg = if binding.kind == BindingKind::ForIter {
+                            // The span points at the `for` head expression.
+                            "cannot determine the type of this `for` loop's iterator, \
+                             which is held across yield_!; iterate over a variable with \
+                             an explicit type annotation: \
+                             `let items: Type = ...; for x in items { ... }`"
+                                .to_string()
                         } else {
-                            binding.mutability
+                            format!(
+                                "cannot determine the type of `{name}`, which is held across \
+                                 yield_!; write an explicit type annotation: \
+                                 `let {name}: Type = ...`"
+                            )
                         };
-                        let forced = forced_mut
-                            .contains(id)
-                            .then(|| syn::Token![mut](binding.ident.span()));
-                        fields.push(StateField {
-                            ident: binding.ident.clone(),
-                            mutability: base.or(forced),
-                            ty,
-                        });
-                    }
-                    None => {
-                        if reported.insert(*id) {
-                            let msg = if binding.kind == BindingKind::ForIter {
-                                // The span points at the `for` head expression.
-                                "cannot determine the type of this `for` loop's iterator, \
-                                 which is held across yield_!; iterate over a variable with \
-                                 an explicit type annotation: \
-                                 `let items: Type = ...; for x in items { ... }`"
-                                    .to_string()
-                            } else {
-                                format!(
-                                    "cannot determine the type of `{name}`, which is held across \
-                                     yield_!; write an explicit type annotation: \
-                                     `let {name}: Type = ...`"
-                                )
-                            };
-                            self.err(binding.ident.span(), msg);
-                        }
+                        self.err(binding.ident.span(), msg);
                     }
                 }
             }
-            variant_fields.push(Some(fields));
         }
-        variant_fields
+        fields
     }
 
     /// Two distinct bindings with the same name live at the same variant
@@ -461,6 +484,18 @@ impl Context<'_> {
             }
         }
     }
+}
+
+/// A binding whose type can't be spelled in an annotation (e.g. a match
+/// arm or destructuring `for` pattern) but that must be stored across a
+/// state boundary anyway: point the user at rebinding with an explicit
+/// type. `binder` names what bound it, `reason` says why it can't be
+/// annotated in place, and `site` is where to insert the rebind.
+fn unannotatable_binding_error(name: &str, binder: &str, reason: &str, site: &str) -> String {
+    format!(
+        "`{name}` is bound by {binder} and must be stored across a state boundary, but \
+         {reason}; rebind it at the top of {site}: `let {name}2: Type = {name};`"
+    )
 }
 
 /// Computes each block's region root by walking the unique-predecessor
