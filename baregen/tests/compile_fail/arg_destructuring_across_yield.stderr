@@ -1,0 +1,5 @@
+error: `b` is bound by a destructuring argument pattern and must be stored across a state boundary, but its type cannot be derived; rebind it at the top of the function body: `let b2: Type = b;`
+ --> tests/compile_fail/arg_destructuring_across_yield.rs:2:10
+  |
+2 | fn f((a, b): (u32, u32)) -> u32 {
+  |          ^

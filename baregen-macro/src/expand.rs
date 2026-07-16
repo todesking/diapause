@@ -14,13 +14,18 @@ use crate::args::MacroArgs;
 use crate::cfg::{BlockId, Cfg, ResumeBinding, Terminator};
 use crate::lower::{self, skip_nested_scopes, ErrorSink};
 
-/// A function argument (simple-identifier pattern only). Carries the
-/// `ident` needed to emit code, unlike `analyze_cfg::ArgInfo`, which drops
-/// it because that crate identifies arguments by `BindingId` instead.
+/// A function argument. Carries the `ident` needed to emit code, unlike
+/// `analyze_cfg::ArgInfo`, which drops it because that crate identifies
+/// arguments by `BindingId` instead. A non-simple-identifier pattern is
+/// replaced by a fresh `__argN` ident (which is what the state stores)
+/// and kept in `pattern`; the body then destructures it via a
+/// synthesized `let <pattern> = __argN;` at the entry block.
 struct ArgVar {
     ident: syn::Ident,
     mutability: Option<syn::Token![mut]>,
     ty: syn::Type,
+    /// The original pattern, when it is not a simple identifier.
+    pattern: Option<syn::Pat>,
 }
 
 impl From<&ArgVar> for ArgInfo {
@@ -52,7 +57,11 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     rewrite_early_exits(&mut body, &ret_ty);
 
     let arg_idents: Vec<syn::Ident> = args.iter().map(|a| a.ident.clone()).collect();
-    let cfg = lower::lower(&arg_idents, &[], &body)?;
+    let arg_pats: Vec<(syn::Pat, syn::Ident)> = args
+        .iter()
+        .filter_map(|a| a.pattern.clone().map(|p| (p, a.ident.clone())))
+        .collect();
+    let cfg = lower::lower(&arg_idents, &arg_pats, &body)?;
     let arg_infos: Vec<ArgInfo> = args.iter().map(ArgInfo::from).collect();
     let analysis = analyze_cfg::analyze(&cfg, &arg_infos, &macro_args.resume_ty)?;
 
@@ -654,6 +663,24 @@ fn check_return_type(ty: &syn::Type) -> syn::Result<()> {
 }
 
 fn parse_args(sig: &syn::Signature) -> syn::Result<Vec<ArgVar>> {
+    let simple = |pat: &syn::Pat| match pat {
+        syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => Some(pi.clone()),
+        _ => None,
+    };
+    // Names taken by simple-identifier arguments; the fresh `__argN`
+    // names must not collide with them (they share the State enum's
+    // Start-variant field namespace).
+    let taken: HashSet<String> = sig
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            syn::FnArg::Typed(pt) => simple(&pt.pat).map(|pi| pi.ident.to_string()),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect();
+    let mut fresh = (0usize..)
+        .map(|i| format!("__arg{i}"))
+        .filter(|name| !taken.contains(name));
     sig.inputs
         .iter()
         .map(|input| {
@@ -666,17 +693,24 @@ fn parse_args(sig: &syn::Signature) -> syn::Result<Vec<ArgVar>> {
                 }
                 syn::FnArg::Typed(pt) => pt,
             };
-            match &*pat_type.pat {
-                syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => Ok(ArgVar {
+            let ty = (*pat_type.ty).clone();
+            Ok(match simple(&pat_type.pat) {
+                Some(pi) => ArgVar {
                     ident: pi.ident.clone(),
                     mutability: pi.mutability,
-                    ty: (*pat_type.ty).clone(),
-                }),
-                other => Err(syn::Error::new_spanned(
-                    other,
-                    "argument patterns must be simple identifiers",
-                )),
-            }
+                    ty,
+                    pattern: None,
+                },
+                // Any other pattern (destructuring, `_`, `ref`, `@`):
+                // the state stores the value under a fresh name and the
+                // entry block destructures it.
+                None => ArgVar {
+                    ident: syn::Ident::new(&fresh.next().unwrap(), pat_type.pat.span()),
+                    mutability: None,
+                    ty,
+                    pattern: Some((*pat_type.pat).clone()),
+                },
+            })
         })
         .collect()
 }
