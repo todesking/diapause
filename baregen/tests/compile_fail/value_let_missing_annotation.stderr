@@ -1,0 +1,5 @@
+error: cannot determine the type of `x`, which is held across yield_!; write an explicit type annotation: `let x: Type = ...`
+ --> tests/compile_fail/value_let_missing_annotation.rs:3:9
+  |
+3 |     let x = if c {
+  |         ^

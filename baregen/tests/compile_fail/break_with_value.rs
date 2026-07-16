@@ -4,6 +4,9 @@ fn break_value() {
         yield_!(1);
         break 42;
     }
+    after();
 }
+
+fn after() {}
 
 fn main() {}

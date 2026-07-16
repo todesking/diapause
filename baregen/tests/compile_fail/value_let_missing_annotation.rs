@@ -1,6 +1,6 @@
 #[baregen::coroutine(yield = i32)]
-fn value_position(c: bool) -> i32 {
-    let x: i32 = 1 + if c {
+fn missing_annotation(c: bool) -> i32 {
+    let x = if c {
         yield_!(1);
         1
     } else {

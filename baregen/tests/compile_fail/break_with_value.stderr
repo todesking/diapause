@@ -1,4 +1,4 @@
-error: `break` with a value cannot target a loop containing yield_!
+error: `break` with a value can only target a loop containing yield_! when the loop is a `let` initializer or the function's trailing expression
  --> tests/compile_fail/break_with_value.rs:5:15
   |
 5 |         break 42;

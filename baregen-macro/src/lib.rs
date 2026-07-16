@@ -48,6 +48,13 @@ mod ty_infer;
 /// `yield_!` are kept verbatim; only yield-containing control flow is
 /// expanded into state-machine transitions.
 ///
+/// Yield-containing control flow may also produce a value in two
+/// positions: as a whole `let` initializer
+/// (`let x: T = if c { yield_!(1); a } else { b };`, including `break`
+/// with a value from a `loop` initializer) and as the function's
+/// trailing expression. The `let` form needs its type annotation
+/// whenever the value crosses the join into a state variant.
+///
 /// # Constraints
 ///
 /// The transformation is purely syntactic, which imposes the following
@@ -56,13 +63,16 @@ mod ty_infer;
 ///
 /// - **Statement-position yield.** `yield_!` is only accepted as
 ///   `yield_!(expr);` or `let x = yield_!(expr);`. It cannot appear in
-///   expressions, value-position control flow
-///   (`let x = if c { yield_!(1); a } else { b };`), tail expressions,
-///   conditions, match scrutinees or guards, `for`-head expressions,
-///   assignments (`x = yield_!(..)` — resume values bind via `let`
-///   only), `if let` (use `match`), `unsafe` blocks, or other macro
-///   invocations. If you need the value in expression position, assign
-///   into an `Option<T>` in each branch and `unwrap()` after the join.
+///   expressions (`f(yield_!(1))`, `1 + yield_!(2)`), conditions, match
+///   scrutinees or guards, `for`-head expressions, assignments
+///   (`x = yield_!(..)` — resume values bind via `let` only), `if let`
+///   (use `match`), `unsafe` blocks, or other macro invocations.
+///   Yield-containing control flow produces a value only in the two
+///   supported positions above; anywhere else, assign into an
+///   `Option<T>` in each branch and `unwrap()` after the join.
+/// - **`break` with a value** may target a yield-containing loop only
+///   when the loop is a `let` initializer or the function's trailing
+///   expression.
 /// - **Syntactic types.** A variable held across a `yield_!` must have
 ///   a syntactically determinable type: an explicit annotation, a
 ///   suffixed or unambiguous literal (`123u8`, `true`), a move from a

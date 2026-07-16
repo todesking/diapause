@@ -1252,6 +1252,88 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // === Value-position let initializers ===
+
+    #[test]
+    fn let_if_value_binding_is_carried_into_the_join() {
+        let block: syn::Block = parse_quote!({
+            let x: u32 = if c {
+                yield_!(1);
+                1
+            } else {
+                2
+            };
+            yield_!(x);
+            f(x);
+        });
+        let (cfg, a) = run_args(&[("c", "bool")], &block, &unit());
+        // The join holds x as its only field, with the annotated type.
+        let s1 = resume_ids(&cfg)[0];
+        let Terminator::Goto(join) = cfg.blocks[s1].terminator else {
+            panic!("resume should goto the join");
+        };
+        assert_eq!(field_names(&a, join), ["x"]);
+        let expected: syn::Type = parse_quote!(u32);
+        assert_eq!(field(&a, join, "x").ty, expected);
+        // x stays live across the second yield.
+        assert_eq!(resume_fields(&cfg, &a, 1), ["x"]);
+    }
+
+    #[test]
+    fn let_if_value_consumed_at_the_join_is_not_stored_further() {
+        let block: syn::Block = parse_quote!({
+            let x: u32 = if c {
+                yield_!(1);
+                1
+            } else {
+                2
+            };
+            yield_!(x);
+        });
+        let (cfg, a) = run_args(&[("c", "bool")], &block, &unit());
+        // The join consumes x as the yield value; the following resume
+        // state stores nothing.
+        assert!(resume_fields(&cfg, &a, 1).is_empty());
+    }
+
+    #[test]
+    fn let_if_value_without_annotation_is_an_error() {
+        let block: syn::Block = parse_quote!({
+            let x = if c {
+                yield_!(1);
+                1
+            } else {
+                2
+            };
+            f(x);
+        });
+        let (_, result) = lower_analyze(&[("c", "bool")], &block, &unit());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("type annotation"), "got: {msg}");
+        assert!(msg.contains("`x`"), "got: {msg}");
+    }
+
+    #[test]
+    fn let_loop_break_value_liveness() {
+        let block: syn::Block = parse_quote!({
+            let mut acc: u32 = 0;
+            let total: u32 = loop {
+                let r = yield_!(acc);
+                acc += r;
+                if acc > 9 {
+                    yield_!(1);
+                    break acc;
+                }
+            };
+            yield_!(total);
+            f(total);
+        });
+        let (cfg, a) = run(&block);
+        // After the loop only `total` survives; `acc` dies with the break.
+        let n = resume_ids(&cfg).len();
+        assert_eq!(resume_fields(&cfg, &a, n - 1), ["total"]);
+    }
+
     // === New error cases ===
 
     #[test]

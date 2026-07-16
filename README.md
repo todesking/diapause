@@ -42,6 +42,12 @@ any code. `start()` runs the body up to the first `yield_!`; each
   `break`, `continue` (including labeled forms), early `return`, and the
   `?` operator on `Result` and `Option`. The generated `resume` is a
   dispatch loop over basic blocks, so join points are never duplicated.
+- **Value-producing control flow**: a yield-containing `if` / `match` /
+  `loop` / block may initialize a `let` binding
+  (`let x: T = if c { yield_!(1); a } else { b };` — the annotation is
+  required when the value crosses the join) or stand as the function's
+  trailing expression, including `break` with a value from such a
+  `loop`.
 - **Resume arguments** are ordinary values passed to `resume`, typed via
   the attribute (`resume = String`), with a separate zero-argument
   `start()` so no resume value can be silently dropped on the first
@@ -115,13 +121,17 @@ produces a dedicated compile error with the workaround in the message.
 
 - **`yield_!` is statement-position only**: `yield_!(expr);` or
   `let x = yield_!(expr);`. It cannot appear inside expressions
-  (`f(yield_!(1))`), value-position control flow
-  (`let x = if c { yield_!(1); a } else { b };`), tail expressions,
-  conditions, match scrutinees or guards, `for`-head expressions,
-  assignments (`x = yield_!(..)` — resume values bind via `let` only),
-  `if let` (use `match`), or `unsafe` blocks. If you need the value in
-  expression position, assign into an `Option` in each branch and
-  `unwrap()` after the join.
+  (`f(yield_!(1))`, `1 + yield_!(2)`), conditions, match scrutinees or
+  guards, `for`-head expressions, assignments (`x = yield_!(..)` —
+  resume values bind via `let` only), `if let` (use `match`), or
+  `unsafe` blocks. Yield-containing control flow produces a value only
+  as a whole `let` initializer or as the function's trailing expression
+  (see Features); in any other expression position, assign into an
+  `Option` in each branch and `unwrap()` after the join.
+- **Value bindings crossing the join need an annotation**: in
+  `let x = if c { yield_!(1); a } else { b };` the join is a state
+  variant storing `x`, so write `let x: T = ...` (the usual
+  annotate-the-type error otherwise).
 - **Syntactic types**: every variable held across a `yield_!` needs a
   syntactically determinable type: an explicit annotation, a suffixed
   or unambiguous literal (`123u8`, `true`), a move from a known
@@ -141,7 +151,8 @@ produces a dedicated compile error with the workaround in the message.
   contains a `yield_!`; a plain `if done { break; }` after a yield is
   an error. Move the exit condition into the loop header via a flag
   variable, or restructure so the jump shares a statement with a yield.
-  `break` with a value cannot target such a loop at all.
+  `break` with a value can target such a loop only when the loop is a
+  `let` initializer or the function's trailing expression.
 - **`?` is supported on `Result` and `Option` only.** It desugars to
   calls on the internal `BareTry` / `BareFromResidual` traits (visible
   in error messages when `?` is used on other types); implementing them

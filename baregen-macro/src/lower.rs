@@ -76,6 +76,10 @@ enum TailCtx {
     /// The trailing expression's value is discarded (statement blocks,
     /// loop bodies, match arms).
     Discard,
+    /// The trailing expression's value is assigned to a `let` binding
+    /// (the initializer of `let x = if/match/loop/{..}` and, recursively,
+    /// the arms thereof).
+    Store(BindingId),
 }
 
 struct DraftBlock {
@@ -91,7 +95,33 @@ struct DraftBlock {
 struct Frame {
     label: Option<String>,
     header: Option<BlockId>,
-    exit: BlockId,
+    dest: BreakDest,
+}
+
+/// What a `break` targeting a frame does, determined by the position of
+/// the loop or labeled block it belongs to.
+#[derive(Clone, Copy)]
+enum BreakDest {
+    /// Statement position: jump to the exit block; a value is an error.
+    Plain(BlockId),
+    /// `let` initializer: assign the value to the binding, then jump.
+    Store { binding: BindingId, exit: BlockId },
+    /// The function's trailing expression: the value completes the
+    /// coroutine.
+    Return,
+}
+
+impl BreakDest {
+    /// The destination for a value produced in the frame's position:
+    /// loops pass it to their `break`s, labeled blocks additionally to
+    /// their trailing expression.
+    fn of(ctx: TailCtx, exit: BlockId) -> Self {
+        match ctx {
+            TailCtx::Discard => BreakDest::Plain(exit),
+            TailCtx::Store(binding) => BreakDest::Store { binding, exit },
+            TailCtx::FnReturn => BreakDest::Return,
+        }
+    }
 }
 
 /// `pub(crate)` so that `ty_infer.rs` can add an `impl Lowerer` block of
@@ -305,17 +335,24 @@ const ERR_FOREIGN_MACRO: &str = "yield_! cannot appear inside another macro invo
 const ERR_LET_ELSE: &str = "`let ... else` cannot be used with yield_!";
 const ERR_SIMPLE_BINDING: &str =
     "the binding of `let ... = yield_!(...)` must be a simple identifier";
+const ERR_VALUE_LET_BINDING: &str =
+    "the binding of a `let` whose initializer contains yield_! must be a simple identifier";
 const ERR_YIELD_ARG: &str = "yield_! takes a single expression";
-const ERR_VALUE_POSITION: &str = "yield_! in value position is not supported; only \
-     `yield_!(expr);` and `let x = yield_!(expr);` statements can suspend";
-const ERR_TAIL: &str = "yield_! in the trailing expression is not supported; add a semicolon";
+const ERR_VALUE_POSITION: &str = "yield_! in value position is only supported when the \
+     value is the whole `let` initializer or function tail expression and is an \
+     `if`/`match`/`loop`/block expression whose arms produce the value; as a workaround, \
+     declare `let mut x: Option<T> = None;` before the control flow, assign \
+     `x = Some(...);` where the value is produced, and use `x.unwrap()` afterwards";
+const ERR_TAIL: &str = "yield_! in the trailing expression is not supported here; \
+     add a semicolon";
 const ERR_COND: &str = "yield_! in a condition expression is not supported";
 const ERR_SCRUTINEE: &str = "yield_! in a match scrutinee is not supported";
 const ERR_GUARD: &str = "yield_! in a match guard is not supported";
 const ERR_UNSAFE: &str = "yield_! inside an unsafe block is not supported";
 const ERR_IF_LET: &str = "yield_! inside `if let` is not supported; use `match` instead";
 const ERR_FOR_HEAD: &str = "yield_! in a `for` loop's iterator expression is not supported";
-const ERR_BREAK_VALUE: &str = "`break` with a value cannot target a loop containing yield_!";
+const ERR_BREAK_VALUE: &str = "`break` with a value can only target a loop containing \
+     yield_! when the loop is a `let` initializer or the function's trailing expression";
 
 fn for_local_borrow_err(name: &syn::Ident) -> String {
     format!(
@@ -493,17 +530,33 @@ impl<'ast> Visit<'ast> for PatBindingCollector {
 impl Lowerer {
     /// Lowers a statement list. In `Discard` context the caller
     /// terminates the current block afterwards; in `FnReturn` context
-    /// this terminates it with `Return`.
+    /// this terminates it with `Return`; in `Store` context every path
+    /// ends by assigning the block's value (the trailing expression, or
+    /// `()` without one) to the destination binding.
     fn lower_stmt_list(&mut self, stmts: &[syn::Stmt], ctx: TailCtx) {
         let n = stmts.len();
+        let mut has_value_tail = false;
         for (i, stmt) in stmts.iter().enumerate() {
             match stmt {
-                syn::Stmt::Expr(e, None) if i + 1 == n => self.lower_tail_expr(stmt, e, ctx),
+                syn::Stmt::Expr(e, None) if i + 1 == n => {
+                    has_value_tail = true;
+                    self.lower_tail_expr(stmt, e, ctx);
+                }
                 _ => self.lower_stmt(stmt),
             }
         }
-        if ctx == TailCtx::FnReturn && !self.is_current_terminated() {
-            self.terminate(Terminator::Return(syn::parse_quote!(())));
+        match ctx {
+            TailCtx::FnReturn => {
+                if !self.is_current_terminated() {
+                    self.terminate(Terminator::Return(syn::parse_quote!(())));
+                }
+            }
+            // A block without a trailing expression evaluates to `()`.
+            TailCtx::Store(id) if !has_value_tail && !self.is_current_terminated() => {
+                let span = stmts.last().map_or_else(proc_macro2::Span::call_site, |s| s.span());
+                self.push_store(id, &unit_expr(span));
+            }
+            _ => {}
         }
     }
 
@@ -512,36 +565,21 @@ impl Lowerer {
         if matches!(e, syn::Expr::Break(_) | syn::Expr::Continue(_)) {
             return self.lower_stmt(stmt);
         }
-        // A trailing loop always evaluates to `()` (a `break` with a
-        // value is rejected separately), so it is safe to lower as a
-        // statement even as the tail expression.
-        if matches!(
-            e,
-            syn::Expr::Loop(_) | syn::Expr::While(_) | syn::Expr::ForLoop(_)
-        ) && contains_yield_expr(e)
-        {
-            return self.lower_stmt(stmt);
-        }
         match ctx {
-            TailCtx::FnReturn => {
-                if contains_yield_expr(e) {
-                    // The trailing expression is the return value, so a
-                    // yield inside it is a value-position yield. Lower the
-                    // statement anyway to surface the most specific
-                    // error; if it lowers cleanly the only problem is
-                    // its tail position.
-                    let before = self.errors.len();
-                    self.lower_stmt(stmt);
-                    if self.errors.len() == before {
-                        self.err(syn::Error::new_spanned(e, ERR_TAIL));
-                    }
-                } else {
-                    self.check_no_yield(e, ERR_TAIL); // foreign macro scan
-                    self.record_expr_uses(e, self.current);
-                    self.terminate(Terminator::Return(e.clone()));
-                }
+            TailCtx::FnReturn | TailCtx::Store(_) if contains_yield_expr(e) => {
+                self.lower_value_expr(e, ctx);
             }
+            TailCtx::FnReturn => {
+                self.check_no_yield(e, ERR_TAIL); // foreign macro scan
+                self.record_expr_uses(e, self.current);
+                self.terminate(Terminator::Return(e.clone()));
+            }
+            TailCtx::Store(id) => self.push_store(id, e),
             TailCtx::Discard => {
+                // A trailing loop always evaluates to `()` (a `break`
+                // with a value cannot target a `Plain` frame), so it is
+                // safe to lower as a statement even as the tail
+                // expression.
                 if is_block_like(e) || contains_yield_expr(e) {
                     self.lower_stmt(stmt);
                 } else {
@@ -550,6 +588,68 @@ impl Lowerer {
                 }
             }
         }
+    }
+
+    /// Lowers a yield-containing expression whose value is needed (a
+    /// `let` initializer or the function's trailing expression):
+    /// control-flow expressions distribute the destination into their
+    /// arms; anything else cannot suspend and is an error.
+    fn lower_value_expr(&mut self, e: &syn::Expr, ctx: TailCtx) {
+        match e {
+            syn::Expr::If(ei) => self.lower_if(ei, ctx),
+            syn::Expr::Match(em) => self.lower_match(em, ctx),
+            syn::Expr::Loop(el) => self.lower_loop(el, ctx),
+            syn::Expr::Block(eb) => self.lower_block_stmt(eb, ctx),
+            // `while` and `for` loops always evaluate to `()`: lower as
+            // a statement, then produce `()` at the exit.
+            syn::Expr::While(_) | syn::Expr::ForLoop(_) => {
+                self.lower_control_expr(e);
+                if let TailCtx::Store(id) = ctx {
+                    self.push_store(id, &unit_expr(e.span()));
+                }
+            }
+            syn::Expr::Unsafe(eu) => {
+                self.err(syn::Error::new_spanned(eu.unsafe_token, ERR_UNSAFE));
+            }
+            other => match ctx {
+                TailCtx::FnReturn => {
+                    // A yield inside the return value is a value-position
+                    // yield. Lower the expression as a statement anyway
+                    // to surface the most specific error; if it lowers
+                    // cleanly the only problem is its tail position.
+                    let before = self.errors.len();
+                    self.lower_stmt(&syn::Stmt::Expr(other.clone(), None));
+                    if self.errors.len() == before {
+                        self.err(syn::Error::new_spanned(other, ERR_TAIL));
+                    }
+                }
+                _ => self.err(syn::Error::new_spanned(other, ERR_VALUE_POSITION)),
+            },
+        }
+    }
+
+    /// Appends `let [mut] x[: T] = value;` assigning a block's value to
+    /// the destination binding of a `Store` context, and records the
+    /// definition. The binding enters the visible scope only after the
+    /// whole initializer is lowered, so `value` still resolves against
+    /// the enclosing environment.
+    fn push_store(&mut self, id: BindingId, value: &syn::Expr) {
+        self.check_no_yield(value, ERR_VALUE_POSITION);
+        self.record_expr_uses(value, self.current);
+        let b = &self.bindings[id.0];
+        let ident = b.ident.clone();
+        let mutability = b.mutability;
+        let annotation = match &b.ty {
+            TySource::Known(t) => Some(t.clone()),
+            _ => None,
+        };
+        let span = value.span();
+        let stmt: syn::Stmt = match annotation {
+            Some(ty) => syn::parse_quote_spanned!(span => let #mutability #ident: #ty = #value;),
+            None => syn::parse_quote_spanned!(span => let #mutability #ident = #value;),
+        };
+        self.blocks[self.current].stmts.push(stmt);
+        self.blocks[self.current].defs.insert(id);
     }
 
     fn lower_stmt(&mut self, stmt: &syn::Stmt) {
@@ -582,9 +682,7 @@ impl Lowerer {
             syn::Stmt::Expr(syn::Expr::Continue(c), _) => self.lower_continue(c),
             _ if !contains_yield_stmt(stmt) => self.push_opaque(stmt),
             // From here on the statement contains a yield_! somewhere.
-            syn::Stmt::Local(local) => {
-                self.err(syn::Error::new_spanned(local, ERR_VALUE_POSITION));
-            }
+            syn::Stmt::Local(local) => self.lower_let_value(local),
             syn::Stmt::Expr(e, _) => self.lower_control_expr(e),
             // Stmt::Macro with yield tokens is caught as opaque; items
             // never contain our yield.
@@ -615,6 +713,69 @@ impl Lowerer {
             }
         };
         self.lower_yield(&m.mac, Some(binding));
+    }
+
+    /// `let x[: T] = <control-flow expr containing yield_!>;` — the
+    /// let-initializer form of value-position yield. The binding becomes
+    /// a "block argument" of the join block: every arm of the initializer
+    /// ends by assigning its value to the binding (`push_store`), so the
+    /// ordinary liveness machinery carries it into the join state. The
+    /// join is a multi-predecessor block and thus always a state variant,
+    /// so the binding needs a syntactically known type; without the
+    /// annotation the analysis reports the usual annotate-the-type error.
+    fn lower_let_value(&mut self, local: &syn::Local) {
+        let init = local.init.as_ref().expect("BUG: a yield is inside the initializer");
+        if let Some((else_token, _)) = &init.diverge {
+            return self.err(syn::Error::new_spanned(else_token, ERR_LET_ELSE));
+        }
+        let expr = strip_parens(&init.expr);
+        if !matches!(
+            expr,
+            syn::Expr::If(_)
+                | syn::Expr::Match(_)
+                | syn::Expr::Loop(_)
+                | syn::Expr::While(_)
+                | syn::Expr::ForLoop(_)
+                | syn::Expr::Block(_)
+                | syn::Expr::Unsafe(_)
+        ) {
+            return self.err(syn::Error::new_spanned(local, ERR_VALUE_POSITION));
+        }
+        let (pat, annotation) = match &local.pat {
+            syn::Pat::Type(pt) => (&*pt.pat, Some((*pt.ty).clone())),
+            other => (other, None),
+        };
+        // `let _ = <init>;` binds nothing: the arm values are simply
+        // discarded, like a statement-position construct.
+        if matches!(pat, syn::Pat::Wild(_)) {
+            return self.lower_value_expr(expr, TailCtx::Discard);
+        }
+        let syn::Pat::Ident(pi) = pat else {
+            return self.err(syn::Error::new_spanned(pat, ERR_VALUE_LET_BINDING));
+        };
+        if pi.by_ref.is_some() || pi.subpat.is_some() {
+            return self.err(syn::Error::new_spanned(pi, ERR_VALUE_LET_BINDING));
+        }
+        // The binding is created up front (the arms assign to it) but
+        // enters the visible scope only after the initializer is fully
+        // lowered: the initializer sees the enclosing environment, as in
+        // any `let`.
+        let id = BindingId(self.bindings.len());
+        self.bindings.push(Binding {
+            ident: pi.ident.clone(),
+            mutability: pi.mutability,
+            kind: BindingKind::Local,
+            ty: annotation
+                .clone()
+                .map_or(TySource::Unknown, TySource::Known),
+            borrow: self.classify_borrow(None, annotation.as_ref()),
+            def_stmt: None,
+        });
+        self.lower_value_expr(expr, TailCtx::Store(id));
+        self.scopes
+            .last_mut()
+            .expect("BUG: no scope")
+            .insert(pi.ident.to_string(), id);
     }
 
     /// Ends the current block with a `Yield` terminator and switches to
@@ -671,11 +832,33 @@ impl Lowerer {
                 },
             ));
         };
-        let exit = frame.exit;
-        if let Some(value) = &b.expr {
-            self.err(syn::Error::new_spanned(value, ERR_BREAK_VALUE));
+        let dest = frame.dest;
+        // A `break` without a value produces `()` where a value frame
+        // expects one; the type mismatch, if any, is rustc's to report.
+        let value = |b: &syn::ExprBreak| -> syn::Expr {
+            b.expr
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| unit_expr(b.break_token.span()))
+        };
+        match dest {
+            BreakDest::Plain(exit) => {
+                if let Some(v) = &b.expr {
+                    self.err(syn::Error::new_spanned(v, ERR_BREAK_VALUE));
+                }
+                self.terminate(Terminator::Goto(exit));
+            }
+            BreakDest::Store { binding, exit } => {
+                self.push_store(binding, &value(b));
+                self.terminate(Terminator::Goto(exit));
+            }
+            BreakDest::Return => {
+                let v = value(b);
+                self.check_no_yield(&v, ERR_VALUE_POSITION);
+                self.record_expr_uses(&v, self.current);
+                self.terminate(Terminator::Return(v));
+            }
         }
-        self.terminate(Terminator::Goto(exit));
         // Anything after the jump is unreachable; lower it into a fresh
         // block that simplification will drop.
         self.current = self.new_block(false);
@@ -779,6 +962,13 @@ fn is_block_like(e: &syn::Expr) -> bool {
     )
 }
 
+/// A `()` expression carrying `span`, used for the implicit value of
+/// valueless paths in `Store`/`FnReturn` contexts (`break;`, a missing
+/// `else`, a block without a trailing expression, `while`/`for` exits).
+fn unit_expr(span: proc_macro2::Span) -> syn::Expr {
+    syn::parse_quote_spanned!(span => ())
+}
+
 /// Turns a discarded expression into a statement: block-like expressions
 /// (if/match/loop/etc.) are already valid statements on their own, while
 /// everything else needs a semicolon to keep the statement sequence valid.
@@ -796,12 +986,12 @@ fn stmt_from_discarded_expr(expr: syn::Expr) -> syn::Stmt {
 impl Lowerer {
     fn lower_control_expr(&mut self, e: &syn::Expr) {
         match e {
-            syn::Expr::If(ei) => self.lower_if(ei),
-            syn::Expr::Match(em) => self.lower_match(em),
-            syn::Expr::Loop(el) => self.lower_loop(el),
+            syn::Expr::If(ei) => self.lower_if(ei, TailCtx::Discard),
+            syn::Expr::Match(em) => self.lower_match(em, TailCtx::Discard),
+            syn::Expr::Loop(el) => self.lower_loop(el, TailCtx::Discard),
             syn::Expr::While(ew) => self.lower_while(ew),
             syn::Expr::ForLoop(ef) => self.lower_for(ef),
-            syn::Expr::Block(eb) => self.lower_block_stmt(eb),
+            syn::Expr::Block(eb) => self.lower_block_stmt(eb, TailCtx::Discard),
             syn::Expr::Unsafe(eu) => {
                 self.err(syn::Error::new_spanned(eu.unsafe_token, ERR_UNSAFE));
             }
@@ -809,15 +999,24 @@ impl Lowerer {
         }
     }
 
-    fn lower_if(&mut self, ei: &syn::ExprIf) {
+    /// Terminates the current block with a jump to `target` unless a
+    /// tail already terminated it (a `FnReturn` arm ends in `Return`).
+    fn goto_if_open(&mut self, target: BlockId) {
+        if !self.is_current_terminated() {
+            self.terminate(Terminator::Goto(target));
+        }
+    }
+
+    fn lower_if(&mut self, ei: &syn::ExprIf, ctx: TailCtx) {
         let join = self.new_block(false);
-        self.lower_if_arms(ei, join);
+        self.lower_if_arms(ei, join, ctx);
         self.current = join;
     }
 
     /// Lowers one `if`/`else if` link of a chain; every arm exits to the
-    /// shared `join` block.
-    fn lower_if_arms(&mut self, ei: &syn::ExprIf, join: BlockId) {
+    /// shared `join` block. The arms' trailing expressions are handled
+    /// per `ctx` (discarded, assigned to a binding, or returned).
+    fn lower_if_arms(&mut self, ei: &syn::ExprIf, join: BlockId, ctx: TailCtx) {
         if matches!(&*ei.cond, syn::Expr::Let(_)) {
             self.err(syn::Error::new_spanned(ei.if_token, ERR_IF_LET));
             self.terminate(Terminator::Goto(join));
@@ -826,9 +1025,12 @@ impl Lowerer {
         self.check_no_yield(&ei.cond, ERR_COND);
         self.record_expr_uses(&ei.cond, self.current);
         let then_bb = self.new_block(false);
-        let else_bb = match &ei.else_branch {
-            None => join,
-            Some(_) => self.new_block(false),
+        // Without an `else`, the false edge produces `()`: in `Store`
+        // context it needs a block that assigns it (otherwise the
+        // binding would look live at the function entry).
+        let else_bb = match (&ei.else_branch, ctx) {
+            (None, TailCtx::Store(_)) | (Some(_), _) => self.new_block(false),
+            (None, _) => join,
         };
         self.terminate(Terminator::Branch {
             cond: (*ei.cond).clone(),
@@ -836,22 +1038,31 @@ impl Lowerer {
             else_: else_bb,
         });
         self.current = then_bb;
-        self.in_scope(|lw| lw.lower_stmt_list(&ei.then_branch.stmts, TailCtx::Discard));
-        self.terminate(Terminator::Goto(join));
-        if let Some((_, else_expr)) = &ei.else_branch {
-            self.current = else_bb;
-            match &**else_expr {
-                syn::Expr::Block(b) => {
-                    self.in_scope(|lw| lw.lower_stmt_list(&b.block.stmts, TailCtx::Discard));
+        self.in_scope(|lw| lw.lower_stmt_list(&ei.then_branch.stmts, ctx));
+        self.goto_if_open(join);
+        match &ei.else_branch {
+            Some((_, else_expr)) => {
+                self.current = else_bb;
+                match &**else_expr {
+                    syn::Expr::Block(b) => {
+                        self.in_scope(|lw| lw.lower_stmt_list(&b.block.stmts, ctx));
+                        self.goto_if_open(join);
+                    }
+                    syn::Expr::If(nested) => self.lower_if_arms(nested, join, ctx),
+                    _ => unreachable!("else branch is always a block or an if"),
+                }
+            }
+            None => {
+                if let TailCtx::Store(id) = ctx {
+                    self.current = else_bb;
+                    self.push_store(id, &unit_expr(ei.if_token.span()));
                     self.terminate(Terminator::Goto(join));
                 }
-                syn::Expr::If(nested) => self.lower_if_arms(nested, join),
-                _ => unreachable!("else branch is always a block or an if"),
             }
         }
     }
 
-    fn lower_match(&mut self, em: &syn::ExprMatch) {
+    fn lower_match(&mut self, em: &syn::ExprMatch, ctx: TailCtx) {
         self.check_no_yield(&em.expr, ERR_SCRUTINEE);
         self.record_expr_uses(&em.expr, self.current);
         let match_bb = self.current;
@@ -869,10 +1080,16 @@ impl Lowerer {
             self.current = body_bb;
             self.in_scope(|lw| {
                 lw.define_pat_bindings(&arm.pat, body_bb, BindingKind::ArmPat, None);
-                let body_stmt = wrap_arm_body(&arm.body);
-                lw.lower_stmt_list(std::slice::from_ref(&body_stmt), TailCtx::Discard);
+                // In value contexts the arm body is the value; in
+                // statement position it is discarded and needs the
+                // trailing semicolon to stay a valid statement.
+                let body_stmt = match ctx {
+                    TailCtx::Discard => wrap_arm_body(&arm.body),
+                    _ => syn::Stmt::Expr((*arm.body).clone(), None),
+                };
+                lw.lower_stmt_list(std::slice::from_ref(&body_stmt), ctx);
             });
-            self.terminate(Terminator::Goto(join));
+            self.goto_if_open(join);
             arms.push(MatchArm {
                 pat: arm.pat.clone(),
                 guard,
@@ -905,6 +1122,7 @@ impl Lowerer {
         &mut self,
         label: &Option<syn::Label>,
         body_stmts: &[syn::Stmt],
+        ctx: TailCtx,
         setup: impl FnOnce(&mut Self, BlockId) -> (BlockId, BlockId),
         bind_pat: impl FnOnce(&mut Self, BlockId),
     ) {
@@ -915,7 +1133,7 @@ impl Lowerer {
         self.labels.push(Frame {
             label: label.as_ref().map(|l| l.name.ident.to_string()),
             header: Some(header),
-            exit,
+            dest: BreakDest::of(ctx, exit),
         });
         self.current = body;
         self.in_scope(|lw| {
@@ -927,10 +1145,14 @@ impl Lowerer {
         self.current = exit;
     }
 
-    fn lower_loop(&mut self, el: &syn::ExprLoop) {
+    /// In value contexts (`ctx` is `Store`/`FnReturn`) the loop's value
+    /// comes exclusively from its `break`s, which the frame's `dest`
+    /// routes; the exit block is then reachable only through them.
+    fn lower_loop(&mut self, el: &syn::ExprLoop, ctx: TailCtx) {
         self.with_loop_frame(
             &el.label,
             &el.body.stmts,
+            ctx,
             |lw, header| (header, lw.new_block(false)),
             |_, _| {},
         );
@@ -943,6 +1165,7 @@ impl Lowerer {
         self.with_loop_frame(
             &ew.label,
             &ew.body.stmts,
+            TailCtx::Discard,
             |lw, header| {
                 lw.check_no_yield(&ew.cond, ERR_COND);
                 lw.record_expr_uses(&ew.cond, header);
@@ -963,6 +1186,7 @@ impl Lowerer {
         self.with_loop_frame(
             &ew.label,
             &ew.body.stmts,
+            TailCtx::Discard,
             |lw, header| {
                 lw.check_no_yield(&el.expr, ERR_SCRUTINEE);
                 lw.record_expr_uses(&el.expr, header);
@@ -1019,6 +1243,7 @@ impl Lowerer {
         self.with_loop_frame(
             &ef.label,
             &ef.body.stmts,
+            TailCtx::Discard,
             |lw, header| {
                 let body = lw.new_block(false);
                 let exit = lw.new_block(false);
@@ -1070,24 +1295,26 @@ impl Lowerer {
         }
     }
 
-    /// A block statement: the contents are lowered in place. A labeled
-    /// block additionally becomes a `break` target.
-    fn lower_block_stmt(&mut self, eb: &syn::ExprBlock) {
+    /// A block statement or block-valued initializer/tail: the contents
+    /// are lowered in place with the block's own trailing expression
+    /// handled per `ctx`. A labeled block additionally becomes a `break`
+    /// target whose `break` values follow the same destination.
+    fn lower_block_stmt(&mut self, eb: &syn::ExprBlock, ctx: TailCtx) {
         match &eb.label {
             Some(label) => {
                 let join = self.new_block(false);
                 self.labels.push(Frame {
                     label: Some(label.name.ident.to_string()),
                     header: None,
-                    exit: join,
+                    dest: BreakDest::of(ctx, join),
                 });
-                self.in_scope(|lw| lw.lower_stmt_list(&eb.block.stmts, TailCtx::Discard));
-                self.terminate(Terminator::Goto(join));
+                self.in_scope(|lw| lw.lower_stmt_list(&eb.block.stmts, ctx));
+                self.goto_if_open(join);
                 self.labels.pop();
                 self.current = join;
             }
             None => {
-                self.in_scope(|lw| lw.lower_stmt_list(&eb.block.stmts, TailCtx::Discard));
+                self.in_scope(|lw| lw.lower_stmt_list(&eb.block.stmts, ctx));
             }
         }
     }
@@ -1915,6 +2142,250 @@ mod tests {
         assert!(matches!(cfg.blocks[0].terminator, Terminator::Return(_)));
     }
 
+    // === Value position (let initializers and fn tails) ===
+
+    #[test]
+    fn let_if_value_assigns_in_each_arm() {
+        let block: syn::Block = parse_quote!({
+            let x: u32 = if c {
+                yield_!(1);
+                1
+            } else {
+                2
+            };
+            f(x);
+        });
+        let cfg = lower_args(&["c"], &block);
+        let x = binding(&cfg, "x");
+        let Terminator::Branch { then_, else_, .. } = cfg.blocks[0].terminator else {
+            panic!("entry must branch");
+        };
+        // The then arm yields; its resume block assigns x and joins.
+        let Terminator::Yield { next, .. } = cfg.blocks[then_].terminator else {
+            panic!("then arm should yield: {:?}", cfg.blocks[then_].terminator);
+        };
+        let resume = &cfg.blocks[next];
+        assert_eq!(resume.stmts.len(), 1);
+        assert_eq!(resume.defs, ids(&[x]));
+        let Terminator::Goto(join) = resume.terminator else {
+            panic!("resume should goto the join");
+        };
+        // The else arm assigns x and joins on the same block.
+        let else_b = &cfg.blocks[else_];
+        assert_eq!(else_b.defs, ids(&[x]));
+        assert_eq!(else_b.stmts.len(), 1);
+        assert!(matches!(else_b.terminator, Terminator::Goto(j) if j == join));
+        // The join uses x without defining it; the binding knows its type.
+        assert_eq!(cfg.blocks[join].uses, ids(&[x]));
+        assert!(!cfg.blocks[join].defs.contains(&x));
+        let expected: syn::Type = parse_quote!(u32);
+        assert!(matches!(&cfg.bindings[x.0].ty, TySource::Known(t) if *t == expected));
+    }
+
+    #[test]
+    fn let_if_without_else_assigns_unit_on_the_false_edge() {
+        let block: syn::Block = parse_quote!({
+            let x: () = if c {
+                yield_!(1);
+            };
+            f(x);
+        });
+        let cfg = lower_args(&["c"], &block);
+        let x = binding(&cfg, "x");
+        let Terminator::Branch { then_, else_, .. } = cfg.blocks[0].terminator else {
+            panic!("entry must branch");
+        };
+        // The synthesized false edge assigns `()`.
+        assert_eq!(cfg.blocks[else_].defs, ids(&[x]));
+        assert_eq!(cfg.blocks[else_].stmts.len(), 1);
+        // The then arm has no tail expression: its resume block assigns
+        // `()` too.
+        let Terminator::Yield { next, .. } = cfg.blocks[then_].terminator else {
+            panic!("then arm should yield");
+        };
+        assert_eq!(cfg.blocks[next].defs, ids(&[x]));
+    }
+
+    #[test]
+    fn let_match_value_assigns_in_each_arm() {
+        let block: syn::Block = parse_quote!({
+            let x: u32 = match k {
+                0 => {
+                    yield_!(0);
+                    1
+                }
+                _ => 2,
+            };
+            f(x);
+        });
+        let cfg = lower_args(&["k"], &block);
+        let x = binding(&cfg, "x");
+        let Terminator::Match { arms, .. } = &cfg.blocks[0].terminator else {
+            panic!("expected match terminator");
+        };
+        // The non-block arm body `2` becomes a synthetic assignment.
+        let wild = &cfg.blocks[arms[1].body];
+        assert_eq!(wild.defs, ids(&[x]));
+        assert_eq!(wild.stmts.len(), 1);
+    }
+
+    #[test]
+    fn let_loop_break_value_assigns_before_the_exit() {
+        let block: syn::Block = parse_quote!({
+            let x: u32 = loop {
+                let r = yield_!(1);
+                break r;
+            };
+            f(x);
+        });
+        let cfg = lower_ok(&block);
+        let x = binding(&cfg, "x");
+        let r = binding(&cfg, "r");
+        // The resume block assigns x from r; the exit block (merged into
+        // it) then uses x and returns.
+        let resume = cfg.blocks.iter().find(|b| b.resume_point).unwrap();
+        assert_eq!(resume.defs, ids(&[x, r]));
+        assert_eq!(resume.stmts.len(), 2, "assignment + f(x) after the merge");
+        assert!(matches!(resume.terminator, Terminator::Return(_)));
+    }
+
+    #[test]
+    fn let_labeled_block_break_value_assigns() {
+        let block: syn::Block = parse_quote!({
+            let x: u32 = 'b: {
+                yield_!(1);
+                break 'b 5;
+            };
+            f(x);
+        });
+        let cfg = lower_ok(&block);
+        let x = binding(&cfg, "x");
+        let resume = cfg.blocks.iter().find(|b| b.resume_point).unwrap();
+        assert!(resume.defs.contains(&x));
+    }
+
+    #[test]
+    fn let_nested_if_distributes_assignments_to_leaf_arms() {
+        let block: syn::Block = parse_quote!({
+            let x: u32 = if a {
+                if b {
+                    yield_!(1);
+                    1
+                } else {
+                    2
+                }
+            } else {
+                3
+            };
+            f(x);
+        });
+        let cfg = lower_args(&["a", "b"], &block);
+        let x = binding(&cfg, "x");
+        let n_defs = cfg.blocks.iter().filter(|blk| blk.defs.contains(&x)).count();
+        assert_eq!(n_defs, 3, "one assignment per leaf arm");
+    }
+
+    #[test]
+    fn let_value_initializer_sees_the_outer_binding() {
+        let block: syn::Block = parse_quote!({
+            let x: u32 = 1;
+            let x: u32 = if c {
+                yield_!(1);
+                x + 1
+            } else {
+                2
+            };
+            f(x);
+        });
+        let cfg = lower_args(&["c"], &block);
+        let xs: Vec<BindingId> = cfg
+            .bindings
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.ident == "x")
+            .map(|(i, _)| BindingId(i))
+            .collect();
+        assert_eq!(xs.len(), 2);
+        let (outer, inner) = (xs[0], xs[1]);
+        // `x + 1` in the resume block reads the outer x; the assignment
+        // defines the inner one.
+        let resume = cfg.blocks.iter().find(|b| b.resume_point).unwrap();
+        assert!(resume.uses.contains(&outer));
+        assert!(resume.defs.contains(&inner));
+    }
+
+    #[test]
+    fn fn_tail_if_arms_return() {
+        let block: syn::Block = parse_quote!({
+            if c {
+                yield_!(1);
+                1u32
+            } else {
+                2u32
+            }
+        });
+        let cfg = lower_args(&["c"], &block);
+        let one: syn::Expr = parse_quote!(1u32);
+        let two: syn::Expr = parse_quote!(2u32);
+        let returns: Vec<&Terminator> = cfg
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Return(_)))
+            .map(|b| &b.terminator)
+            .collect();
+        assert_eq!(returns.len(), 2, "each arm returns; there is no join");
+        assert!(returns.iter().any(|t| matches!(t, Terminator::Return(e) if *e == one)));
+        assert!(returns.iter().any(|t| matches!(t, Terminator::Return(e) if *e == two)));
+    }
+
+    #[test]
+    fn fn_tail_loop_break_value_returns() {
+        let block: syn::Block = parse_quote!({
+            loop {
+                let r = yield_!(1);
+                break r;
+            }
+        });
+        let cfg = lower_ok(&block);
+        let resume = cfg.blocks.iter().find(|b| b.resume_point).unwrap();
+        let expected: syn::Expr = parse_quote!(r);
+        assert!(
+            matches!(&resume.terminator, Terminator::Return(e) if *e == expected),
+            "break value should become the return value: {:?}",
+            resume.terminator
+        );
+    }
+
+    #[test]
+    fn let_wildcard_value_is_discarded() {
+        let block: syn::Block = parse_quote!({
+            let _ = if c {
+                yield_!(1);
+                1
+            } else {
+                2
+            };
+            f();
+        });
+        let cfg = lower_args(&["c"], &block);
+        // No binding is created and no synthetic assignment happens:
+        // the only binding is the argument.
+        assert_eq!(cfg.bindings.len(), 1);
+    }
+
+    #[test]
+    fn let_value_destructuring_binding_is_rejected() {
+        let block: syn::Block = parse_quote!({
+            let (a, b) = if c {
+                yield_!(1);
+                (1, 2)
+            } else {
+                (3, 4)
+            };
+        });
+        assert!(error_of(&block).to_string().contains("simple identifier"));
+    }
+
     // === Errors ===
 
     #[test]
@@ -1928,8 +2399,10 @@ mod tests {
 
     #[test]
     fn yield_in_value_position_is_rejected() {
+        // The initializer is not itself a control-flow expression, so
+        // there is no arm tail to assign from.
         let block: syn::Block = parse_quote!({
-            let x: u32 = if c {
+            let x: u32 = 1 + if c {
                 yield_!(1);
                 1
             } else {
@@ -1986,14 +2459,7 @@ mod tests {
     }
 
     #[test]
-    fn yield_in_trailing_expression_is_rejected() {
-        let block: syn::Block = parse_quote!({
-            if c {
-                yield_!(1);
-            }
-        });
-        assert!(error_of(&block).to_string().contains("add a semicolon"));
-        // Bare trailing yield uses the same message.
+    fn bare_trailing_yield_is_rejected() {
         let block: syn::Block = parse_quote!({
             yield_!(1)
         });
@@ -2064,21 +2530,13 @@ mod tests {
     }
 
     #[test]
-    fn break_with_value_is_rejected() {
-        let block: syn::Block = parse_quote!({
-            let x: u32 = loop {
-                yield_!(1);
-                break 5;
-            };
-        });
-        // The whole `let` is value-position; a direct loop hits the
-        // break-value error.
-        assert!(error_of(&block).to_string().contains("value"));
+    fn break_with_value_is_rejected_in_statement_loops() {
         let block: syn::Block = parse_quote!({
             loop {
                 yield_!(1);
                 break 5;
             }
+            after();
         });
         assert!(
             error_of(&block)
