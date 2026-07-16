@@ -93,6 +93,21 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     let n_yields = cfg.blocks.iter().filter(|b| b.resume_point).count();
     let suspension = Suspension::new(n_yields);
 
+    // The `fingerprint` flag threads a plain `__fp: u64` field through
+    // every data-carrying variant: initialized to FINGERPRINT at
+    // construction and on every transition, checked on entry to
+    // `start`/`resume` (the guard runs with `__fp` bound by the match).
+    let fp_guard = macro_args.fingerprint.then(|| {
+        let msg = format!("this state was created by a different version of `{name}`");
+        quote! {
+            if *__fp != Self::FINGERPRINT {
+                ::core::panic!(#msg);
+            }
+        }
+    });
+    let fp_bind = macro_args.fingerprint.then(|| quote!(__fp,));
+    let fp_init = macro_args.fingerprint.then(|| quote!(__fp: #fingerprint,));
+
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let cx = ExpandCtx {
         generics: &generics,
@@ -105,6 +120,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
         yield_ty,
         ret_ty: &ret_ty,
         resume_ty,
+        fp_guard: fp_guard.as_ref(),
     };
 
     let StateEnum {
@@ -113,13 +129,14 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     } = build_state_enum(&cx, &derive_attrs, &suspension.poisoned_variant);
     let resume_body = build_resume_dispatch(&cx, &suspension);
     let drive_fn = build_drive_fn(&cx, &suspension.placeholder);
+    let fp_check_fn = macro_args.fingerprint.then(|| build_check_fingerprint(&cx));
 
     Ok(quote! {
         #(#fn_attrs)*
         #vis fn #name #impl_generics (#(#arg_ident: #arg_ty),*) -> #name::State #ty_generics
         #where_clause
         {
-            #name::State::Start { #(#arg_ident,)* #phantom_init }
+            #name::State::Start { #(#arg_ident,)* #fp_init #phantom_init }
         }
 
         #vis mod #name {
@@ -136,7 +153,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
 
                 fn start(&mut self) -> ::baregen::CoroutineState<#yield_ty, #ret_ty> {
                     match self {
-                        State::Start { .. } => {}
+                        State::Start { #fp_bind .. } => { #fp_guard }
                         _ => ::core::panic!("Already started"),
                     }
                     self.__drive(::core::option::Option::None)
@@ -156,6 +173,8 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
                 /// arguments, signature, and body tokens. Editing the
                 /// coroutine changes it; comments and formatting do not.
                 pub const FINGERPRINT: u64 = #fingerprint;
+
+                #fp_check_fn
 
                 #drive_fn
             }
@@ -183,6 +202,15 @@ struct ExpandCtx<'a> {
     yield_ty: &'a syn::Type,
     ret_ty: &'a syn::Type,
     resume_ty: &'a syn::Type,
+    /// `Some` iff the `fingerprint` flag was given: the mismatch check
+    /// to run where a dispatch arm has bound `__fp`.
+    fp_guard: Option<&'a TokenStream>,
+}
+
+impl ExpandCtx<'_> {
+    fn fp_enabled(&self) -> bool {
+        self.fp_guard.is_some()
+    }
 }
 
 /// Whether the coroutine ever suspends, and the codegen fallout of that:
@@ -234,6 +262,10 @@ fn build_state_enum(
     derive_attrs: &[&syn::Attribute],
     poisoned_variant: &TokenStream,
 ) -> StateEnum {
+    // The fingerprint field is ordinary data to user derives (serde,
+    // Clone, ...); its meaning lives entirely in the generated checks.
+    let fp_field = cx.fp_enabled().then(|| quote!(__fp: u64,));
+
     // Variant declarations in BlockId order: deterministic, and linear
     // bodies produce a `Start, S1..Sn` layout.
     let state_variants: Vec<TokenStream> = cx
@@ -248,7 +280,7 @@ fn build_state_enum(
                 let ty = &f.ty;
                 quote!(#ident: #ty)
             });
-            quote!(#ident { #(#field_defs),* })
+            quote!(#ident { #(#field_defs,)* #fp_field })
         })
         .collect();
 
@@ -277,7 +309,7 @@ fn build_state_enum(
     let tokens = quote! {
         #(#derive_attrs)*
         pub enum State #generics #where_clause {
-            Start { #(#arg_ident: #arg_ty,)* #phantom_field },
+            Start { #(#arg_ident: #arg_ty,)* #fp_field #phantom_field },
             #(#state_variants,)*
             Done,
             #poisoned_variant
@@ -314,9 +346,11 @@ fn build_resume_dispatch(cx: &ExpandCtx, suspension: &Suspension) -> TokenStream
             }
         }
     } else {
+        let fp_bind = cx.fp_enabled().then(|| quote!(__fp,));
+        let fp_guard = cx.fp_guard;
         quote! {
             match self {
-                #(State::#s_idents { .. } => {})*
+                #(State::#s_idents { #fp_bind .. } => { #fp_guard })*
                 State::Start { .. } => ::core::panic!("Not started"),
                 State::Done => ::core::panic!("Already done"),
                 #poisoned_arm
@@ -350,6 +384,8 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
         yield_ty: cx.yield_ty,
         ret_ty: cx.ret_ty,
         start_pattern: quote!(State::Start { #(#arg_pat,)* .. }),
+        fp_pat: cx.fp_enabled().then(|| quote!(__fp: _,)),
+        fp_init: cx.fp_enabled().then(|| quote!(__fp: Self::FINGERPRINT,)),
     };
     let drive_arms: Vec<TokenStream> = cx
         .analysis
@@ -384,6 +420,43 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
     }
 }
 
+/// Builds the inherent `check_fingerprint` method (only when the
+/// `fingerprint` flag was given): the graceful counterpart of the
+/// panicking guard in `start`/`resume`.
+fn build_check_fingerprint(cx: &ExpandCtx) -> TokenStream {
+    let data_variants = cx
+        .analysis
+        .variants
+        .iter()
+        .filter(|v| v.block != cx.cfg.entry)
+        .map(|v| &v.ident);
+    quote! {
+        /// Checks that this state was created by the same coroutine
+        /// source (see [`Self::FINGERPRINT`]). Call it right after
+        /// deserializing to detect a mismatch gracefully;
+        /// `start`/`resume` panic on the same condition. Terminal
+        /// states (`Done`, `Poisoned`) carry no fingerprint and
+        /// always pass.
+        pub fn check_fingerprint(
+            &self,
+        ) -> ::core::result::Result<(), ::baregen::FingerprintMismatch> {
+            let found = match self {
+                State::Start { __fp, .. } => *__fp,
+                #(State::#data_variants { __fp, .. } => *__fp,)*
+                _ => return ::core::result::Result::Ok(()),
+            };
+            if found == Self::FINGERPRINT {
+                ::core::result::Result::Ok(())
+            } else {
+                ::core::result::Result::Err(::baregen::FingerprintMismatch {
+                    expected: Self::FINGERPRINT,
+                    found,
+                })
+            }
+        }
+    }
+}
+
 // === Dispatch-arm generation ===
 
 struct Codegen<'a> {
@@ -393,6 +466,10 @@ struct Codegen<'a> {
     yield_ty: &'a syn::Type,
     ret_ty: &'a syn::Type,
     start_pattern: TokenStream,
+    /// `__fp: _,` in variant unpack patterns when fingerprinting.
+    fp_pat: Option<TokenStream>,
+    /// `__fp: Self::FINGERPRINT,` in constructed next-state values.
+    fp_init: Option<TokenStream>,
 }
 
 impl Codegen<'_> {
@@ -404,7 +481,8 @@ impl Codegen<'_> {
         } else {
             let ident = &v.ident;
             let pats = v.fields.iter().map(|f| bind_pat(&f.mutability, &f.ident));
-            quote!(State::#ident { #(#pats),* })
+            let fp_pat = &self.fp_pat;
+            quote!(State::#ident { #(#pats,)* #fp_pat })
         };
         // A resume-point variant's only predecessor is its yield, so the
         // take() runs exactly once per __drive call and cannot fail.
@@ -523,7 +601,8 @@ impl Codegen<'_> {
             .expect("BUG: state_value called for an inline block");
         let ident = &v.ident;
         let fields = v.fields.iter().map(|f| &f.ident);
-        quote!(State::#ident { #(#fields),* })
+        let fp_init = &self.fp_init;
+        quote!(State::#ident { #(#fields,)* #fp_init })
     }
 }
 

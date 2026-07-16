@@ -4,4 +4,7 @@ fn unknown_arg() {}
 #[baregen::coroutine(yield = i32, yield = u32)]
 fn duplicate_arg() {}
 
+#[baregen::coroutine(fingerprint, fingerprint)]
+fn duplicate_fingerprint() {}
+
 fn main() {}

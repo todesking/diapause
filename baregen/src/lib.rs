@@ -111,6 +111,34 @@ pub trait Coroutine<R = ()> {
     fn start(&mut self) -> CoroutineState<Self::Yield, Self::Return>;
 }
 
+/// A persisted coroutine state does not match the source of the
+/// coroutine it is checked against.
+///
+/// Returned by the `check_fingerprint` method that [`macro@coroutine`]
+/// generates when the attribute is given the `fingerprint` flag. Call
+/// it right after deserializing to detect the mismatch gracefully;
+/// `start`/`resume` panic on the same condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FingerprintMismatch {
+    /// The fingerprint of the current source (`State::FINGERPRINT`).
+    pub expected: u64,
+    /// The fingerprint stored in the state when it was created.
+    pub found: u64,
+}
+
+impl core::fmt::Display for FingerprintMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "coroutine state fingerprint mismatch: expected {:#018x}, found {:#018x} \
+             (the state was created by a different version of the coroutine)",
+            self.expected, self.found
+        )
+    }
+}
+
+impl core::error::Error for FingerprintMismatch {}
+
 /// Desugaring target for `?` inside a `#[baregen::coroutine]` function.
 ///
 /// The coroutine transformation rewrites `expr?` into a `branch` call so
