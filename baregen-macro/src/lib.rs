@@ -8,6 +8,7 @@ mod analyze_cfg;
 mod args;
 mod cfg;
 mod expand;
+mod hoist;
 mod lower;
 #[cfg(test)]
 mod test_util;

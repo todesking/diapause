@@ -1322,7 +1322,7 @@ fn refutable_match(
 /// Whether an `if`/`while` condition is an edition-2024 let chain:
 /// `let` patterns combined with `&&`. A lone `if let`/`while let`
 /// condition is a plain `Expr::Let`, not a chain.
-fn is_let_chain(cond: &syn::Expr) -> bool {
+pub(crate) fn is_let_chain(cond: &syn::Expr) -> bool {
     fn contains_let(e: &syn::Expr) -> bool {
         match e {
             syn::Expr::Let(_) => true,

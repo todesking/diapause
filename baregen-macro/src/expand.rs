@@ -59,10 +59,15 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     };
     check_return_type(&ret_ty)?;
 
+    // Expression-position yields with a pure evaluation prefix become
+    // `let __tmpN = yield_!(..);` statements, so lowering only sees the
+    // native statement forms. Runs first: `?` must still be visible as
+    // `Expr::Try` (an effect ending the prefix).
+    let mut body = (*item.block).clone();
+    crate::hoist::hoist_yields(&mut body);
     // Early `return e` and `e?` become completion transitions everywhere
     // in the body, including inside opaque statements; the rewritten form
     // only makes sense inside `__drive`, where `self` and `State` resolve.
-    let mut body = (*item.block).clone();
     rewrite_early_exits(&mut body, &ret_ty);
 
     let arg_idents: Vec<syn::Ident> = args.iter().map(|a| a.ident.clone()).collect();
@@ -407,7 +412,9 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
     quote! {
         /// Runs the state machine until the next suspension point
         /// or completion. Not visible outside the module.
-        #[allow(unused_mut, unreachable_code)]
+        /// (`path_statements`: a hoisted trailing yield in discard
+        /// position leaves a bare `__tmpN;` behind.)
+        #[allow(unused_mut, unreachable_code, path_statements)]
         fn __drive(
             &mut self,
             mut __resume: ::core::option::Option<#resume_ty>,

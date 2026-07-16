@@ -1,11 +1,11 @@
 error: yield_! is only allowed in statement position: `yield_!(expr);` or `let x = yield_!(expr);`
- --> tests/compile_fail/yield_in_expression.rs:5:5
-  |
-5 |     f(1, yield_!(2));
-  |     ^^^^^^^^^^^^^^^^
+  --> tests/compile_fail/yield_in_expression.rs:10:5
+   |
+10 |     f(g(), yield_!(2));
+   |     ^^^^^^^^^^^^^^^^^^
 
 error: yield_! in value position is only supported when the value is the whole `let` initializer or function tail expression and is an `if`/`match`/`loop`/block expression whose arms produce the value; as a workaround, declare `let mut x: Option<T> = None;` before the control flow, assign `x = Some(...);` where the value is produced, and use `x.unwrap()` afterwards
- --> tests/compile_fail/yield_in_expression.rs:6:5
-  |
-6 |     let _x = 1 + yield_!(3);
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+  --> tests/compile_fail/yield_in_expression.rs:11:5
+   |
+11 |     let _x = g() + yield_!(3);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^

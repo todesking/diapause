@@ -1,17 +1,17 @@
 error: yield_! in a condition expression is not supported
- --> tests/compile_fail/yield_in_condition.rs:5:8
-  |
-5 |     if yield_!(1) {
-  |        ^^^^^^^^^^
+  --> tests/compile_fail/yield_in_condition.rs:13:15
+   |
+13 |     if g() && yield_!(1) {
+   |               ^^^^^^^^^^
 
 error: yield_! in a condition expression is not supported
-  --> tests/compile_fail/yield_in_condition.rs:12:11
+  --> tests/compile_fail/yield_in_condition.rs:22:11
    |
-12 |     while yield_!(2) {
+22 |     while yield_!(2) {
    |           ^^^^^^^^^^
 
 error: yield_! in a match scrutinee is not supported
-  --> tests/compile_fail/yield_in_condition.rs:19:11
+  --> tests/compile_fail/yield_in_condition.rs:30:18
    |
-19 |     match yield_!(3) {
-   |           ^^^^^^^^^^
+30 |     match h(g(), yield_!(3)) {
+   |                  ^^^^^^^^^^
