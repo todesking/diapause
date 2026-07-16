@@ -137,6 +137,46 @@ fn enabling_fingerprint_invalidates_old_persisted_states() {
     assert!(serde_json::from_str::<tally_v1::State>(&json).is_err());
 }
 
+// A manual `fingerprint = "tag"` override pins the fingerprint across
+// edits: the user asserts that states persisted under the same tag stay
+// resumable (the state layout must actually still match).
+
+#[baregen::coroutine(yield = u32, resume = u32, fingerprint = "tally-pin")]
+#[derive(Serialize, Deserialize)]
+fn pinned_v1(n: u32) -> u32 {
+    let mut sum: u32 = 0;
+    for i in 0u32..n {
+        let w = yield_!(i);
+        sum += i * w;
+    }
+    sum
+}
+
+#[baregen::coroutine(yield = u32, resume = u32, fingerprint = "tally-pin")]
+#[derive(Serialize, Deserialize)]
+fn pinned_v2(n: u32) -> u32 {
+    let mut sum: u32 = 0;
+    for i in 0u32..n {
+        let w = yield_!(i);
+        sum += i + w;
+    }
+    sum
+}
+
+#[test]
+fn manual_fingerprint_pins_compatibility_across_edits() {
+    assert_eq!(pinned_v1::State::FINGERPRINT, pinned_v2::State::FINGERPRINT);
+
+    let mut c = pinned_v1(4);
+    c.start();
+    let json = serde_json::to_string(&c).unwrap();
+
+    // The v1 state resumes under v2's edited body without complaint.
+    let mut restored: pinned_v2::State = serde_json::from_str(&json).unwrap();
+    restored.check_fingerprint().unwrap();
+    assert_eq!(restored.resume(10), CoroutineState::Yielded(1));
+}
+
 #[test]
 fn fingerprint_const_is_generated_without_the_flag() {
     // `FINGERPRINT` exists on every state enum, `fingerprint` flag or

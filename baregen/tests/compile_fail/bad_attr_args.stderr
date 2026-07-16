@@ -15,3 +15,9 @@ error: duplicate `fingerprint` argument
   |
 7 | #[baregen::coroutine(fingerprint, fingerprint)]
   |                                   ^^^^^^^^^^^
+
+error: expected string literal
+  --> tests/compile_fail/bad_attr_args.rs:10:36
+   |
+10 | #[baregen::coroutine(fingerprint = 42)]
+   |                                    ^^

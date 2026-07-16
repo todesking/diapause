@@ -10,7 +10,7 @@ use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
 use crate::analyze_cfg::{self, Analysis, ArgInfo, Variant};
-use crate::args::MacroArgs;
+use crate::args::{Fingerprint, MacroArgs};
 use crate::cfg::{BlockId, Cfg, ResumeBinding, Terminator};
 use crate::lower::{self, skip_nested_scopes, ErrorSink};
 
@@ -41,6 +41,13 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     // Hashed before the body is rewritten, from the exact source tokens.
     let fingerprint = source_fingerprint(&attr, &item.sig, &item.block);
     let macro_args: MacroArgs = syn::parse2(attr)?;
+    // A manual `fingerprint = "tag"` replaces the source hash: states
+    // persisted under equal tags are declared compatible by the user.
+    let fingerprint = match &macro_args.fingerprint {
+        Fingerprint::Manual(tag) => fnv1a(FNV_OFFSET_BASIS, tag.value().as_bytes()),
+        _ => fingerprint,
+    };
+    let fp_enabled = macro_args.fingerprint.enabled();
 
     check_signature(&item.sig)?;
     let mut args = parse_args(&item.sig)?;
@@ -97,7 +104,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     // every data-carrying variant: initialized to FINGERPRINT at
     // construction and on every transition, checked on entry to
     // `start`/`resume` (the guard runs with `__fp` bound by the match).
-    let fp_guard = macro_args.fingerprint.then(|| {
+    let fp_guard = fp_enabled.then(|| {
         let msg = format!("this state was created by a different version of `{name}`");
         quote! {
             if *__fp != Self::FINGERPRINT {
@@ -105,8 +112,8 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
             }
         }
     });
-    let fp_bind = macro_args.fingerprint.then(|| quote!(__fp,));
-    let fp_init = macro_args.fingerprint.then(|| quote!(__fp: #fingerprint,));
+    let fp_bind = fp_enabled.then(|| quote!(__fp,));
+    let fp_init = fp_enabled.then(|| quote!(__fp: #fingerprint,));
 
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let cx = ExpandCtx {
@@ -129,7 +136,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     } = build_state_enum(&cx, &derive_attrs, &suspension.poisoned_variant);
     let resume_body = build_resume_dispatch(&cx, &suspension);
     let drive_fn = build_drive_fn(&cx, &suspension.placeholder);
-    let fp_check_fn = macro_args.fingerprint.then(|| build_check_fingerprint(&cx));
+    let fp_check_fn = fp_enabled.then(|| build_check_fingerprint(&cx));
 
     Ok(quote! {
         #(#fn_attrs)*

@@ -7,23 +7,44 @@ use syn::parse::{Parse, ParseStream};
 pub struct MacroArgs {
     pub yield_ty: syn::Type,
     pub resume_ty: syn::Type,
-    /// Whether the `fingerprint` flag was given (injects the `__fp`
-    /// field and its checks).
-    pub fingerprint: bool,
+    pub fingerprint: Fingerprint,
+}
+
+/// The `fingerprint` argument: when given, the `__fp` field and its
+/// checks are generated. Bare `fingerprint` hashes the coroutine's
+/// source; `fingerprint = "tag"` hashes the tag instead — an escape
+/// hatch declaring states persisted under the same tag compatible
+/// across an edit (e.g. resuming states persisted before a hot fix).
+pub enum Fingerprint {
+    Off,
+    FromSource,
+    Manual(syn::LitStr),
+}
+
+impl Fingerprint {
+    pub fn enabled(&self) -> bool {
+        !matches!(self, Fingerprint::Off)
+    }
 }
 
 impl Parse for MacroArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut yield_ty = None;
         let mut resume_ty = None;
-        let mut fingerprint = false;
+        let mut fingerprint = None;
         while !input.is_empty() {
             // `yield` is a reserved keyword, so accept any identifier here.
             let name = input.call(syn::Ident::parse_any)?;
             let duplicate =
                 |name: &syn::Ident| syn::Error::new(name.span(), format!("duplicate `{name}` argument"));
             if name == "fingerprint" {
-                if std::mem::replace(&mut fingerprint, true) {
+                let value = if input.peek(Token![=]) {
+                    input.parse::<Token![=]>()?;
+                    Fingerprint::Manual(input.parse::<syn::LitStr>()?)
+                } else {
+                    Fingerprint::FromSource
+                };
+                if fingerprint.replace(value).is_some() {
                     return Err(duplicate(&name));
                 }
             } else {
@@ -51,7 +72,7 @@ impl Parse for MacroArgs {
         Ok(MacroArgs {
             yield_ty: yield_ty.unwrap_or_else(unit),
             resume_ty: resume_ty.unwrap_or_else(unit),
-            fingerprint,
+            fingerprint: fingerprint.unwrap_or(Fingerprint::Off),
         })
     }
 }
