@@ -387,3 +387,227 @@ fn borrow_across_loop_yield_is_rebuilt_each_iteration() {
     assert_eq!(c.resume(5), CoroutineState::Yielded(5));
     assert_eq!(c.resume(6), CoroutineState::Complete(11));
 }
+
+// === Jumps out of suspending loops from opaque statements ===
+//
+// A `break`/`continue` inside a statement without a yield_! (an "opaque"
+// statement) still reaches its suspending target loop: lowering rewrites
+// it into a transition that re-enters the dispatch loop.
+
+/// The natural `if done { break; }` after a yield.
+#[baregen::coroutine(yield = u32, resume = bool)]
+fn stop_when_told() -> u32 {
+    let mut i: u32 = 0;
+    loop {
+        let done = yield_!(i);
+        if done {
+            break;
+        }
+        i += 1;
+    }
+    i * 10
+}
+
+#[test]
+fn opaque_break_exits_the_loop() {
+    let mut c = stop_when_told();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(false), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(true), CoroutineState::Complete(10));
+}
+
+/// An opaque `continue` targeting a `while` loop re-evaluates its
+/// condition at the header.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn sum_odd_replies(n: u32) -> u32 {
+    let mut sum: u32 = 0;
+    let mut i: u32 = 0;
+    while i < n {
+        i += 1;
+        let r = yield_!(i);
+        if r % 2 == 0 {
+            continue;
+        }
+        sum += r;
+    }
+    sum
+}
+
+#[test]
+fn opaque_continue_restarts_the_while_loop() {
+    let mut c = sum_odd_replies(3);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(2), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(3), CoroutineState::Yielded(3));
+    assert_eq!(c.resume(5), CoroutineState::Complete(8));
+}
+
+/// An opaque `continue` targeting a `for` loop advances its stored
+/// iterator.
+#[baregen::coroutine(yield = u32)]
+fn sum_even_indices(n: u32) -> u32 {
+    let mut sum: u32 = 0;
+    for x in 0u32..n {
+        yield_!(x);
+        if x % 2 == 1 {
+            continue;
+        }
+        sum += x;
+    }
+    sum
+}
+
+#[test]
+fn opaque_continue_advances_the_for_loop() {
+    let mut c = sum_even_indices(4);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(()), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(()), CoroutineState::Yielded(3));
+    assert_eq!(c.resume(()), CoroutineState::Complete(2));
+}
+
+/// A labeled break out of a whole opaque nested loop, with a variable
+/// assigned inside the statement before the jump and live at the exit.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn find_seven() -> u32 {
+    let mut found: u32 = 0;
+    'outer: loop {
+        let base = yield_!(found);
+        for k in 0..10u32 {
+            if base + k == 7 {
+                found = base + k;
+                break 'outer;
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn opaque_labeled_break_from_nested_opaque_loop() {
+    let mut c = find_seven();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(20), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(5), CoroutineState::Complete(7));
+}
+
+/// An opaque statement mixing jumps that stay local (the inner loop's
+/// own `break`) with one that escapes to the suspending loop.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn smallest_root() -> u32 {
+    let mut best: u32 = 0;
+    'search: loop {
+        let target = yield_!(best);
+        let mut k: u32 = 0;
+        loop {
+            if k * k >= target {
+                break;
+            }
+            k += 1;
+        }
+        if k == target {
+            best = k;
+            break 'search;
+        }
+    }
+    best
+}
+
+#[test]
+fn local_breaks_stay_inside_the_opaque_statement() {
+    let mut c = smallest_root();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(3), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(1), CoroutineState::Complete(1));
+}
+
+/// Both jump kinds escaping from one opaque `match` statement.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn accumulate_until_zero() -> u32 {
+    let mut acc: u32 = 0;
+    loop {
+        let r = yield_!(acc);
+        match r {
+            0 => break,
+            1 => continue,
+            n => acc += n,
+        }
+    }
+    acc
+}
+
+#[test]
+fn opaque_break_and_continue_in_match_arms() {
+    let mut c = accumulate_until_zero();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(5), CoroutineState::Yielded(5));
+    assert_eq!(c.resume(1), CoroutineState::Yielded(5));
+    assert_eq!(c.resume(0), CoroutineState::Complete(5));
+}
+
+/// An opaque `break` targeting an expanded labeled block.
+#[baregen::coroutine(yield = u32)]
+fn skippable_block(c: bool) -> u32 {
+    let mut out: u32 = 1;
+    'b: {
+        yield_!(out);
+        if c {
+            break 'b;
+        }
+        out += 10;
+    }
+    out * 2
+}
+
+#[test]
+fn opaque_break_out_of_labeled_block() {
+    let mut c = skippable_block(true);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(2));
+
+    let mut c = skippable_block(false);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(22));
+}
+
+/// A valued opaque `break` out of a `let`-initializer loop assigns the
+/// binding before jumping to the join.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn first_big_reply() -> u32 {
+    let x: u32 = loop {
+        let r = yield_!(1);
+        if r > 3 {
+            break r * 2;
+        }
+    };
+    x + 1
+}
+
+#[test]
+fn opaque_valued_break_into_let_initializer() {
+    let mut c = first_big_reply();
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(2), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(5), CoroutineState::Complete(11));
+}
+
+/// A valued opaque `break` out of a tail-position loop completes the
+/// coroutine directly.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn reply_after_nine() -> u32 {
+    loop {
+        let r = yield_!(0);
+        if r == 9 {
+            break r + 1;
+        }
+    }
+}
+
+#[test]
+fn opaque_valued_break_out_of_tail_loop() {
+    let mut c = reply_after_nine();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(3), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(9), CoroutineState::Complete(10));
+}

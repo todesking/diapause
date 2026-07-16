@@ -11,7 +11,7 @@ use syn::visit_mut::VisitMut;
 
 use crate::analyze_cfg::{self, Analysis, ArgInfo, Variant};
 use crate::args::{Fingerprint, MacroArgs};
-use crate::cfg::{BlockId, Cfg, ResumeBinding, Terminator};
+use crate::cfg::{BlockId, Cfg, OpaqueJumpKind, ResumeBinding, Terminator};
 use crate::lower::{self, skip_nested_scopes, ErrorSink};
 
 /// A function argument. Carries the `ident` needed to emit code, unlike
@@ -520,7 +520,8 @@ impl Codegen<'_> {
     }
 
     /// A block's statements and transition, with crossed borrows
-    /// re-established first and removed original borrow `let`s omitted.
+    /// re-established first, removed original borrow `let`s omitted, and
+    /// jump markers left by lowering replaced with their transitions.
     /// `b` may be inline (no reborrows of its own) or a variant block.
     fn block_code(&self, b: BlockId) -> TokenStream {
         let reborrows = self
@@ -535,12 +536,20 @@ impl Codegen<'_> {
                 let mut_tok = rb.mutable.then(|| quote!(mut));
                 quote!(let #target_mut #target = & #mut_tok #source;)
             });
+        let has_jumps = !self.cfg.blocks[b].jumps.is_empty();
         let stmts = self.cfg.blocks[b]
             .stmts
             .iter()
             .enumerate()
             .filter(|(i, _)| !self.analysis.removed_stmts[b].contains(i))
-            .map(|(_, stmt)| stmt);
+            .map(|(_, stmt)| {
+                if !has_jumps {
+                    return quote!(#stmt);
+                }
+                let mut stmt = stmt.clone();
+                JumpMarkerReplacer { codegen: self }.visit_stmt_mut(&mut stmt);
+                quote!(#stmt)
+            });
         let term = self.terminator_code(b);
         quote!(#(#reborrows)* #(#stmts)* #term)
     }
@@ -630,6 +639,77 @@ impl Codegen<'_> {
         let fp_init = &self.fp_init;
         quote!(State::#ident { #(#fields,)* #fp_init })
     }
+}
+
+/// Replaces the `__baregen_jump!` markers lowering left for
+/// `break`/`continue` escaping an opaque statement (see
+/// `cfg::OpaqueJump`) with their real transitions: a next-state
+/// assignment re-entering the dispatch loop, or a completion for a
+/// valued `break` out of a tail-position loop.
+struct JumpMarkerReplacer<'a, 'b> {
+    codegen: &'a Codegen<'b>,
+}
+
+/// The body of a `__baregen_jump!(k [, value])` marker.
+struct MarkerArgs {
+    k: usize,
+    value: Option<syn::Expr>,
+}
+
+impl syn::parse::Parse for MarkerArgs {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let k: syn::LitInt = input.parse()?;
+        let value = if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            Some(input.parse()?)
+        } else {
+            None
+        };
+        Ok(MarkerArgs {
+            k: k.base10_parse()?,
+            value,
+        })
+    }
+}
+
+impl VisitMut for JumpMarkerReplacer<'_, '_> {
+    fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
+        syn::visit_mut::visit_expr_mut(self, e);
+        let syn::Expr::Macro(m) = e else { return };
+        if !lower::is_jump_marker(&m.mac) {
+            return;
+        }
+        let span = m.mac.span();
+        let args: MarkerArgs = m
+            .mac
+            .parse_body()
+            .expect("BUG: malformed __baregen_jump! marker");
+        match self.codegen.cfg.opaque_jumps[args.k].kind {
+            OpaqueJumpKind::Goto { target, .. } => {
+                let next_state = self.codegen.state_value(target);
+                *e = syn::parse_quote_spanned!(span => {
+                    __state = #next_state;
+                    continue '__dispatch;
+                });
+            }
+            OpaqueJumpKind::Complete => {
+                let mut value = args.value.expect("BUG: completion marker without a value");
+                // The value traveled as macro tokens, so markers nested
+                // inside it have not been visited yet.
+                self.visit_expr_mut(&mut value);
+                let ret_ty = self.codegen.ret_ty;
+                *e = syn::parse_quote_spanned!(span => {
+                    let __ret: #ret_ty = #value;
+                    *self = State::Done;
+                    return ::baregen::CoroutineState::Complete(__ret);
+                });
+            }
+        }
+    }
+
+    // Markers never occur inside these (the lowering rewriter skips
+    // them); leave any user macro coincidentally named like ours alone.
+    skip_nested_scopes!(VisitMut);
 }
 
 /// Field shorthand with the original binding mode: `mut x` rebinds the

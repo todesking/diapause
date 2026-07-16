@@ -98,6 +98,39 @@ pub enum BorrowSource {
     NonReconstructible { why: &'static str },
 }
 
+/// A `break`/`continue` written inside an opaque statement but targeting
+/// an expanded (yield-containing) loop or labeled block outside it.
+/// Lowering rewrites the jump expression into a `__baregen_jump!(k)`
+/// marker (`k` indexes `Cfg::opaque_jumps`) and codegen replaces the
+/// marker with the real transition; the indirection keeps the statement
+/// tokens valid while simplification renumbers blocks.
+#[derive(Debug)]
+pub struct OpaqueJump {
+    pub kind: OpaqueJumpKind,
+    /// Identifiers bound by patterns inside the statement containing the
+    /// jump. The transition moves the target's live-in bindings by name
+    /// from the jump site, so an inner binding shadowing one of them
+    /// would be captured instead; the analysis rejects that combination
+    /// (conservatively: any binding in the statement counts).
+    pub shadowed: Vec<syn::Ident>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OpaqueJumpKind {
+    /// Transition to `target`: a loop's exit block for `break`, its
+    /// header for `continue`. For a valued `break` out of a
+    /// `let`-initializer loop, `store` is the destination binding; the
+    /// rewritten tokens bind it with a synthesized `let` just before
+    /// the marker.
+    Goto {
+        target: BlockId,
+        store: Option<BindingId>,
+    },
+    /// A valued `break` out of a loop in the function's tail position:
+    /// the marker carries the value and completes the coroutine.
+    Complete,
+}
+
 #[derive(Debug)]
 pub struct Cfg {
     pub blocks: Vec<Block>,
@@ -105,6 +138,26 @@ pub struct Cfg {
     /// All bindings, indexed by `BindingId`; the function arguments come
     /// first, in declaration order.
     pub bindings: Vec<Binding>,
+    /// All opaque-statement jumps, indexed by the `k` embedded in their
+    /// `__baregen_jump!(k)` markers.
+    pub opaque_jumps: Vec<OpaqueJump>,
+}
+
+impl Cfg {
+    /// Successor block ids of `b`: the terminator's successors plus the
+    /// targets of opaque jumps in its statements (`Complete` jumps leave
+    /// the coroutine and have no successor).
+    pub fn successors(&self, b: BlockId) -> impl DoubleEndedIterator<Item = BlockId> + '_ {
+        self.blocks[b]
+            .terminator
+            .successors()
+            .chain(self.blocks[b].jumps.iter().filter_map(|&j| {
+                match self.opaque_jumps[j].kind {
+                    OpaqueJumpKind::Goto { target, .. } => Some(target),
+                    OpaqueJumpKind::Complete => None,
+                }
+            }))
+    }
 }
 
 #[derive(Debug)]
@@ -119,6 +172,9 @@ pub struct Block {
     pub defs: BTreeSet<BindingId>,
     /// Resume entry point after a yield; always becomes an enum variant.
     pub resume_point: bool,
+    /// Indices into `Cfg::opaque_jumps` of the jump markers embedded in
+    /// this block's `stmts`.
+    pub jumps: Vec<usize>,
     /// Set by simplification: the block has a unique predecessor and is
     /// emitted inline in that predecessor's transition arm instead of
     /// becoming an enum variant.
@@ -228,30 +284,51 @@ impl DoubleEndedIterator for Successors<'_> {
 /// Merges single-predecessor `Goto` chains, drops unreachable blocks,
 /// and marks the remaining single-predecessor blocks (branch/match arm
 /// targets) as inline. Resume points always stay separate blocks: they
-/// are the state-machine's resume entry variants.
+/// are the state-machine's resume entry variants. So do opaque-jump
+/// targets: they are entered by `continue '__dispatch`, which only
+/// reaches dispatchable variants.
 pub(crate) fn simplify(cfg: &mut Cfg) {
     remove_unreachable(cfg);
     merge_goto_chains(cfg);
     remove_unreachable(cfg);
-    let preds = pred_edge_counts(&cfg.blocks);
+    let preds = pred_edge_counts(cfg);
+    let jump_target = jump_targets(cfg);
+    let entry = cfg.entry;
     for (i, b) in cfg.blocks.iter_mut().enumerate() {
-        b.inline = i != cfg.entry && !b.resume_point && preds[i] == 1;
+        b.inline = i != entry && !b.resume_point && preds[i] == 1 && !jump_target[i];
     }
 }
 
-fn pred_edge_counts(blocks: &[Block]) -> Vec<usize> {
-    let mut counts = vec![0usize; blocks.len()];
-    for b in blocks {
-        for s in b.terminator.successors() {
+/// Predecessor edge counts, opaque-jump edges included.
+fn pred_edge_counts(cfg: &Cfg) -> Vec<usize> {
+    let mut counts = vec![0usize; cfg.blocks.len()];
+    for b in 0..cfg.blocks.len() {
+        for s in cfg.successors(b) {
             counts[s] += 1;
         }
     }
     counts
 }
 
+/// Blocks entered by an opaque jump.
+fn jump_targets(cfg: &Cfg) -> Vec<bool> {
+    let mut out = vec![false; cfg.blocks.len()];
+    for b in &cfg.blocks {
+        for &j in &b.jumps {
+            if let OpaqueJumpKind::Goto { target, .. } = cfg.opaque_jumps[j].kind {
+                out[target] = true;
+            }
+        }
+    }
+    out
+}
+
 fn merge_goto_chains(cfg: &mut Cfg) {
     loop {
-        let preds = pred_edge_counts(&cfg.blocks);
+        // A jump target's opaque-jump edges are part of its pred count,
+        // so it never qualifies for merging (any `Goto` into it makes
+        // preds >= 2, and without one there is nothing to merge from).
+        let preds = pred_edge_counts(cfg);
         let mut pair = None;
         for (b, blk) in cfg.blocks.iter().enumerate() {
             if let Terminator::Goto(c) = &blk.terminator {
@@ -272,6 +349,7 @@ fn merge_goto_chains(cfg: &mut Cfg) {
         );
         let uses = std::mem::take(&mut cfg.blocks[c].uses);
         let defs = std::mem::take(&mut cfg.blocks[c].defs);
+        let jumps = std::mem::take(&mut cfg.blocks[c].jumps);
         // c's statements land after b's existing ones, so the def_stmt
         // indices of c's bindings shift by b's statement count.
         let offset = cfg.blocks[b].stmts.len();
@@ -289,6 +367,9 @@ fn merge_goto_chains(cfg: &mut Cfg) {
             }
         }
         bb.defs.extend(defs);
+        // Jump indices are global (into `cfg.opaque_jumps`), so moving
+        // the statements does not invalidate the embedded markers.
+        bb.jumps.extend(jumps);
     }
 }
 
@@ -299,7 +380,7 @@ fn remove_unreachable(cfg: &mut Cfg) {
         if std::mem::replace(&mut reachable[b], true) {
             continue;
         }
-        stack.extend(cfg.blocks[b].terminator.successors());
+        stack.extend(cfg.successors(b));
     }
     if reachable.iter().all(|r| *r) {
         return;
@@ -321,6 +402,20 @@ fn remove_unreachable(cfg: &mut Cfg) {
         .collect();
     for b in &mut cfg.blocks {
         retarget(&mut b.terminator, &remap);
+    }
+    // Retarget the jumps of surviving blocks. A jump keeps its target
+    // reachable (`successors` above traverses jump edges), so no
+    // surviving jump can point at a removed block; entries owned by
+    // removed blocks become unreferenced and stay stale.
+    let live_jumps: Vec<usize> = cfg
+        .blocks
+        .iter()
+        .flat_map(|b| b.jumps.iter().copied())
+        .collect();
+    for j in live_jumps {
+        if let OpaqueJumpKind::Goto { target, .. } = &mut cfg.opaque_jumps[j].kind {
+            *target = remap[*target];
+        }
     }
     cfg.entry = remap[cfg.entry];
 }

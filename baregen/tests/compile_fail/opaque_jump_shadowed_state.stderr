@@ -1,0 +1,5 @@
+error: `sum` is also stored in the coroutine state by the `break`/`continue` in this statement, which would capture this inner `sum` instead of the stored one; rename the inner binding
+  --> tests/compile_fail/opaque_jump_shadowed_state.rs:10:21
+   |
+10 |         if let Some(sum) = helper(n) {
+   |                     ^^^

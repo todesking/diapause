@@ -8,10 +8,11 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use syn::spanned::Spanned;
 use syn::visit::Visit;
+use syn::visit_mut::VisitMut;
 
 use crate::cfg::{
-    Binding, BindingId, BindingKind, Block, BlockId, BorrowSource, Cfg, MatchArm, ResumeBinding,
-    Terminator, TySource, simplify,
+    Binding, BindingId, BindingKind, Block, BlockId, BorrowSource, Cfg, MatchArm, OpaqueJump,
+    OpaqueJumpKind, ResumeBinding, Terminator, TySource, simplify,
 };
 use crate::ty_infer::strip_parens;
 
@@ -112,6 +113,7 @@ struct DraftBlock {
     uses: BTreeSet<BindingId>,
     defs: BTreeSet<BindingId>,
     resume_point: bool,
+    jumps: Vec<usize>,
 }
 
 /// A `break`/`continue` target introduced by an expanded loop or an
@@ -153,6 +155,7 @@ impl BreakDest {
 pub(crate) struct Lowerer {
     blocks: Vec<DraftBlock>,
     bindings: Vec<Binding>,
+    opaque_jumps: Vec<OpaqueJump>,
     scopes: Vec<HashMap<String, BindingId>>,
     labels: Vec<Frame>,
     errors: ErrorSink,
@@ -172,6 +175,7 @@ impl Lowerer {
         let mut lw = Lowerer {
             blocks: Vec::new(),
             bindings: Vec::new(),
+            opaque_jumps: Vec::new(),
             scopes: vec![HashMap::new()],
             labels: Vec::new(),
             errors: ErrorSink::default(),
@@ -222,6 +226,7 @@ impl Lowerer {
                 uses: d.uses,
                 defs: d.defs,
                 resume_point: d.resume_point,
+                jumps: d.jumps,
                 inline: false,
             })
             .collect();
@@ -229,6 +234,7 @@ impl Lowerer {
             blocks,
             entry: 0,
             bindings: self.bindings,
+            opaque_jumps: self.opaque_jumps,
         };
         simplify(&mut cfg);
         Ok(cfg)
@@ -245,6 +251,7 @@ impl Lowerer {
             uses: BTreeSet::new(),
             defs: BTreeSet::new(),
             resume_point,
+            jumps: Vec::new(),
         });
         self.blocks.len() - 1
     }
@@ -414,13 +421,6 @@ fn for_local_borrow_err(name: &syn::Ident) -> String {
     )
 }
 
-fn opaque_jump_err(kw: &str) -> String {
-    format!(
-        "`{kw}` cannot target a loop containing yield_! from inside a statement \
-         that does not contain yield_!"
-    )
-}
-
 // === Yield detection ===
 
 pub fn is_yield_macro(mac: &syn::Macro) -> bool {
@@ -435,6 +435,15 @@ pub fn is_yield_all_macro(mac: &syn::Macro) -> bool {
         .segments
         .last()
         .is_some_and(|seg| seg.ident == "yield_all")
+}
+
+/// The internal marker macro `rewrite_opaque_jumps` leaves where an
+/// opaque-statement `break`/`continue` was: `__baregen_jump!(k)` (or
+/// `__baregen_jump!(k, value)` for a completing valued `break`), where
+/// `k` indexes `Cfg::opaque_jumps`. `expand` replaces the markers with
+/// the real transitions once variant fields are known.
+pub fn is_jump_marker(mac: &syn::Macro) -> bool {
+    mac.path.is_ident("__baregen_jump")
 }
 
 /// Textually scans a foreign macro's tokens for `yield_ !` / `yield_all !`.
@@ -1213,17 +1222,19 @@ impl Lowerer {
         self.labels.iter().rev().find(|f| f.header.is_some())
     }
 
-    /// Appends a statement without yield_! to the current block.
+    /// Appends a statement without yield_! to the current block, after
+    /// validating it and rewriting any `break`/`continue` targeting an
+    /// expanded loop or labeled block into a jump marker.
     fn push_opaque(&mut self, stmt: &syn::Stmt) {
-        self.validate_opaque(stmt);
-        self.record_stmt_uses(stmt);
-        if let syn::Stmt::Local(local) = stmt {
+        let stmt = self.rewrite_opaque(stmt);
+        self.record_stmt_uses(&stmt);
+        if let syn::Stmt::Local(local) = &stmt {
             // The statement is not pushed yet, so its future index in
             // `stmts` is the current length.
             let stmt_idx = self.blocks[self.current].stmts.len();
             self.define_local(local, stmt_idx);
         }
-        self.blocks[self.current].stmts.push(stmt.clone());
+        self.blocks[self.current].stmts.push(stmt);
     }
 
     /// Introduces the bindings of an opaque `let`, classifying the type
@@ -1706,46 +1717,67 @@ impl Lowerer {
     }
 }
 
-// === Opaque statement validation ===
+// === Opaque statement validation and jump rewriting ===
 
 impl Lowerer {
-    /// Checks a statement that stays opaque: no foreign macro may carry
-    /// yield_! tokens, and no `break`/`continue` inside it may target an
-    /// expanded (yield-containing) loop or labeled block outside it.
-    fn validate_opaque(&mut self, stmt: &syn::Stmt) {
-        let expanded_labels: HashSet<String> =
-            self.labels.iter().filter_map(|f| f.label.clone()).collect();
-        let mut checker = OpaqueChecker {
-            expanded_labels,
-            in_expanded_loop: self.labels.iter().any(|f| f.header.is_some()),
+    /// Checks and rewrites a statement that stays opaque: no foreign
+    /// macro may carry yield_! tokens, and every `break`/`continue`
+    /// inside it that targets an expanded (yield-containing) loop or
+    /// labeled block outside it is rewritten into a `__baregen_jump!`
+    /// marker recorded in `opaque_jumps`. Codegen later replaces the
+    /// marker with a transition into the dispatch loop (or a completion
+    /// for a valued `break` out of a tail-position loop), so the jump
+    /// works at any depth inside the statement. The jump does not end
+    /// the current block; its edge is carried by `Block::jumps`.
+    fn rewrite_opaque(&mut self, stmt: &syn::Stmt) -> syn::Stmt {
+        let mut bound = StmtBindingCollector::default();
+        bound.visit_stmt(stmt);
+        let mut stmt = stmt.clone();
+        let mut rw = OpaqueRewriter {
+            lw: self,
+            stmt_bindings: bound.idents,
             local_loop_depth: 0,
             local_labels: Vec::new(),
-            error: ErrorSink::default(),
         };
-        checker.visit_stmt(stmt);
-        if let Some(e) = checker.error.into_option() {
-            self.err(e);
-        }
+        rw.visit_stmt_mut(&mut stmt);
+        stmt
     }
 }
 
-struct OpaqueChecker {
-    /// Labels of expanded loops and blocks enclosing the statement.
-    expanded_labels: HashSet<String>,
-    /// Whether any expanded loop encloses the statement.
-    in_expanded_loop: bool,
+/// Identifiers bound by patterns within one statement (`let`s, match
+/// arms, `if let`/`while let` patterns, `for` patterns), nested scopes
+/// excluded. Recorded per jump for the analysis' shadowing check.
+#[derive(Default)]
+struct StmtBindingCollector {
+    idents: Vec<syn::Ident>,
+}
+
+impl<'ast> Visit<'ast> for StmtBindingCollector {
+    fn visit_pat_ident(&mut self, pi: &'ast syn::PatIdent) {
+        self.idents.push(pi.ident.clone());
+        syn::visit::visit_pat_ident(self, pi);
+    }
+
+    skip_nested_scopes!(Visit);
+}
+
+/// Rewrites the jumps escaping one opaque statement. Mirrors the label
+/// resolution of `lower_break`/`lower_continue`: loops and labels
+/// declared within the statement own their own jumps and are tracked so
+/// only escaping jumps are rewritten (and escaping jumps resolve against
+/// the expanded frames, which are the only enclosing constructs — every
+/// non-expanded one is inside the opaque statement itself).
+struct OpaqueRewriter<'a> {
+    lw: &'a mut Lowerer,
+    /// See `StmtBindingCollector`.
+    stmt_bindings: Vec<syn::Ident>,
     /// Loops of the statement itself that enclose the current node.
     local_loop_depth: usize,
     /// Labels declared within the statement (shadow expanded ones).
     local_labels: Vec<String>,
-    error: ErrorSink,
 }
 
-impl OpaqueChecker {
-    fn record(&mut self, e: syn::Error) {
-        self.error.push(e);
-    }
-
+impl OpaqueRewriter<'_> {
     fn enter_loop<F: FnOnce(&mut Self)>(&mut self, label: &Option<syn::Label>, f: F) {
         let labeled = label.is_some();
         if let Some(l) = label {
@@ -1759,69 +1791,193 @@ impl OpaqueChecker {
         }
     }
 
-    fn check_jump(&mut self, label: &Option<syn::Lifetime>, kw: &str, span_of: &dyn quote::ToTokens) {
-        match label {
+    /// Resolves a jump's frame like `lower_break` does, returning `None`
+    /// both when the jump belongs to the statement itself (nothing to
+    /// rewrite) and on a reported resolution error.
+    fn escaping_frame(
+        &mut self,
+        label: &Option<syn::Lifetime>,
+        kw: &str,
+        span_of: &dyn quote::ToTokens,
+    ) -> Option<(Option<BlockId>, BreakDest)> {
+        let frame = match label {
             Some(l) => {
-                let name = l.ident.to_string();
-                if !self.local_labels.contains(&name) && self.expanded_labels.contains(&name) {
-                    self.record(syn::Error::new_spanned(span_of, opaque_jump_err(kw)));
+                if self.local_labels.contains(&l.ident.to_string()) {
+                    return None;
                 }
+                let Some(f) = self.lw.find_labeled_frame(&l.ident.to_string()) else {
+                    self.lw.err(syn::Error::new_spanned(
+                        span_of,
+                        format!("use of undeclared label `{l}`"),
+                    ));
+                    return None;
+                };
+                f
             }
             None => {
-                if self.local_loop_depth == 0 && self.in_expanded_loop {
-                    self.record(syn::Error::new_spanned(span_of, opaque_jump_err(kw)));
+                if self.local_loop_depth > 0 {
+                    return None;
                 }
+                let Some(f) = self.lw.innermost_loop_frame() else {
+                    self.lw.err(syn::Error::new_spanned(
+                        span_of,
+                        format!("`{kw}` outside of a loop"),
+                    ));
+                    return None;
+                };
+                f
+            }
+        };
+        Some((frame.header, frame.dest))
+    }
+
+    /// Allocates a jump entry owned by the current block and returns the
+    /// bare `k` literal for its marker.
+    fn new_jump(&mut self, kind: OpaqueJumpKind, span: proc_macro2::Span) -> syn::LitInt {
+        let k = self.lw.opaque_jumps.len();
+        self.lw.opaque_jumps.push(OpaqueJump {
+            kind,
+            shadowed: self.stmt_bindings.clone(),
+        });
+        let current = self.lw.current;
+        self.lw.blocks[current].jumps.push(k);
+        syn::LitInt::new(&k.to_string(), span)
+    }
+
+    /// The `{ __state = ..; continue '__dispatch; }` marker jumping to
+    /// `target`.
+    fn goto_marker(
+        &mut self,
+        target: BlockId,
+        store: Option<BindingId>,
+        span: proc_macro2::Span,
+    ) -> syn::Expr {
+        let k = self.new_jump(OpaqueJumpKind::Goto { target, store }, span);
+        syn::parse_quote_spanned!(span => __baregen_jump!(#k))
+    }
+
+    /// The replacement for an escaping `break`, or `None` to keep it.
+    fn rewrite_break(&mut self, b: &syn::ExprBreak) -> Option<syn::Expr> {
+        let (_, dest) = self.escaping_frame(&b.label, "break", b)?;
+        let span = b.break_token.span();
+        let value = |b: &syn::ExprBreak| -> syn::Expr {
+            b.expr
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| unit_expr(span))
+        };
+        match dest {
+            BreakDest::Plain(exit) => {
+                if let Some(v) = &b.expr {
+                    self.lw.err(syn::Error::new_spanned(v, ERR_BREAK_VALUE));
+                }
+                Some(self.goto_marker(exit, None, span))
+            }
+            // Like the native `push_store`, but the synthesized `let`
+            // sits at the jump site, inside the statement; the marker
+            // right after it moves the fresh binding into the target
+            // state (so a same-named user binding in the statement
+            // cannot be captured by mistake).
+            BreakDest::Store { binding, exit } => {
+                let v = value(b);
+                let bd = &self.lw.bindings[binding.0];
+                let ident = bd.ident.clone();
+                let mutability = bd.mutability;
+                let annotation = match &bd.ty {
+                    TySource::Known(t) => Some(t.clone()),
+                    _ => None,
+                };
+                let current = self.lw.current;
+                self.lw.blocks[current].defs.insert(binding);
+                let marker = self.goto_marker(exit, Some(binding), span);
+                let let_stmt: syn::Stmt = match annotation {
+                    Some(ty) => syn::parse_quote_spanned!(span =>
+                        let #mutability #ident: #ty = #v;),
+                    None => syn::parse_quote_spanned!(span => let #mutability #ident = #v;),
+                };
+                Some(syn::parse_quote_spanned!(span => { #let_stmt #marker }))
+            }
+            // The loop is the function's tail expression: the `break`
+            // value completes the coroutine. The marker carries the
+            // value; codegen wraps it in the completion transition
+            // (only it knows the return type).
+            BreakDest::Return => {
+                let v = value(b);
+                let k = self.new_jump(OpaqueJumpKind::Complete, span);
+                Some(syn::parse_quote_spanned!(span => __baregen_jump!(#k, #v)))
             }
         }
+    }
+
+    /// The replacement for an escaping `continue`, or `None` to keep it.
+    fn rewrite_continue(&mut self, c: &syn::ExprContinue) -> Option<syn::Expr> {
+        let (header, _) = self.escaping_frame(&c.label, "continue", c)?;
+        let Some(header) = header else {
+            self.lw.err(syn::Error::new_spanned(
+                c,
+                "`continue` cannot target a labeled block",
+            ));
+            return None;
+        };
+        Some(self.goto_marker(header, None, c.continue_token.span()))
     }
 }
 
-impl<'ast> Visit<'ast> for OpaqueChecker {
-    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        if is_yield_macro(mac) {
-            // Unreachable in practice: the caller only validates
-            // statements without yield_!. Kept for robustness.
-            self.record(syn::Error::new_spanned(mac, ERR_UNHOISTABLE));
-        } else if tokens_contain_yield(mac.tokens.clone()) {
-            self.record(syn::Error::new(mac.span(), ERR_FOREIGN_MACRO));
+impl VisitMut for OpaqueRewriter<'_> {
+    fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
+        // Children first: a jump nested inside a `break` value must be
+        // rewritten before the outer break captures the value.
+        syn::visit_mut::visit_expr_mut(self, e);
+        let replacement = match e {
+            syn::Expr::Break(b) => self.rewrite_break(b),
+            syn::Expr::Continue(c) => self.rewrite_continue(c),
+            _ => None,
+        };
+        if let Some(r) = replacement {
+            *e = r;
         }
     }
 
-    fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
-        self.enter_loop(&node.label, |v| syn::visit::visit_expr_loop(v, node));
+    fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
+        if is_yield_macro(mac) {
+            // Unreachable in practice: the caller only rewrites
+            // statements without yield_!. Kept for robustness.
+            self.lw.err(syn::Error::new_spanned(&*mac, ERR_UNHOISTABLE));
+        } else if tokens_contain_yield(mac.tokens.clone()) {
+            self.lw.err(syn::Error::new(mac.span(), ERR_FOREIGN_MACRO));
+        }
     }
 
-    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
-        self.enter_loop(&node.label, |v| syn::visit::visit_expr_while(v, node));
+    fn visit_expr_loop_mut(&mut self, node: &mut syn::ExprLoop) {
+        let label = node.label.clone();
+        self.enter_loop(&label, |v| syn::visit_mut::visit_expr_loop_mut(v, node));
     }
 
-    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
-        self.enter_loop(&node.label, |v| syn::visit::visit_expr_for_loop(v, node));
+    fn visit_expr_while_mut(&mut self, node: &mut syn::ExprWhile) {
+        let label = node.label.clone();
+        self.enter_loop(&label, |v| syn::visit_mut::visit_expr_while_mut(v, node));
     }
 
-    fn visit_expr_block(&mut self, node: &'ast syn::ExprBlock) {
+    fn visit_expr_for_loop_mut(&mut self, node: &mut syn::ExprForLoop) {
+        let label = node.label.clone();
+        self.enter_loop(&label, |v| {
+            syn::visit_mut::visit_expr_for_loop_mut(v, node)
+        });
+    }
+
+    fn visit_expr_block_mut(&mut self, node: &mut syn::ExprBlock) {
         if let Some(l) = &node.label {
             self.local_labels.push(l.name.ident.to_string());
-            syn::visit::visit_expr_block(self, node);
+            syn::visit_mut::visit_expr_block_mut(self, node);
             self.local_labels.pop();
         } else {
-            syn::visit::visit_expr_block(self, node);
+            syn::visit_mut::visit_expr_block_mut(self, node);
         }
-    }
-
-    fn visit_expr_break(&mut self, node: &'ast syn::ExprBreak) {
-        self.check_jump(&node.label, "break", node);
-        syn::visit::visit_expr_break(self, node);
-    }
-
-    fn visit_expr_continue(&mut self, node: &'ast syn::ExprContinue) {
-        self.check_jump(&node.label, "continue", node);
-        syn::visit::visit_expr_continue(self, node);
     }
 
     // Separate scopes: break/continue and yield_! inside these belong to
     // them, not to the coroutine.
-    skip_nested_scopes!(Visit);
+    skip_nested_scopes!(VisitMut);
 }
 
 /// Turns a match arm body into a statement for lowering: the arm's value
@@ -2591,7 +2747,8 @@ mod tests {
                 }
             }
         });
-        assert!(lower(&[], &[], &block).is_ok());
+        let cfg = lower_args(&[], &block);
+        assert!(cfg.opaque_jumps.is_empty());
     }
 
     #[test]
@@ -3099,8 +3256,20 @@ mod tests {
         );
     }
 
+    /// The single block owning a jump marker, with its jump indices.
+    fn jump_owner(cfg: &Cfg) -> &Block {
+        let owners: Vec<&Block> = cfg.blocks.iter().filter(|b| !b.jumps.is_empty()).collect();
+        assert_eq!(owners.len(), 1, "expected exactly one jump-owning block");
+        owners[0]
+    }
+
+    fn stmt_text(b: &Block) -> String {
+        let stmts = &b.stmts;
+        quote::quote!(#(#stmts)*).to_string()
+    }
+
     #[test]
-    fn opaque_break_into_expanded_loop_is_rejected() {
+    fn opaque_break_into_expanded_loop_is_rewritten() {
         let block: syn::Block = parse_quote!({
             loop {
                 yield_!(1);
@@ -3108,13 +3277,32 @@ mod tests {
                     break;
                 }
             }
+            after();
         });
-        let err = error_of(&block);
-        assert!(err.to_string().contains("does not contain yield_!"));
+        let cfg = lower_ok(&block);
+        assert_eq!(cfg.opaque_jumps.len(), 1);
+        let OpaqueJumpKind::Goto {
+            target,
+            store: None,
+        } = cfg.opaque_jumps[0].kind
+        else {
+            panic!("expected a plain goto jump: {:?}", cfg.opaque_jumps[0]);
+        };
+        // The target is the loop's exit block, reachable only through
+        // the jump edge, and kept a variant.
+        let exit = &cfg.blocks[target];
+        assert!(!exit.inline, "jump targets must stay variants");
+        assert_eq!(stmt_text(exit), "after () ;");
+        // The rewritten statement carries the marker; the block records
+        // the edge.
+        let owner = jump_owner(&cfg);
+        assert_eq!(owner.jumps, vec![0]);
+        assert!(stmt_text(owner).contains("__baregen_jump ! (0)"));
+        assert!(matches!(owner.terminator, Terminator::Goto(_)));
     }
 
     #[test]
-    fn opaque_labeled_jumps_into_expanded_loop_are_rejected() {
+    fn opaque_labeled_jumps_into_expanded_loop_are_rewritten() {
         let block: syn::Block = parse_quote!({
             'a: loop {
                 yield_!(1);
@@ -3122,25 +3310,138 @@ mod tests {
                     break 'a;
                 }
             }
+            after();
         });
-        assert!(
-            error_of(&block)
-                .to_string()
-                .contains("does not contain yield_!")
-        );
+        let cfg = lower_ok(&block);
+        assert_eq!(cfg.opaque_jumps.len(), 1);
+        let OpaqueJumpKind::Goto { target, .. } = cfg.opaque_jumps[0].kind else {
+            panic!("expected a goto jump");
+        };
+        assert_eq!(stmt_text(&cfg.blocks[target]), "after () ;");
+
         let block: syn::Block = parse_quote!({
             'a: loop {
                 yield_!(1);
                 loop {
-                    continue 'a;
+                    if c {
+                        continue 'a;
+                    }
+                    break;
                 }
             }
+        });
+        let cfg = lower_ok(&block);
+        assert_eq!(cfg.opaque_jumps.len(), 1);
+        let OpaqueJumpKind::Goto { target, .. } = cfg.opaque_jumps[0].kind else {
+            panic!("expected a goto jump");
+        };
+        // `continue 'a` targets the expanded loop's header (the block
+        // yielding 1); the inner loop's own `break` stays untouched.
+        assert!(matches!(
+            cfg.blocks[target].terminator,
+            Terminator::Yield { .. }
+        ));
+        assert!(stmt_text(jump_owner(&cfg)).contains("break ;"));
+    }
+
+    #[test]
+    fn opaque_valued_break_into_let_initializer_loop_stores_and_jumps() {
+        let block: syn::Block = parse_quote!({
+            let x: u32 = loop {
+                let r = yield_!(1);
+                if r > 3 {
+                    break r;
+                }
+            };
+            f(x);
+        });
+        let cfg = lower_ok(&block);
+        assert_eq!(cfg.opaque_jumps.len(), 1);
+        let OpaqueJumpKind::Goto {
+            target,
+            store: Some(s),
+        } = cfg.opaque_jumps[0].kind
+        else {
+            panic!("expected a storing goto jump: {:?}", cfg.opaque_jumps[0]);
+        };
+        assert_eq!(s, binding(&cfg, "x"));
+        assert_eq!(stmt_text(&cfg.blocks[target]), "f (x) ;");
+        // The jump site binds the destination with a synthesized `let`
+        // (annotation included) and defines it in the jumping block.
+        let owner = jump_owner(&cfg);
+        assert!(owner.defs.contains(&s));
+        assert!(stmt_text(owner).contains("let x : u32 = r ;"));
+    }
+
+    #[test]
+    fn opaque_valued_break_out_of_tail_loop_completes() {
+        let block: syn::Block = parse_quote!({
+            loop {
+                let r = yield_!(1);
+                if r > 3 {
+                    break r;
+                }
+            }
+        });
+        let cfg = lower_ok(&block);
+        assert_eq!(cfg.opaque_jumps.len(), 1);
+        assert!(matches!(
+            cfg.opaque_jumps[0].kind,
+            OpaqueJumpKind::Complete
+        ));
+        // The marker carries the completion value.
+        assert!(stmt_text(jump_owner(&cfg)).contains("__baregen_jump ! (0 , r)"));
+    }
+
+    #[test]
+    fn opaque_valued_break_into_statement_loop_is_rejected() {
+        let block: syn::Block = parse_quote!({
+            loop {
+                yield_!(1);
+                if c {
+                    break 5;
+                }
+            }
+            after();
         });
         assert!(
             error_of(&block)
                 .to_string()
-                .contains("does not contain yield_!")
+                .contains("`break` with a value")
         );
+    }
+
+    #[test]
+    fn opaque_jump_resolution_errors_match_native_ones() {
+        let block: syn::Block = parse_quote!({
+            yield_!(1);
+            if c {
+                break;
+            }
+            after();
+        });
+        assert!(error_of(&block).to_string().contains("outside of a loop"));
+
+        let block: syn::Block = parse_quote!({
+            loop {
+                yield_!(1);
+                if c {
+                    break 'nowhere;
+                }
+            }
+        });
+        assert!(error_of(&block).to_string().contains("undeclared label"));
+
+        let block: syn::Block = parse_quote!({
+            'b: {
+                yield_!(1);
+                if c {
+                    continue 'b;
+                }
+                after();
+            }
+        });
+        assert!(error_of(&block).to_string().contains("labeled block"));
     }
 
     #[test]
@@ -3153,7 +3454,8 @@ mod tests {
                 }
             }
         });
-        assert!(lower(&[], &[], &block).is_ok());
+        let cfg = lower_args(&[], &block);
+        assert!(cfg.opaque_jumps.is_empty());
     }
 
     #[test]

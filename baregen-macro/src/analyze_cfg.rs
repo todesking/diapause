@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use quote::format_ident;
 use syn::visit::Visit;
 
-use crate::cfg::{BindingId, BindingKind, BlockId, BorrowSource, Cfg, Terminator, TySource};
+use crate::cfg::{
+    BindingId, BindingKind, BlockId, BorrowSource, Cfg, OpaqueJumpKind, Terminator, TySource,
+};
 use crate::lower::{ErrorSink, UseCollector};
 
 /// Signature-level information about one function argument, parallel to
@@ -123,6 +125,7 @@ impl<'a> Context<'a> {
         let live_in = self.liveness(&uses);
         let removed_stmts = self.removed_statements(&rebuilds);
         let variants = self.build_variants(&live_in, &rebuilds);
+        self.check_jump_shadowing(&variants);
         self.errors.into_result(Analysis {
             variants,
             removed_stmts,
@@ -201,12 +204,15 @@ impl Context<'_> {
 
     /// Standard backward dataflow to a fixed point (the CFG has back
     /// edges): `live_in(B) = use(B) ∪ (∪ live_in(succ) ∖ def(B))`.
+    /// Successors include opaque-jump edges: a jump can fire anywhere in
+    /// the block, so its target's live-ins are (conservatively) live
+    /// through the whole block.
     fn liveness(&self, uses: &[BTreeSet<BindingId>]) -> Vec<BTreeSet<BindingId>> {
         let n = self.cfg.blocks.len();
         let mut live_in: Vec<BTreeSet<BindingId>> = vec![BTreeSet::new(); n];
         fixpoint((0..n).rev(), |b| {
             let mut set = BTreeSet::new();
-            for s in self.cfg.blocks[b].terminator.successors() {
+            for s in self.cfg.successors(b) {
                 set.extend(live_in[s].iter().copied());
             }
             for d in &self.cfg.blocks[b].defs {
@@ -469,6 +475,52 @@ impl Context<'_> {
         }
     }
 
+    /// Rejects an opaque-statement jump when a binding declared inside
+    /// the statement shares its name with a field of the target variant:
+    /// the transition moves the fields by name from the jump site, so it
+    /// would capture the inner (shadowing) binding instead of the stored
+    /// one. Conservative: the inner binding is flagged even if it does
+    /// not actually enclose the jump within the statement.
+    fn check_jump_shadowing(&mut self, variants: &[Variant]) {
+        let cfg = self.cfg;
+        let mut reported: BTreeSet<String> = BTreeSet::new();
+        for blk in &cfg.blocks {
+            for &j in &blk.jumps {
+                let jump = &cfg.opaque_jumps[j];
+                let OpaqueJumpKind::Goto { target, store } = jump.kind else {
+                    // Completions move nothing; the value is evaluated
+                    // in place.
+                    continue;
+                };
+                let i = variants
+                    .binary_search_by_key(&target, |v| v.block)
+                    .expect("BUG: opaque jump into an inline block");
+                for ident in &jump.shadowed {
+                    // The jump's own store binding is provided by a
+                    // fresh `let` synthesized at the jump site, so a
+                    // same-named user binding cannot be captured.
+                    if store.is_some_and(|s| cfg.bindings[s.0].ident == *ident) {
+                        continue;
+                    }
+                    let name = ident.to_string();
+                    if variants[i].fields.iter().any(|f| f.ident == *ident)
+                        && reported.insert(name.clone())
+                    {
+                        self.err(
+                            ident.span(),
+                            format!(
+                                "`{name}` is also stored in the coroutine state by the \
+                                 `break`/`continue` in this statement, which would capture \
+                                 this inner `{name}` instead of the stored one; rename the \
+                                 inner binding"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// The type of a binding: signature type for arguments, the resume
     /// type for unannotated resume bindings, otherwise the recursively
     /// resolved syntactic type source. Move dependencies always point at
@@ -600,7 +652,9 @@ fn reverse_postorder(cfg: &Cfg) -> Vec<BlockId> {
             continue;
         }
         stack.push((b, true));
-        for s in cfg.blocks[b].terminator.successors().rev() {
+        // Jump edges included: a block reachable only through an opaque
+        // jump still becomes a variant and needs a name.
+        for s in cfg.successors(b).rev() {
             if !visited[s] {
                 stack.push((s, false));
             }
