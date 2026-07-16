@@ -41,6 +41,11 @@ pub enum BindingKind {
     ArmPat,
     /// Synthetic `__iter{k}` binding holding a `for` loop's iterator.
     ForIter,
+    /// Synthetic `__dg{k}` binding holding the coroutine a `yield_all!`
+    /// delegates to. Its type follows the operand variable; an
+    /// unresolvable type gets a dedicated error message that does not
+    /// leak the synthetic name.
+    Delegate,
     /// Bound by a destructuring `for` loop pattern. Component types
     /// cannot be derived, so it must not cross a state boundary.
     ForPat,

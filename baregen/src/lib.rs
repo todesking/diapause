@@ -221,3 +221,37 @@ macro_rules! yield_ {
         ::core::compile_error!("yield_! may only be used inside a #[baregen::coroutine] function")
     };
 }
+
+/// Delegates to another coroutine inside a `#[baregen::coroutine]`
+/// function (the analogue of Python's `yield from`).
+///
+/// `yield_all!(sub)` runs the coroutine held by the variable `sub` to
+/// completion: every value it yields is yielded to the caller, every
+/// resume value is forwarded back into it, and the whole expression
+/// evaluates to its completion value. The inner coroutine's yield and
+/// resume types must match the outer ones, and it must not have been
+/// started yet (`start` panics otherwise).
+///
+/// The operand must be a variable whose type is syntactically known
+/// (bind the coroutine with a type annotation first); passing an
+/// arbitrary expression is a compile error. Supported positions are a
+/// statement (`yield_all!(sub);`, completion value discarded), a whole
+/// `let` initializer with a type annotation
+/// (`let x: T = yield_all!(sub);`), and the function's trailing
+/// expression.
+///
+/// The inner coroutine's state enum is stored by value inside the outer
+/// one, so `Clone` and serde derives compose: a coroutine suspended
+/// inside a delegation serializes with the nested state included.
+///
+/// Like [`yield_!`], this macro is consumed by the `#[coroutine]`
+/// transformation and never expands on its own; using it outside a
+/// `#[baregen::coroutine]` function is a compile error.
+#[macro_export]
+macro_rules! yield_all {
+    ($($tt:tt)*) => {
+        ::core::compile_error!(
+            "yield_all! may only be used inside a #[baregen::coroutine] function"
+        )
+    };
+}

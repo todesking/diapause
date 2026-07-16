@@ -23,6 +23,20 @@ struct ResumeBindingSpec {
     ty: Option<syn::Type>,
 }
 
+/// What a yield does with its resume value.
+enum ResumeTarget {
+    /// `yield_!(expr);` — the resume value is dropped.
+    Discard,
+    /// `let x = yield_!(expr);` — a fresh binding.
+    Bind(ResumeBindingSpec),
+    /// `yield_all!`'s internal loop: the resume value re-defines the
+    /// existing `__rv{k}` binding so it can be carried around the
+    /// delegation loop's back edge without a reassignment (which the
+    /// block-level use over-approximation would treat as a use, keeping
+    /// the moved-out value live across the yield).
+    Rebind(BindingId),
+}
+
 /// Accumulates zero or more `syn::Error`s, combining them in push order
 /// so the emitted `compile_error!`s appear in the order the errors were
 /// found.
@@ -145,6 +159,12 @@ pub(crate) struct Lowerer {
     current: BlockId,
     /// Number of `__iter{k}` bindings created so far.
     for_count: usize,
+    /// Number of `yield_all!` expansions so far (numbers `__dg{k}` etc.).
+    yield_all_count: usize,
+    /// Nonzero while lowering a `yield_all!` expansion; gates the
+    /// internal `__rv{k} = yield_!(..);` rebind form, which is not part
+    /// of the user-facing syntax.
+    yield_all_depth: usize,
 }
 
 impl Lowerer {
@@ -157,6 +177,8 @@ impl Lowerer {
             errors: ErrorSink::default(),
             current: 0,
             for_count: 0,
+            yield_all_count: 0,
+            yield_all_depth: 0,
         };
         for arg in args {
             let id = BindingId(lw.bindings.len());
@@ -365,6 +387,9 @@ const ERR_LET_CHAIN: &str = "a let-chain condition is not supported when the bod
 const ERR_FOR_HEAD: &str = "yield_! in a `for` loop's iterator expression is not supported";
 const ERR_BREAK_VALUE: &str = "`break` with a value can only target a loop containing \
      yield_! when the loop is a `let` initializer or the function's trailing expression";
+const ERR_YIELD_ALL_OPERAND: &str = "yield_all! takes a single variable holding the \
+     coroutine to delegate to; bind it first: `let sub: SubTy = make_sub(..);` and then \
+     `yield_all!(sub)`";
 
 fn for_local_borrow_err(name: &syn::Ident) -> String {
     format!(
@@ -390,12 +415,19 @@ pub fn is_yield_macro(mac: &syn::Macro) -> bool {
         .is_some_and(|seg| seg.ident == "yield_")
 }
 
-/// Textually scans a foreign macro's tokens for `yield_ !`.
+pub fn is_yield_all_macro(mac: &syn::Macro) -> bool {
+    mac.path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "yield_all")
+}
+
+/// Textually scans a foreign macro's tokens for `yield_ !` / `yield_all !`.
 fn tokens_contain_yield(tokens: proc_macro2::TokenStream) -> bool {
     let mut iter = tokens.into_iter().peekable();
     while let Some(tt) = iter.next() {
         match tt {
-            proc_macro2::TokenTree::Ident(id) if id == "yield_" => {
+            proc_macro2::TokenTree::Ident(id) if id == "yield_" || id == "yield_all" => {
                 if matches!(
                     iter.peek(),
                     Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '!'
@@ -431,10 +463,11 @@ macro_rules! skip_nested_scopes {
 }
 pub(crate) use skip_nested_scopes;
 
-/// Finds genuine `yield_!` invocations. Closures, async blocks, and
-/// nested items are separate scopes and pass through. Foreign macros
-/// whose tokens mention yield_! do not count as containing a yield;
-/// they are rejected separately.
+/// Finds genuine `yield_!` / `yield_all!` invocations (the latter
+/// desugars into yields). Closures, async blocks, and nested items are
+/// separate scopes and pass through. Foreign macros whose tokens mention
+/// yield_! do not count as containing a yield; they are rejected
+/// separately.
 #[derive(Default)]
 struct ContainsYield {
     found: bool,
@@ -442,7 +475,7 @@ struct ContainsYield {
 
 impl<'ast> Visit<'ast> for ContainsYield {
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        if is_yield_macro(mac) {
+        if is_yield_macro(mac) || is_yield_all_macro(mac) {
             self.found = true;
         }
     }
@@ -479,6 +512,11 @@ impl<'ast> Visit<'ast> for YieldBan<'_> {
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         if is_yield_macro(mac) {
             self.record(syn::Error::new_spanned(mac, self.msg));
+        } else if is_yield_all_macro(mac) {
+            // The positional restrictions apply identically; name the
+            // macro the user actually wrote.
+            let msg = self.msg.replace("yield_!", "yield_all!");
+            self.record(syn::Error::new_spanned(mac, msg));
         } else if tokens_contain_yield(mac.tokens.clone()) {
             self.record(syn::Error::new(mac.span(), ERR_FOREIGN_MACRO));
         }
@@ -554,6 +592,15 @@ impl Lowerer {
                     has_value_tail = true;
                     self.lower_tail_expr(stmt, e, ctx);
                 }
+                // A trailing macro invocation parses as `Stmt::Macro`,
+                // not as a trailing expression; `yield_all!(g)` is the
+                // one macro that produces a value there.
+                syn::Stmt::Macro(sm)
+                    if i + 1 == n && sm.semi_token.is_none() && is_yield_all_macro(&sm.mac) =>
+                {
+                    has_value_tail = true;
+                    self.lower_yield_all(&sm.mac, ctx);
+                }
                 _ => self.lower_stmt(stmt),
             }
         }
@@ -612,6 +659,9 @@ impl Lowerer {
             syn::Expr::Match(em) => self.lower_match(em, ctx),
             syn::Expr::Loop(el) => self.lower_loop(el, ctx),
             syn::Expr::Block(eb) => self.lower_block_stmt(eb, ctx),
+            syn::Expr::Macro(em) if is_yield_all_macro(&em.mac) => {
+                self.lower_yield_all(&em.mac, ctx);
+            }
             // `while` and `for` loops always evaluate to `()`: lower as
             // a statement, then produce `()` at the exit.
             syn::Expr::While(_) | syn::Expr::ForLoop(_) => {
@@ -671,7 +721,12 @@ impl Lowerer {
                 if sm.semi_token.is_none() {
                     return self.err(syn::Error::new_spanned(sm, ERR_TRAILING_YIELD));
                 }
-                self.lower_yield(&sm.mac, None);
+                self.lower_yield(&sm.mac, ResumeTarget::Discard);
+            }
+            // `yield_all!(g);` in statement position (a trailing
+            // `yield_all!(g)` is routed by `lower_stmt_list` instead).
+            syn::Stmt::Macro(sm) if is_yield_all_macro(&sm.mac) => {
+                self.lower_yield_all(&sm.mac, TailCtx::Discard);
             }
             // The same, reconstructed as an expression statement (arm
             // bodies are wrapped this way).
@@ -679,7 +734,10 @@ impl Lowerer {
                 if semi.is_none() {
                     return self.err(syn::Error::new_spanned(em, ERR_TRAILING_YIELD));
                 }
-                self.lower_yield(&em.mac, None);
+                self.lower_yield(&em.mac, ResumeTarget::Discard);
+            }
+            syn::Stmt::Expr(syn::Expr::Macro(em), _) if is_yield_all_macro(&em.mac) => {
+                self.lower_yield_all(&em.mac, TailCtx::Discard);
             }
             // `let r = yield_!(expr);`
             syn::Stmt::Local(local)
@@ -689,6 +747,23 @@ impl Lowerer {
                 ) =>
             {
                 self.lower_let_yield(local);
+            }
+            // `let x: T = yield_all!(g);`
+            syn::Stmt::Local(local)
+                if matches!(
+                    local.init.as_ref().map(|i| &*i.expr),
+                    Some(syn::Expr::Macro(m)) if is_yield_all_macro(&m.mac)
+                ) =>
+            {
+                self.lower_let_yield_all(local);
+            }
+            // `__rv{k} = yield_!(__y{k});` — only synthesized inside a
+            // yield_all! expansion, never accepted from user code.
+            syn::Stmt::Expr(syn::Expr::Assign(assign), _)
+                if self.yield_all_depth > 0
+                    && matches!(&*assign.right, syn::Expr::Macro(m) if is_yield_macro(&m.mac)) =>
+            {
+                self.lower_rebind_yield(assign);
             }
             syn::Stmt::Expr(syn::Expr::Break(b), _) => self.lower_break(b),
             syn::Stmt::Expr(syn::Expr::Continue(c), _) => self.lower_continue(c),
@@ -729,7 +804,7 @@ impl Lowerer {
                 return self.err(syn::Error::new_spanned(other, ERR_SIMPLE_BINDING));
             }
         };
-        self.lower_yield(&m.mac, Some(binding));
+        self.lower_yield(&m.mac, ResumeTarget::Bind(binding));
     }
 
     /// `let x[: T] = <control-flow expr containing yield_!>;` — the
@@ -755,6 +830,14 @@ impl Lowerer {
         ) {
             return self.err(syn::Error::new_spanned(local, ERR_VALUE_POSITION));
         }
+        self.lower_value_let(local, |lw, ctx| lw.lower_value_expr(expr, ctx));
+    }
+
+    /// Sets up the destination of a `let` whose initializer is lowered
+    /// into CFG structure (a value-position yield or `yield_all!`) and
+    /// runs `lower` with the resulting context: `_` discards the value
+    /// and any other non-identifier pattern is an error.
+    fn lower_value_let(&mut self, local: &syn::Local, lower: impl FnOnce(&mut Self, TailCtx)) {
         let (pat, annotation) = match &local.pat {
             syn::Pat::Type(pt) => (&*pt.pat, Some((*pt.ty).clone())),
             other => (other, None),
@@ -762,7 +845,7 @@ impl Lowerer {
         // `let _ = <init>;` binds nothing: the arm values are simply
         // discarded, like a statement-position construct.
         if matches!(pat, syn::Pat::Wild(_)) {
-            return self.lower_value_expr(expr, TailCtx::Discard);
+            return lower(self, TailCtx::Discard);
         }
         let syn::Pat::Ident(pi) = pat else {
             return self.err(syn::Error::new_spanned(pat, ERR_VALUE_LET_BINDING));
@@ -785,7 +868,7 @@ impl Lowerer {
             borrow: self.classify_borrow(None, annotation.as_ref()),
             def_stmt: None,
         });
-        self.lower_value_expr(expr, TailCtx::Store(id));
+        lower(self, TailCtx::Store(id));
         self.scopes
             .last_mut()
             .expect("BUG: no scope")
@@ -843,7 +926,7 @@ impl Lowerer {
 
     /// Ends the current block with a `Yield` terminator and switches to
     /// the resume-point continuation block.
-    fn lower_yield(&mut self, mac: &syn::Macro, binding: Option<ResumeBindingSpec>) {
+    fn lower_yield(&mut self, mac: &syn::Macro, target: ResumeTarget) {
         let value: syn::Expr = if mac.tokens.is_empty() {
             syn::parse_quote!(())
         } else {
@@ -860,25 +943,179 @@ impl Lowerer {
         self.check_no_yield(&value, ERR_STMT_POSITION);
         self.record_expr_uses(&value, self.current);
         let next = self.new_block(true);
-        let resume_binding = binding.map(|spec| {
-            let id = self.define(&spec.ident, next, BindingKind::Resume, None);
-            let b = &mut self.bindings[id.0];
-            b.mutability = spec.mutability;
-            if let Some(t) = &spec.ty {
-                b.ty = TySource::Known(t.clone());
+        let resume_binding = match target {
+            ResumeTarget::Discard => None,
+            ResumeTarget::Bind(spec) => {
+                let id = self.define(&spec.ident, next, BindingKind::Resume, None);
+                let b = &mut self.bindings[id.0];
+                b.mutability = spec.mutability;
+                if let Some(t) = &spec.ty {
+                    b.ty = TySource::Known(t.clone());
+                }
+                Some(ResumeBinding {
+                    binding: id,
+                    mutability: spec.mutability,
+                    ty: spec.ty,
+                })
             }
-            ResumeBinding {
-                binding: id,
-                mutability: spec.mutability,
-                ty: spec.ty,
+            // The existing binding is re-defined (not read) by the
+            // resume transition, exactly like a fresh resume binding.
+            ResumeTarget::Rebind(id) => {
+                self.blocks[next].defs.insert(id);
+                Some(ResumeBinding {
+                    binding: id,
+                    mutability: None,
+                    ty: None,
+                })
             }
-        });
+        };
         self.terminate(Terminator::Yield {
             value,
             resume_binding,
             next,
         });
         self.current = next;
+    }
+
+    /// `yield_all!(g)` — delegates to the coroutine held by the variable
+    /// `g`: each inner yield is forwarded to the caller, each resume
+    /// value is forwarded back in, and the inner completion value is the
+    /// expansion's value. Desugared into source that the ordinary
+    /// machinery lowers:
+    ///
+    /// ```text
+    /// let mut __dg0 = g;
+    /// match ::baregen::Coroutine::start(&mut __dg0) {
+    ///     Complete(__v0) => __v0,
+    ///     Yielded(__y0) => {
+    ///         let __rv0 = yield_!(__y0);
+    ///         loop {
+    ///             match ::baregen::Coroutine::resume(&mut __dg0, __rv0) {
+    ///                 Complete(__v0) => break __v0,
+    ///                 Yielded(__y0) => {
+    ///                     __rv0 = yield_!(__y0); // internal rebind form
+    ///                 }
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Only `__dg{k}` and `__rv{k}` are live at the delegation loop's
+    /// header: the coroutine's type follows the operand variable (the
+    /// usual known-variable move rule — hence the variable-only operand
+    /// restriction) and the resume value's type defaults to the outer
+    /// resume type like any resume binding. Everything else (`__y{k}`,
+    /// `__v{k}`) is consumed before the next transition. A yield/resume
+    /// type mismatch between the inner and outer coroutine surfaces as
+    /// an ordinary type error in the generated code.
+    fn lower_yield_all(&mut self, mac: &syn::Macro, ctx: TailCtx) {
+        let operand: Option<syn::Expr> = if mac.tokens.is_empty() {
+            None
+        } else {
+            mac.parse_body().ok()
+        };
+        let Some(operand) = operand else {
+            return self.err(syn::Error::new(mac.span(), ERR_YIELD_ALL_OPERAND));
+        };
+        let inner = strip_parens(&operand);
+        if !matches!(inner, syn::Expr::Path(p) if p.qself.is_none() && p.path.get_ident().is_some())
+        {
+            return self.err(syn::Error::new_spanned(inner, ERR_YIELD_ALL_OPERAND));
+        }
+        let span = inner.span();
+        let k = self.yield_all_count;
+        self.yield_all_count += 1;
+        let dg = syn::Ident::new(&format!("__dg{k}"), span);
+        let y = syn::Ident::new(&format!("__y{k}"), span);
+        let rv = syn::Ident::new(&format!("__rv{k}"), span);
+        let v = syn::Ident::new(&format!("__v{k}"), span);
+
+        // In `Discard` context the completion values are dropped and the
+        // loop breaks without a value (a valued `break` may not target a
+        // statement-position loop).
+        let em: syn::ExprMatch = if matches!(ctx, TailCtx::Discard) {
+            syn::parse_quote_spanned!(span => match ::baregen::Coroutine::start(&mut #dg) {
+                ::baregen::CoroutineState::Complete(_) => {}
+                ::baregen::CoroutineState::Yielded(#y) => {
+                    let #rv = yield_!(#y);
+                    loop {
+                        match ::baregen::Coroutine::resume(&mut #dg, #rv) {
+                            ::baregen::CoroutineState::Complete(_) => break,
+                            ::baregen::CoroutineState::Yielded(#y) => {
+                                #rv = yield_!(#y);
+                            }
+                        }
+                    }
+                }
+            })
+        } else {
+            syn::parse_quote_spanned!(span => match ::baregen::Coroutine::start(&mut #dg) {
+                ::baregen::CoroutineState::Complete(#v) => #v,
+                ::baregen::CoroutineState::Yielded(#y) => {
+                    let #rv = yield_!(#y);
+                    loop {
+                        match ::baregen::Coroutine::resume(&mut #dg, #rv) {
+                            ::baregen::CoroutineState::Complete(#v) => break #v,
+                            ::baregen::CoroutineState::Yielded(#y) => {
+                                #rv = yield_!(#y);
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        // The synthetic bindings get their own scope so the enclosing
+        // code never sees them.
+        self.in_scope(|lw| {
+            // `let mut __dg{k} = <operand>;` — the coroutine moves into
+            // the state under a fresh name; its type follows the operand.
+            let ty = lw.infer_ty_source(inner);
+            let stmt: syn::Stmt = syn::parse_quote_spanned!(span => let mut #dg = #inner;);
+            lw.record_stmt_uses(&stmt);
+            let stmt_idx = lw.blocks[lw.current].stmts.len();
+            let id = lw.define(&dg, lw.current, BindingKind::Delegate, Some(stmt_idx));
+            let b = &mut lw.bindings[id.0];
+            b.mutability = Some(syn::Token![mut](span));
+            b.ty = ty;
+            lw.blocks[lw.current].stmts.push(stmt);
+
+            lw.yield_all_depth += 1;
+            lw.lower_match(&em, ctx);
+            lw.yield_all_depth -= 1;
+        });
+    }
+
+    /// `let x: T = yield_all!(g);` — the let-initializer form. The value
+    /// crosses the join after the delegation loop into a state variant,
+    /// so the annotation is required by the usual value-`let` rule.
+    fn lower_let_yield_all(&mut self, local: &syn::Local) {
+        let init = local.init.as_ref().expect("BUG: checked by caller");
+        if init.diverge.is_some() {
+            return self.err(syn::Error::new_spanned(&init.expr, ERR_LET_ELSE_INIT));
+        }
+        let syn::Expr::Macro(m) = &*init.expr else {
+            unreachable!()
+        };
+        self.lower_value_let(local, |lw, ctx| lw.lower_yield_all(&m.mac, ctx));
+    }
+
+    /// The internal `__rv{k} = yield_!(__y{k});` form synthesized by
+    /// `lower_yield_all` (and gated by `yield_all_depth`): a yield whose
+    /// resume value re-defines the existing `__rv{k}` binding.
+    fn lower_rebind_yield(&mut self, assign: &syn::ExprAssign) {
+        let syn::Expr::Macro(m) = &*assign.right else {
+            unreachable!("BUG: checked by the caller")
+        };
+        let syn::Expr::Path(p) = &*assign.left else {
+            unreachable!("BUG: the rebind target is a synthesized identifier")
+        };
+        let ident = p.path.get_ident().expect("BUG: synthesized identifier");
+        let id = self
+            .resolve(&ident.to_string())
+            .expect("BUG: rebind target not in scope");
+        self.lower_yield(&m.mac, ResumeTarget::Rebind(id));
     }
 
     fn lower_break(&mut self, b: &syn::ExprBreak) {
@@ -2970,6 +3207,134 @@ mod tests {
         });
         let err = error_of(&block);
         assert_eq!(err.into_iter().count(), 2);
+    }
+
+    // === yield_all! delegation ===
+
+    #[test]
+    fn yield_all_desugars_into_a_delegation_loop() {
+        let block: syn::Block = parse_quote!({
+            let g: G = mk();
+            yield_all!(g);
+            done();
+        });
+        let cfg = lower_ok(&block);
+        // The coroutine moves into a synthetic Delegate binding whose
+        // type follows the operand variable.
+        let dg = binding(&cfg, "__dg0");
+        assert_eq!(cfg.bindings[dg.0].kind, BindingKind::Delegate);
+        assert!(matches!(cfg.bindings[dg.0].ty, TySource::Moved(id) if id == binding(&cfg, "g")));
+        // The expansion yields twice (peeled start + loop) and both
+        // yields resume into the same `__rv0` binding (rebind form).
+        let rv = binding(&cfg, "__rv0");
+        let resume_targets: Vec<BindingId> = cfg
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.terminator {
+                Terminator::Yield {
+                    resume_binding: Some(rb),
+                    ..
+                } => Some(rb.binding),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resume_targets, [rv, rv]);
+        // The loop's rebind resume point re-defines __rv0.
+        let rebind_resume = cfg
+            .blocks
+            .iter()
+            .filter(|b| b.resume_point)
+            .nth(1)
+            .unwrap();
+        assert!(rebind_resume.defs.contains(&rv));
+    }
+
+    #[test]
+    fn yield_all_synthetic_names_are_numbered_per_expansion() {
+        let block: syn::Block = parse_quote!({
+            let g1: G = mk();
+            yield_all!(g1);
+            let g2: G = mk();
+            yield_all!(g2);
+        });
+        let cfg = lower_ok(&block);
+        binding(&cfg, "__dg0");
+        binding(&cfg, "__dg1");
+        binding(&cfg, "__rv0");
+        binding(&cfg, "__rv1");
+    }
+
+    #[test]
+    fn yield_all_direct_expression_is_rejected() {
+        let block: syn::Block = parse_quote!({
+            yield_all!(mk());
+        });
+        let msg = error_of(&block).to_string();
+        assert!(msg.contains("single variable"), "got: {msg}");
+        let block: syn::Block = parse_quote!({
+            yield_all!();
+        });
+        assert!(error_of(&block).to_string().contains("single variable"));
+    }
+
+    #[test]
+    fn yield_all_let_destructuring_binding_is_rejected() {
+        let block: syn::Block = parse_quote!({
+            let (a, b) = yield_all!(g);
+        });
+        assert!(error_of(&block).to_string().contains("simple identifier"));
+    }
+
+    #[test]
+    fn yield_all_in_expression_position_is_rejected() {
+        let block: syn::Block = parse_quote!({
+            f(yield_all!(g));
+        });
+        assert!(error_of(&block).to_string().contains("statement position"));
+    }
+
+    #[test]
+    fn yield_all_in_condition_is_rejected() {
+        let block: syn::Block = parse_quote!({
+            if yield_all!(g) {
+                f();
+            }
+        });
+        let msg = error_of(&block).to_string();
+        assert!(msg.contains("yield_all! in a condition"), "got: {msg}");
+    }
+
+    #[test]
+    fn yield_all_in_foreign_macro_is_rejected() {
+        let block: syn::Block = parse_quote!({
+            println!("{}", yield_all!(g));
+        });
+        assert!(error_of(&block).to_string().contains("another macro"));
+    }
+
+    #[test]
+    fn yield_all_in_let_else_initializer_is_rejected() {
+        let block: syn::Block = parse_quote!({
+            let x = yield_all!(g) else {
+                return;
+            };
+        });
+        assert!(
+            error_of(&block)
+                .to_string()
+                .contains("initializer of `let ... else`")
+        );
+    }
+
+    #[test]
+    fn user_written_rebind_yield_is_still_rejected() {
+        // The internal `x = yield_!(..)` form must not leak into the
+        // user-facing syntax.
+        let block: syn::Block = parse_quote!({
+            let mut x: u32 = 0;
+            x = yield_!(1);
+        });
+        assert!(error_of(&block).to_string().contains("statement position"));
     }
 
     // === Argument patterns ===

@@ -421,6 +421,13 @@ impl Context<'_> {
                              an explicit type annotation: \
                              `let items: Type = ...; for x in items { ... }`"
                                 .to_string()
+                        } else if binding.kind == BindingKind::Delegate {
+                            // The span points at the yield_all! operand.
+                            "cannot determine the type of the coroutine delegated to by \
+                             yield_all!, which is stored in the state while it runs; bind \
+                             it to a variable with an explicit type annotation: \
+                             `let sub: Type = make_sub(..);`"
+                                .to_string()
                         } else {
                             format!(
                                 "cannot determine the type of `{name}`, which is held across \
@@ -1393,6 +1400,47 @@ mod tests {
         });
         let msg = error_of(&block).to_string();
         assert!(msg.contains("two different bindings named `x`"), "got: {msg}");
+    }
+
+    // === yield_all! delegation ===
+
+    #[test]
+    fn yield_all_stores_the_coroutine_and_the_resume_value() {
+        let block: syn::Block = parse_quote!({
+            let g: G = mk();
+            let x: u32 = yield_all!(g);
+            f(x);
+        });
+        let resume_ty: syn::Type = parse_quote!(u32);
+        let (cfg, a) = run_args(&[], &block, &resume_ty);
+        // Both suspension points store only the delegated coroutine,
+        // with the type propagated from the operand variable.
+        assert_eq!(resume_fields(&cfg, &a, 0), ["__dg0"]);
+        assert_eq!(resume_fields(&cfg, &a, 1), ["__dg0"]);
+        let g_ty: syn::Type = parse_quote!(G);
+        assert_eq!(field(&a, resume_ids(&cfg)[0], "__dg0").ty, g_ty);
+        // The delegation loop's header additionally carries the resume
+        // value, typed by the coroutine's resume type.
+        let header = a
+            .variants
+            .iter()
+            .find(|v| v.fields.iter().any(|f| f.ident == "__rv0"))
+            .expect("the loop header should hold __rv0");
+        let names: Vec<String> = header.fields.iter().map(|f| f.ident.to_string()).collect();
+        assert_eq!(names, ["__dg0", "__rv0"]);
+        assert_eq!(field(&a, header.block, "__rv0").ty, resume_ty);
+    }
+
+    #[test]
+    fn yield_all_of_an_unknown_typed_variable_is_a_dedicated_error() {
+        let block: syn::Block = parse_quote!({
+            let g = mk();
+            yield_all!(g);
+        });
+        let msg = error_of(&block).to_string();
+        assert!(msg.contains("delegated to by yield_all!"), "got: {msg}");
+        assert!(msg.contains("type annotation"), "got: {msg}");
+        assert!(!msg.contains("__dg"), "no synthetic names: {msg}");
     }
 
     // === Argument patterns ===
