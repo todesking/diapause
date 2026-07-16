@@ -1,10 +1,10 @@
-error: yield_! is only allowed in statement position: `yield_!(expr);` or `let x = yield_!(expr);`
-  --> tests/compile_fail/yield_in_expression.rs:10:5
+error: yield_! is not supported in this position: inside an expression it is only supported when everything evaluated before it is a path, a literal, or another yield_!, in an unconditionally evaluated position; bind the resume value first: `let r = yield_!(..);` and use `r` here
+  --> tests/compile_fail/yield_in_expression.rs:10:12
    |
 10 |     f(g(), yield_!(2));
-   |     ^^^^^^^^^^^^^^^^^^
+   |            ^^^^^^^^^^
 
-error: yield_! in value position is only supported when the value is the whole `let` initializer or function tail expression and is an `if`/`match`/`loop`/block expression whose arms produce the value; as a workaround, declare `let mut x: Option<T> = None;` before the control flow, assign `x = Some(...);` where the value is produced, and use `x.unwrap()` afterwards
+error: yield_! in value position is only supported when everything evaluated before it is a path, a literal, or another yield_!, or when the value is the whole `let` initializer or function tail expression and is an `if`/`match`/`loop`/block expression whose arms produce the value; bind the yield first (`let r = yield_!(..);`) or, around control flow, declare `let mut x: Option<T> = None;` before it, assign `x = Some(...);` where the value is produced, and use `x.unwrap()` afterwards
   --> tests/compile_fail/yield_in_expression.rs:11:5
    |
 11 |     let _x = g() + yield_!(3);

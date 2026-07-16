@@ -1,16 +1,16 @@
-error: yield_! in a condition expression is not supported
+error: yield_! in a condition is only supported in `if` when everything evaluated before it is a path, a literal, or another yield_!; bind it first: `let c = yield_!(..);`. A `while` condition is re-evaluated every iteration and cannot contain yield_!; restructure into `loop` with `if .. { break; }`
   --> tests/compile_fail/yield_in_condition.rs:13:15
    |
 13 |     if g() && yield_!(1) {
    |               ^^^^^^^^^^
 
-error: yield_! in a condition expression is not supported
+error: yield_! in a condition is only supported in `if` when everything evaluated before it is a path, a literal, or another yield_!; bind it first: `let c = yield_!(..);`. A `while` condition is re-evaluated every iteration and cannot contain yield_!; restructure into `loop` with `if .. { break; }`
   --> tests/compile_fail/yield_in_condition.rs:22:11
    |
 22 |     while yield_!(2) {
    |           ^^^^^^^^^^
 
-error: yield_! in a match scrutinee is not supported
+error: yield_! in a scrutinee is only supported for `match`/`if let`/`let ... else` when everything evaluated before it is a path, a literal, or another yield_!; bind it first: `let s = yield_!(..);`. A `while let` scrutinee is re-evaluated every iteration and cannot contain yield_!
   --> tests/compile_fail/yield_in_condition.rs:30:18
    |
 30 |     match h(g(), yield_!(3)) {

@@ -359,8 +359,10 @@ impl Lowerer {
 
 // === Error messages ===
 
-const ERR_STMT_POSITION: &str = "yield_! is only allowed in statement position: \
-     `yield_!(expr);` or `let x = yield_!(expr);`";
+const ERR_UNHOISTABLE: &str = "yield_! is not supported in this position: inside an \
+     expression it is only supported when everything evaluated before it is a path, a \
+     literal, or another yield_!, in an unconditionally evaluated position; bind the \
+     resume value first: `let r = yield_!(..);` and use `r` here";
 const ERR_TRAILING_YIELD: &str =
     "yield_! as the trailing expression is not supported; add a semicolon";
 const ERR_FOREIGN_MACRO: &str = "yield_! cannot appear inside another macro invocation";
@@ -371,25 +373,38 @@ const ERR_SIMPLE_BINDING: &str =
 const ERR_VALUE_LET_BINDING: &str =
     "the binding of a `let` whose initializer contains yield_! must be a simple identifier";
 const ERR_YIELD_ARG: &str = "yield_! takes a single expression";
-const ERR_VALUE_POSITION: &str = "yield_! in value position is only supported when the \
-     value is the whole `let` initializer or function tail expression and is an \
-     `if`/`match`/`loop`/block expression whose arms produce the value; as a workaround, \
-     declare `let mut x: Option<T> = None;` before the control flow, assign \
-     `x = Some(...);` where the value is produced, and use `x.unwrap()` afterwards";
+const ERR_VALUE_POSITION: &str = "yield_! in value position is only supported when \
+     everything evaluated before it is a path, a literal, or another yield_!, or when \
+     the value is the whole `let` initializer or function tail expression and is an \
+     `if`/`match`/`loop`/block expression whose arms produce the value; bind the yield \
+     first (`let r = yield_!(..);`) or, around control flow, declare \
+     `let mut x: Option<T> = None;` before it, assign `x = Some(...);` where the value \
+     is produced, and use `x.unwrap()` afterwards";
 const ERR_TAIL: &str = "yield_! in the trailing expression is not supported here; \
      add a semicolon";
-const ERR_COND: &str = "yield_! in a condition expression is not supported";
-const ERR_SCRUTINEE: &str = "yield_! in a match scrutinee is not supported";
+const ERR_COND: &str = "yield_! in a condition is only supported in `if` when \
+     everything evaluated before it is a path, a literal, or another yield_!; bind it \
+     first: `let c = yield_!(..);`. A `while` condition is re-evaluated every iteration \
+     and cannot contain yield_!; restructure into `loop` with `if .. { break; }`";
+const ERR_SCRUTINEE: &str = "yield_! in a scrutinee is only supported for \
+     `match`/`if let`/`let ... else` when everything evaluated before it is a path, a \
+     literal, or another yield_!; bind it first: `let s = yield_!(..);`. A `while let` \
+     scrutinee is re-evaluated every iteration and cannot contain yield_!";
 const ERR_GUARD: &str = "yield_! in a match guard is not supported";
 const ERR_UNSAFE: &str = "yield_! inside an unsafe block is not supported";
 const ERR_LET_CHAIN: &str = "a let-chain condition is not supported when the body contains \
      yield_!; use nested `if let` or `match` instead";
-const ERR_FOR_HEAD: &str = "yield_! in a `for` loop's iterator expression is not supported";
+const ERR_FOR_HEAD: &str = "yield_! in a `for` loop's iterator expression is only \
+     supported when everything evaluated before it is a path, a literal, or another \
+     yield_!; bind it first: `let r = yield_!(..);`";
 const ERR_BREAK_VALUE: &str = "`break` with a value can only target a loop containing \
      yield_! when the loop is a `let` initializer or the function's trailing expression";
 const ERR_YIELD_ALL_OPERAND: &str = "yield_all! takes a single variable holding the \
      coroutine to delegate to; bind it first: `let sub: SubTy = make_sub(..);` and then \
      `yield_all!(sub)`";
+const ERR_YIELD_ALL_POSITION: &str = "yield_all! is only supported in statement \
+     position (`yield_all!(sub);`), as a whole `let` initializer, or as the function's \
+     trailing expression";
 
 fn for_local_borrow_err(name: &syn::Ident) -> String {
     format!(
@@ -513,10 +528,9 @@ impl<'ast> Visit<'ast> for YieldBan<'_> {
         if is_yield_macro(mac) {
             self.record(syn::Error::new_spanned(mac, self.msg));
         } else if is_yield_all_macro(mac) {
-            // The positional restrictions apply identically; name the
-            // macro the user actually wrote.
-            let msg = self.msg.replace("yield_!", "yield_all!");
-            self.record(syn::Error::new_spanned(mac, msg));
+            // yield_all! is never hoisted, so the position-specific
+            // hoisting advice does not apply; name its own rules.
+            self.record(syn::Error::new_spanned(mac, ERR_YIELD_ALL_POSITION));
         } else if tokens_contain_yield(mac.tokens.clone()) {
             self.record(syn::Error::new(mac.span(), ERR_FOREIGN_MACRO));
         }
@@ -940,7 +954,7 @@ impl Lowerer {
         };
         // The yielded value is evaluated before the transition: its uses
         // belong to the yielding block, and it must not itself suspend.
-        self.check_no_yield(&value, ERR_STMT_POSITION);
+        self.check_no_yield(&value, ERR_UNHOISTABLE);
         self.record_expr_uses(&value, self.current);
         let next = self.new_block(true);
         let resume_binding = match target {
@@ -1361,7 +1375,9 @@ impl Lowerer {
             syn::Expr::Unsafe(eu) => {
                 self.err(syn::Error::new_spanned(eu.unsafe_token, ERR_UNSAFE));
             }
-            other => self.err(syn::Error::new_spanned(other, ERR_STMT_POSITION)),
+            // Point at each yield_! (or yield_all!/foreign macro) in
+            // the statement rather than the whole expression.
+            other => self.check_no_yield(other, ERR_UNHOISTABLE),
         }
     }
 
@@ -1765,7 +1781,7 @@ impl<'ast> Visit<'ast> for OpaqueChecker {
         if is_yield_macro(mac) {
             // Unreachable in practice: the caller only validates
             // statements without yield_!. Kept for robustness.
-            self.record(syn::Error::new_spanned(mac, ERR_STMT_POSITION));
+            self.record(syn::Error::new_spanned(mac, ERR_UNHOISTABLE));
         } else if tokens_contain_yield(mac.tokens.clone()) {
             self.record(syn::Error::new(mac.span(), ERR_FOREIGN_MACRO));
         }
@@ -2920,11 +2936,13 @@ mod tests {
 
     #[test]
     fn yield_in_expression_is_rejected() {
+        // Hoisting happens in a pre-pass; by the time an expression
+        // yield reaches lowering it is unhoistable.
         let block: syn::Block = parse_quote!({
             f(1, yield_!(2));
         });
         let err = error_of(&block);
-        assert!(err.to_string().contains("statement position"));
+        assert!(err.to_string().contains("path, a literal"));
     }
 
     #[test]
@@ -3301,7 +3319,7 @@ mod tests {
             }
         });
         let msg = error_of(&block).to_string();
-        assert!(msg.contains("yield_all! in a condition"), "got: {msg}");
+        assert!(msg.contains("yield_all! is only supported"), "got: {msg}");
     }
 
     #[test]
@@ -3334,7 +3352,7 @@ mod tests {
             let mut x: u32 = 0;
             x = yield_!(1);
         });
-        assert!(error_of(&block).to_string().contains("statement position"));
+        assert!(error_of(&block).to_string().contains("path, a literal"));
     }
 
     // === Argument patterns ===
