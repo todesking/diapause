@@ -77,8 +77,8 @@ fn double(v: u32) -> u32 {
 
 #[baregen::coroutine(yield = u32, resume = u32)]
 fn assignments() -> u32 {
-    let mut x: u32 = 0;
-    x = double(yield_!(1));
+    let mut x: u32 = 3;
+    x = double(yield_!(1)) + x;
     x += yield_!(2);
     x
 }
@@ -88,7 +88,7 @@ fn yields_in_assignment_rhs_and_compound_assignment() {
     let mut c = assignments();
     assert_eq!(c.start(), CoroutineState::Yielded(1));
     assert_eq!(c.resume(10), CoroutineState::Yielded(2));
-    assert_eq!(c.resume(3), CoroutineState::Complete(23));
+    assert_eq!(c.resume(4), CoroutineState::Complete(27));
 }
 
 // === Trailing expressions ===
