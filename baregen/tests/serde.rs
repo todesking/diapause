@@ -185,6 +185,52 @@ fn fingerprint_const_is_generated_without_the_flag() {
     assert_eq!(fp, running_sum::State::FINGERPRINT);
 }
 
+// `yield_all!` stores the inner coroutine's state enum by value in the
+// outer one, so serde derives compose across the nesting: a coroutine
+// suspended inside a delegation serializes with the inner state included.
+
+#[baregen::coroutine(yield = u32, resume = u32)]
+#[derive(Serialize, Deserialize)]
+fn sub_sum(n: u32) -> u32 {
+    let mut sum: u32 = 0;
+    for i in 0u32..n {
+        let w = yield_!(i);
+        sum += w;
+    }
+    sum
+}
+
+#[baregen::coroutine(yield = u32, resume = u32)]
+#[derive(Serialize, Deserialize)]
+fn delegating(n: u32) -> u32 {
+    let g: sub_sum::State = sub_sum(n);
+    let total: u32 = yield_all!(g);
+    total * 2
+}
+
+#[test]
+fn suspended_delegation_round_trips_through_json() {
+    let mut c = delegating(3);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(10), CoroutineState::Yielded(1));
+
+    // Suspended mid-delegation: the outer state holds the inner State
+    // (itself suspended mid-iteration) as an ordinary nested value.
+    let value: serde_json::Value = serde_json::to_value(&c).unwrap();
+    let inner = &value["S2"]["__dg0"];
+    assert!(inner.is_object(), "inner state missing: {value}");
+
+    let json = serde_json::to_string(&c).unwrap();
+    let mut restored: delegating::State = serde_json::from_str(&json).unwrap();
+
+    // Both copies finish independently with the same tally:
+    // (10 + 20 + 30) * 2 = 120.
+    for c in [&mut c, &mut restored] {
+        assert_eq!(c.resume(20), CoroutineState::Yielded(2));
+        assert_eq!(c.resume(30), CoroutineState::Complete(120));
+    }
+}
+
 #[test]
 fn serialized_state_exposes_the_iterator_cursor() {
     let mut c = running_sum(3);
