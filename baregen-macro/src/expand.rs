@@ -415,8 +415,16 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
         /// (`path_statements`: a hoisted trailing yield in discard
         /// position leaves a bare `__tmpN;` behind. `unused_labels`:
         /// a body without internal transitions never continues
-        /// `'__dispatch`.)
-        #[allow(unused_mut, unreachable_code, path_statements, unused_labels)]
+        /// `'__dispatch`. `unused_assignments`: splitting a variable
+        /// across state arms lets rustc see per-arm dead stores that
+        /// are live on another path of the original body.)
+        #[allow(
+            unused_mut,
+            unreachable_code,
+            path_statements,
+            unused_labels,
+            unused_assignments
+        )]
         fn __drive(
             &mut self,
             mut __resume: ::core::option::Option<#resume_ty>,
