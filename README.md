@@ -70,6 +70,8 @@ any code. `start()` runs the body up to the first `yield_!`; each
   their ordinary semantics. A suspended coroutine can be serialized,
   shipped to another process, deserialized, and resumed — something
   that is fundamentally impossible for async-based generator crates.
+  An opt-in `fingerprint` flag detects a persisted state meeting
+  edited source instead of resuming at a wrong program point.
 - **Panic safety**: a coroutine that panics mid-transition is left in a
   `Poisoned` state and panics on further use.
 
@@ -116,7 +118,64 @@ Serde support follows directly from what the state stores:
   so it can be serialized but not deserialized.
 - Variant names (`S1..`, `B1..`) are assigned in yield and block
   order; editing the coroutine body can renumber them, so persisted
-  states are only compatible with the exact source they were built from.
+  states are only compatible with the exact source they were built
+  from. Restoring a state into edited source can succeed structurally
+  and silently resume at the wrong program point — the `fingerprint`
+  flag below exists to catch exactly this.
+
+### Detecting stale states: `fingerprint`
+
+Adding `fingerprint` to the attribute stamps every state with a hash of
+the coroutine's source and validates it before resuming:
+
+```rust
+use baregen::{Coroutine, CoroutineState};
+use serde::{Deserialize, Serialize};
+
+#[baregen::coroutine(yield = u32, fingerprint)]
+#[derive(Serialize, Deserialize)]
+fn countdown(n: u32) -> u32 {
+    let mut sum: u32 = 0;
+    for i in 0u32..n {
+        yield_!(i);
+        sum += i;
+    }
+    sum
+}
+
+fn main() {
+    let mut c = countdown(3);
+    c.start();
+    let json = serde_json::to_string(&c).unwrap();
+
+    let mut restored: countdown::State = serde_json::from_str(&json).unwrap();
+    // Err(baregen::FingerprintMismatch { .. }) if the state was
+    // persisted by a different version of `countdown`.
+    restored.check_fingerprint().unwrap();
+    assert_eq!(restored.resume(()), CoroutineState::Yielded(1));
+}
+```
+
+- Every state enum has a `State::FINGERPRINT: u64` associated const,
+  flag or not: an FNV-1a hash of the attribute arguments, signature,
+  and body tokens. Editing the coroutine changes it; comments and
+  formatting do not.
+- The `fingerprint` flag additionally stores that hash in every state
+  as a plain `__fp: u64` field — any derive (serde, `Clone`, ...)
+  handles it as ordinary data — makes `start()`/`resume()` panic on a
+  mismatch as a last line of defense, and generates
+  `fn check_fingerprint(&self) -> Result<(), baregen::FingerprintMismatch>`
+  for graceful validation right after deserializing.
+- Enabling the flag is itself a breaking change for previously
+  persisted states: they lack the `__fp` field and fail to deserialize.
+- `fingerprint = "some-tag"` hashes the tag instead of the source: an
+  escape hatch to declare states compatible across an edit you know
+  preserves the state layout (e.g. resuming states persisted before a
+  hot fix).
+- The hash is computed from the macro's token-stream stringification,
+  which is stable in practice but not formally guaranteed across
+  rustc/proc-macro2 versions. Treat the fingerprint as a best-effort
+  guard against accidental skew, not a versioned format.
 
 ## Constraints
 

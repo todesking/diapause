@@ -33,7 +33,10 @@ mod ty_infer;
 ///
 /// Attribute arguments `yield = Type` and `resume = Type` set the
 /// yielded and resume-argument types; both default to `()`. The
-/// `Return` type is the function's return type.
+/// `Return` type is the function's return type. The `fingerprint`
+/// flag stamps every state with a hash of the coroutine's source and
+/// validates it before resuming (see "State-variant naming and serde"
+/// below); `fingerprint = "tag"` hashes the tag instead.
 ///
 /// `#[derive(...)]` attributes written **below** this attribute are
 /// moved onto the generated `State` enum; other attributes (doc
@@ -130,6 +133,20 @@ mod ty_infer;
 /// Deserializing requires naming the state type, which is impossible
 /// for coroutines with `impl Trait` arguments (their state type has an
 /// inferred parameter).
+///
+/// Every state enum carries an associated const
+/// `State::FINGERPRINT: u64`: an FNV-1a hash of the attribute
+/// arguments, signature, and body tokens, which changes when the
+/// coroutine is edited (comments and formatting do not affect it).
+/// With the `fingerprint` attribute flag, each data-carrying variant
+/// additionally stores that hash in a plain `__fp: u64` field —
+/// derives persist it as ordinary data — `start`/`resume` panic when
+/// it does not match the current source, and a generated inherent
+/// method `check_fingerprint(&self) -> Result<(), FingerprintMismatch>`
+/// validates it gracefully right after deserializing. Enabling the
+/// flag invalidates previously persisted states (missing `__fp`
+/// field). `fingerprint = "tag"` hashes the tag instead of the
+/// source, declaring states persisted under equal tags compatible.
 #[proc_macro_attribute]
 pub fn coroutine(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item = syn::parse_macro_input!(item as syn::ItemFn);
