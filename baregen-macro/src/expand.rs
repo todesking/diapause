@@ -413,8 +413,10 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
         /// Runs the state machine until the next suspension point
         /// or completion. Not visible outside the module.
         /// (`path_statements`: a hoisted trailing yield in discard
-        /// position leaves a bare `__tmpN;` behind.)
-        #[allow(unused_mut, unreachable_code, path_statements)]
+        /// position leaves a bare `__tmpN;` behind. `unused_labels`:
+        /// a body without internal transitions never continues
+        /// `'__dispatch`.)
+        #[allow(unused_mut, unreachable_code, path_statements, unused_labels)]
         fn __drive(
             &mut self,
             mut __resume: ::core::option::Option<#resume_ty>,
@@ -423,12 +425,16 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
             // state is swapped for a placeholder up front; a
             // panic in user code leaves it behind.
             let mut __state = ::core::mem::replace(self, #placeholder);
-            loop {
-                __state = match __state {
+            // Every arm diverges: internal transitions assign the
+            // next state and `continue '__dispatch` (a statement,
+            // so it also works from inside opaque statements);
+            // suspension and completion `return`.
+            '__dispatch: loop {
+                match __state {
                     #(#drive_arms)*
                     // Unreachable: start/resume checked the state.
                     _ => ::core::panic!("Poisoned"),
-                };
+                }
             }
         }
     }
@@ -539,8 +545,9 @@ impl Codegen<'_> {
         quote!(#(#reborrows)* #(#stmts)* #term)
     }
 
-    /// The transition out of a block: an expression producing the next
-    /// state value, or a diverging suspension/completion.
+    /// The transition out of a block: every path diverges, either by
+    /// assigning the next state and continuing the dispatch loop or by
+    /// a suspension/completion `return`.
     fn terminator_code(&self, b: BlockId) -> TokenStream {
         match &self.cfg.blocks[b].terminator {
             Terminator::Goto(t) => self.edge(*t),
@@ -596,13 +603,18 @@ impl Codegen<'_> {
     }
 
     /// A transition edge: inline blocks are embedded in the predecessor's
-    /// arm, variant blocks become the next state value.
+    /// arm, variant blocks become a state assignment that re-enters the
+    /// dispatch loop.
     fn edge(&self, b: BlockId) -> TokenStream {
         if self.cfg.blocks[b].inline {
             let code = self.block_code(b);
             quote!({ #code })
         } else {
-            self.state_value(b)
+            let next_state = self.state_value(b);
+            quote!({
+                __state = #next_state;
+                continue '__dispatch;
+            })
         }
     }
 
