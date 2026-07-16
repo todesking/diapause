@@ -349,7 +349,8 @@ const ERR_COND: &str = "yield_! in a condition expression is not supported";
 const ERR_SCRUTINEE: &str = "yield_! in a match scrutinee is not supported";
 const ERR_GUARD: &str = "yield_! in a match guard is not supported";
 const ERR_UNSAFE: &str = "yield_! inside an unsafe block is not supported";
-const ERR_IF_LET: &str = "yield_! inside `if let` is not supported; use `match` instead";
+const ERR_LET_CHAIN: &str = "a let-chain condition is not supported when the body contains \
+     yield_!; use nested `if let` or `match` instead";
 const ERR_FOR_HEAD: &str = "yield_! in a `for` loop's iterator expression is not supported";
 const ERR_BREAK_VALUE: &str = "`break` with a value can only target a loop containing \
      yield_! when the loop is a `let` initializer or the function's trailing expression";
@@ -969,6 +970,47 @@ fn unit_expr(span: proc_macro2::Span) -> syn::Expr {
     syn::parse_quote_spanned!(span => ())
 }
 
+/// A two-arm `Match` terminator testing `pat` against `scrutinee`: the
+/// shape shared by `while let`, `if let`, and `let ... else`.
+fn refutable_match(
+    scrutinee: &syn::Expr,
+    pat: &syn::Pat,
+    matched: BlockId,
+    unmatched: BlockId,
+) -> Terminator {
+    Terminator::Match {
+        scrutinee: scrutinee.clone(),
+        arms: vec![
+            MatchArm {
+                pat: pat.clone(),
+                guard: None,
+                body: matched,
+            },
+            MatchArm {
+                pat: syn::parse_quote!(_),
+                guard: None,
+                body: unmatched,
+            },
+        ],
+    }
+}
+
+/// Whether an `if`/`while` condition is an edition-2024 let chain:
+/// `let` patterns combined with `&&`. A lone `if let`/`while let`
+/// condition is a plain `Expr::Let`, not a chain.
+fn is_let_chain(cond: &syn::Expr) -> bool {
+    fn contains_let(e: &syn::Expr) -> bool {
+        match e {
+            syn::Expr::Let(_) => true,
+            syn::Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_)) => {
+                contains_let(&b.left) || contains_let(&b.right)
+            }
+            _ => false,
+        }
+    }
+    !matches!(cond, syn::Expr::Let(_)) && contains_let(cond)
+}
+
 /// Turns a discarded expression into a statement: block-like expressions
 /// (if/match/loop/etc.) are already valid statements on their own, while
 /// everything else needs a semicolon to keep the statement sequence valid.
@@ -1017,13 +1059,11 @@ impl Lowerer {
     /// shared `join` block. The arms' trailing expressions are handled
     /// per `ctx` (discarded, assigned to a binding, or returned).
     fn lower_if_arms(&mut self, ei: &syn::ExprIf, join: BlockId, ctx: TailCtx) {
-        if matches!(&*ei.cond, syn::Expr::Let(_)) {
-            self.err(syn::Error::new_spanned(ei.if_token, ERR_IF_LET));
+        if is_let_chain(&ei.cond) {
+            self.err(syn::Error::new_spanned(ei.if_token, ERR_LET_CHAIN));
             self.terminate(Terminator::Goto(join));
             return;
         }
-        self.check_no_yield(&ei.cond, ERR_COND);
-        self.record_expr_uses(&ei.cond, self.current);
         let then_bb = self.new_block(false);
         // Without an `else`, the false edge produces `()`: in `Store`
         // context it needs a block that assigns it (otherwise the
@@ -1032,13 +1072,33 @@ impl Lowerer {
             (None, TailCtx::Store(_)) | (Some(_), _) => self.new_block(false),
             (None, _) => join,
         };
-        self.terminate(Terminator::Branch {
-            cond: (*ei.cond).clone(),
-            then_: then_bb,
-            else_: else_bb,
-        });
+        // `if let pat = scrutinee` lowers like a two-arm `match`: the
+        // pattern arm enters the then block, `_` the else block.
+        let pat = match &*ei.cond {
+            syn::Expr::Let(el) => {
+                self.check_no_yield(&el.expr, ERR_SCRUTINEE);
+                self.record_expr_uses(&el.expr, self.current);
+                self.terminate(refutable_match(&el.expr, &el.pat, then_bb, else_bb));
+                Some(&*el.pat)
+            }
+            cond => {
+                self.check_no_yield(cond, ERR_COND);
+                self.record_expr_uses(cond, self.current);
+                self.terminate(Terminator::Branch {
+                    cond: cond.clone(),
+                    then_: then_bb,
+                    else_: else_bb,
+                });
+                None
+            }
+        };
         self.current = then_bb;
-        self.in_scope(|lw| lw.lower_stmt_list(&ei.then_branch.stmts, ctx));
+        self.in_scope(|lw| {
+            if let Some(pat) = pat {
+                lw.define_pat_bindings(pat, then_bb, BindingKind::ArmPat, None);
+            }
+            lw.lower_stmt_list(&ei.then_branch.stmts, ctx);
+        });
         self.goto_if_open(join);
         match &ei.else_branch {
             Some((_, else_expr)) => {
@@ -1162,6 +1222,9 @@ impl Lowerer {
         if let syn::Expr::Let(el) = &*ew.cond {
             return self.lower_while_let(ew, el);
         }
+        if is_let_chain(&ew.cond) {
+            return self.err(syn::Error::new_spanned(ew.while_token, ERR_LET_CHAIN));
+        }
         self.with_loop_frame(
             &ew.label,
             &ew.body.stmts,
@@ -1192,24 +1255,7 @@ impl Lowerer {
                 lw.record_expr_uses(&el.expr, header);
                 let body = lw.new_block(false);
                 let exit = lw.new_block(false);
-                lw.set_terminator(
-                    header,
-                    Terminator::Match {
-                        scrutinee: (*el.expr).clone(),
-                        arms: vec![
-                            MatchArm {
-                                pat: (*el.pat).clone(),
-                                guard: None,
-                                body,
-                            },
-                            MatchArm {
-                                pat: syn::parse_quote!(_),
-                                guard: None,
-                                body: exit,
-                            },
-                        ],
-                    },
-                );
+                lw.set_terminator(header, refutable_match(&el.expr, &el.pat, body, exit));
                 (body, exit)
             },
             |lw, body| lw.define_pat_bindings(&el.pat, body, BindingKind::ArmPat, None),
@@ -1774,6 +1820,92 @@ mod tests {
         };
         assert!(arms[0].guard.is_some());
         assert!(arms[1].guard.is_none());
+    }
+
+    #[test]
+    fn if_let_becomes_a_match_terminator() {
+        let block: syn::Block = parse_quote!({
+            if let Some(x2) = opt {
+                yield_!(x2);
+            }
+            done();
+        });
+        let cfg = lower_args(&["opt"], &block);
+        let Terminator::Match { arms, .. } = &cfg.blocks[0].terminator else {
+            panic!("if let should lower to a match: {:?}", cfg.blocks[0].terminator);
+        };
+        assert_eq!(cfg.blocks[0].uses, ids(&[binding(&cfg, "opt")]));
+        assert_eq!(arms.len(), 2);
+        let wild: syn::Pat = parse_quote!(_);
+        assert_eq!(arms[1].pat, wild);
+        // The pattern arm binds x2 and yields; without an `else`, the
+        // `_` arm goes straight to the join.
+        let then_ = &cfg.blocks[arms[0].body];
+        assert_eq!(then_.defs, ids(&[binding(&cfg, "x2")]));
+        let Terminator::Yield { next, .. } = then_.terminator else {
+            panic!("then arm should yield");
+        };
+        let join = arms[1].body;
+        assert!(matches!(cfg.blocks[next].terminator, Terminator::Goto(j) if j == join));
+        assert!(matches!(cfg.blocks[join].terminator, Terminator::Return(_)));
+    }
+
+    #[test]
+    fn else_if_let_chains_into_a_match() {
+        let block: syn::Block = parse_quote!({
+            if a {
+                yield_!(1);
+            } else if let Some(x2) = opt {
+                yield_!(2);
+            } else {
+                yield_!(3);
+            }
+            done();
+        });
+        let cfg = lower_args(&["a", "opt"], &block);
+        let Terminator::Branch { else_, .. } = cfg.blocks[cfg.entry].terminator else {
+            panic!("entry must branch");
+        };
+        let Terminator::Match { arms, .. } = &cfg.blocks[else_].terminator else {
+            panic!("else-if-let link should lower to a match");
+        };
+        assert_eq!(arms.len(), 2);
+        // All three arms join on the single Return block.
+        let joins: BTreeSet<BlockId> = cfg
+            .blocks
+            .iter()
+            .filter(|b| b.resume_point)
+            .map(|b| match b.terminator {
+                Terminator::Goto(j) => j,
+                _ => panic!("resume should goto the join"),
+            })
+            .collect();
+        assert_eq!(joins.len(), 1);
+    }
+
+    #[test]
+    fn let_if_let_value_assigns_in_each_arm() {
+        let block: syn::Block = parse_quote!({
+            let x: u32 = if let Some(v) = opt {
+                yield_!(1);
+                1
+            } else {
+                2
+            };
+            f(x);
+        });
+        let cfg = lower_args(&["opt"], &block);
+        let x = binding(&cfg, "x");
+        let Terminator::Match { arms, .. } = &cfg.blocks[0].terminator else {
+            panic!("if let should lower to a match");
+        };
+        // The pattern arm assigns x in its resume block; the `_` arm in
+        // its own synthesized block.
+        let Terminator::Yield { next, .. } = cfg.blocks[arms[0].body].terminator else {
+            panic!("then arm should yield");
+        };
+        assert!(cfg.blocks[next].defs.contains(&x));
+        assert!(cfg.blocks[arms[1].body].defs.contains(&x));
     }
 
     #[test]
@@ -2477,13 +2609,19 @@ mod tests {
     }
 
     #[test]
-    fn yield_in_if_let_is_rejected() {
+    fn let_chain_conditions_are_rejected() {
         let block: syn::Block = parse_quote!({
-            if let Some(x) = opt {
+            if let Some(x) = opt && c {
                 yield_!(x);
             }
         });
-        assert!(error_of(&block).to_string().contains("if let"));
+        assert!(error_of(&block).to_string().contains("let-chain"));
+        let block: syn::Block = parse_quote!({
+            while let Some(x) = opt && c {
+                yield_!(x);
+            }
+        });
+        assert!(error_of(&block).to_string().contains("let-chain"));
     }
 
     #[test]

@@ -80,6 +80,93 @@ fn yield_in_match_arms() {
     assert_eq!(c.resume(7), CoroutineState::Complete(14));
 }
 
+/// `if let` with yields in both arms. The arm binding `v` is consumed
+/// before the yield, so it never enters the state.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn if_let_yield(opt: Option<u32>) -> u32 {
+    let mut out: u32 = 0;
+    if let Some(v) = opt {
+        out += v;
+        let r = yield_!(out);
+        out += r;
+    } else {
+        yield_!(0);
+        out = 100;
+    }
+    out
+}
+
+#[test]
+fn yield_in_if_let_matched() {
+    let mut c = if_let_yield(Some(3));
+    assert_eq!(c.start(), CoroutineState::Yielded(3));
+    assert_eq!(c.resume(4), CoroutineState::Complete(7));
+}
+
+#[test]
+fn yield_in_if_let_unmatched() {
+    let mut c = if_let_yield(None);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(9), CoroutineState::Complete(100));
+}
+
+#[baregen::coroutine(yield = u32)]
+fn else_if_let(a: bool, opt: Option<u32>) -> u32 {
+    let mut out: u32 = 0;
+    if a {
+        yield_!(1);
+        out = 1;
+    } else if let Some(v) = opt {
+        out = v;
+        yield_!(2);
+    } else {
+        yield_!(3);
+        out = 30;
+    }
+    out
+}
+
+#[test]
+fn yield_in_else_if_let_chain() {
+    let mut c = else_if_let(true, None);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(1));
+
+    let mut c = else_if_let(false, Some(7));
+    assert_eq!(c.start(), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(()), CoroutineState::Complete(7));
+
+    let mut c = else_if_let(false, None);
+    assert_eq!(c.start(), CoroutineState::Yielded(3));
+    assert_eq!(c.resume(()), CoroutineState::Complete(30));
+}
+
+/// `if let` as a `let` initializer: the arm binding is rebound with an
+/// annotation so it can cross the yield.
+#[baregen::coroutine(yield = u32)]
+fn if_let_value(opt: Option<u32>) -> u32 {
+    let x: u32 = if let Some(v) = opt {
+        let v2: u32 = v;
+        yield_!(v2);
+        v2 * 2
+    } else {
+        yield_!(0);
+        7
+    };
+    x + 1
+}
+
+#[test]
+fn if_let_in_value_position() {
+    let mut c = if_let_value(Some(5));
+    assert_eq!(c.start(), CoroutineState::Yielded(5));
+    assert_eq!(c.resume(()), CoroutineState::Complete(11));
+
+    let mut c = if_let_value(None);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(()), CoroutineState::Complete(8));
+}
+
 // The design document's `totals` example.
 #[baregen::coroutine(yield = u32, resume = u32)]
 fn totals(n: u32) -> u32 {

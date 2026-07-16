@@ -1,0 +1,5 @@
+error: `v` is bound by a match arm pattern and must be stored across a state boundary, but arm patterns cannot be annotated with a type; rebind it at the top of the arm: `let v2: Type = v;`
+ --> tests/compile_fail/if_let_binding_across_yield.rs:4:17
+  |
+4 |     if let Some(v) = x {
+  |                 ^

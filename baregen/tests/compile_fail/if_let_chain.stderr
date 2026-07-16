@@ -1,0 +1,5 @@
+error: a let-chain condition is not supported when the body contains yield_!; use nested `if let` or `match` instead
+ --> tests/compile_fail/if_let_chain.rs:3:5
+  |
+3 |     if let Some(x) = opt && c {
+  |     ^^
