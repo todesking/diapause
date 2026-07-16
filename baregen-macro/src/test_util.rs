@@ -10,5 +10,5 @@ pub(crate) fn lower_args(args: &[&str], block: &syn::Block) -> Cfg {
         .iter()
         .map(|a| syn::Ident::new(a, proc_macro2::Span::call_site()))
         .collect();
-    lower(&idents, block).unwrap()
+    lower(&idents, &[], block).unwrap()
 }

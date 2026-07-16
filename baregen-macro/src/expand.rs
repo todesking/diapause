@@ -52,7 +52,7 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     rewrite_early_exits(&mut body, &ret_ty);
 
     let arg_idents: Vec<syn::Ident> = args.iter().map(|a| a.ident.clone()).collect();
-    let cfg = lower::lower(&arg_idents, &body)?;
+    let cfg = lower::lower(&arg_idents, &[], &body)?;
     let arg_infos: Vec<ArgInfo> = args.iter().map(ArgInfo::from).collect();
     let analysis = analyze_cfg::analyze(&cfg, &arg_infos, &macro_args.resume_ty)?;
 

@@ -44,6 +44,11 @@ pub enum BindingKind {
     /// Bound by a destructuring `for` loop pattern. Component types
     /// cannot be derived, so it must not cross a state boundary.
     ForPat,
+    /// Bound by a destructuring argument pattern, re-bound by a
+    /// synthesized `let` at the top of the entry block. Component types
+    /// cannot be derived from the signature, so it must not cross a
+    /// state boundary.
+    ArgPat,
 }
 
 /// Syntactically determined type of a binding.

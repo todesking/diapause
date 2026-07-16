@@ -369,30 +369,29 @@ impl Context<'_> {
                 }
                 BorrowSource::NotABorrow => {}
             }
-            if binding.kind == BindingKind::ArmPat {
+            let unannotatable = match binding.kind {
+                BindingKind::ArmPat => Some((
+                    "a match arm pattern",
+                    "arm patterns cannot be annotated with a type",
+                    "the arm",
+                )),
+                BindingKind::ForPat => Some((
+                    "a destructuring `for` pattern",
+                    "its type cannot be derived",
+                    "the loop body",
+                )),
+                BindingKind::ArgPat => Some((
+                    "a destructuring argument pattern",
+                    "its type cannot be derived",
+                    "the function body",
+                )),
+                _ => None,
+            };
+            if let Some((binder, reason, site)) = unannotatable {
                 if reported.insert(*id) {
                     self.err(
                         binding.ident.span(),
-                        unannotatable_binding_error(
-                            &name,
-                            "a match arm pattern",
-                            "arm patterns cannot be annotated with a type",
-                            "the arm",
-                        ),
-                    );
-                }
-                continue;
-            }
-            if binding.kind == BindingKind::ForPat {
-                if reported.insert(*id) {
-                    self.err(
-                        binding.ident.span(),
-                        unannotatable_binding_error(
-                            &name,
-                            "a destructuring `for` pattern",
-                            "its type cannot be derived",
-                            "the loop body",
-                        ),
+                        unannotatable_binding_error(&name, binder, reason, site),
                     );
                 }
                 continue;
@@ -1394,5 +1393,44 @@ mod tests {
         });
         let msg = error_of(&block).to_string();
         assert!(msg.contains("two different bindings named `x`"), "got: {msg}");
+    }
+
+    // === Argument patterns ===
+
+    /// Lowers and analyzes a body whose single argument `__arg0: (u32, u32)`
+    /// is destructured by `pat` at the entry block.
+    fn analyze_pair_arg(pat: syn::Pat, block: &syn::Block) -> (Cfg, syn::Result<Analysis>) {
+        let source = syn::Ident::new("__arg0", proc_macro2::Span::call_site());
+        let cfg = crate::lower::lower(&[source.clone()], &[(pat, source)], block).unwrap();
+        let infos = [ArgInfo {
+            mutability: None,
+            ty: parse_quote!((u32, u32)),
+        }];
+        let result = analyze(&cfg, &infos, &unit());
+        (cfg, result)
+    }
+
+    #[test]
+    fn arg_pattern_bindings_not_crossing_yield_are_accepted() {
+        let block: syn::Block = parse_quote!({
+            let sum: u32 = a + b;
+            yield_!(sum);
+            sum
+        });
+        let (cfg, result) = analyze_pair_arg(parse_quote!((a, b)), &block);
+        let a = result.unwrap();
+        assert_eq!(resume_fields(&cfg, &a, 0), ["sum"]);
+    }
+
+    #[test]
+    fn arg_pattern_binding_across_yield_is_rejected() {
+        let block: syn::Block = parse_quote!({
+            yield_!(a);
+            b
+        });
+        let (_, result) = analyze_pair_arg(parse_quote!((a, b)), &block);
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("destructuring argument pattern"), "got: {msg}");
+        assert!(msg.contains("let b2: Type = b;"), "got: {msg}");
     }
 }

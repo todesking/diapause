@@ -62,9 +62,19 @@ impl ErrorSink {
 
 /// Lowers a coroutine body to a simplified CFG. `args` are the function
 /// argument names; they become `BindingId(0)..` and are in scope from
-/// the entry block without being defined by it.
-pub fn lower(args: &[syn::Ident], body: &syn::Block) -> syn::Result<Cfg> {
+/// the entry block without being defined by it. `arg_pats` are the
+/// destructuring patterns of non-simple-identifier arguments, each
+/// paired with the fresh argument ident holding its value; they become
+/// `let <pat> = <ident>;` statements at the top of the entry block.
+pub fn lower(
+    args: &[syn::Ident],
+    arg_pats: &[(syn::Pat, syn::Ident)],
+    body: &syn::Block,
+) -> syn::Result<Cfg> {
     let mut lw = Lowerer::new(args);
+    for (pat, source) in arg_pats {
+        lw.push_arg_pat_let(pat, source);
+    }
     lw.lower_fn_body(body);
     lw.finish()
 }
@@ -998,6 +1008,31 @@ impl Lowerer {
         }
     }
 
+    /// Pushes the synthesized `let <pat> = <source>;` that destructures
+    /// a pattern argument at the top of the entry block. Its bindings
+    /// get `BindingKind::ArgPat`. Argument bindings share one namespace
+    /// (as in a plain fn, where duplicates are E0415), and the starter
+    /// fn no longer carries the original patterns for rustc to check,
+    /// so name clashes are rejected here.
+    fn push_arg_pat_let(&mut self, pat: &syn::Pat, source: &syn::Ident) {
+        let stmt: syn::Stmt = syn::parse_quote!(let #pat = #source;);
+        self.record_stmt_uses(&stmt);
+        let stmt_idx = self.blocks[self.current].stmts.len();
+        let mut c = PatBindingCollector::default();
+        c.visit_pat(pat);
+        for (ident, mutability) in c.bindings {
+            if self.resolve(&ident.to_string()).is_some() {
+                self.err(syn::Error::new(
+                    ident.span(),
+                    format!("identifier `{ident}` is bound more than once in the argument list"),
+                ));
+                continue;
+            }
+            let id = self.define(&ident, self.current, BindingKind::ArgPat, Some(stmt_idx));
+            self.bindings[id.0].mutability = mutability;
+        }
+        self.blocks[self.current].stmts.push(stmt);
+    }
 }
 
 fn is_block_like(e: &syn::Expr) -> bool {
@@ -1554,7 +1589,7 @@ mod tests {
     }
 
     fn error_of(block: &syn::Block) -> syn::Error {
-        lower(&[], block).unwrap_err()
+        lower(&[], &[], block).unwrap_err()
     }
 
     /// The BindingId of the (unique) binding with this name.
@@ -2303,7 +2338,7 @@ mod tests {
                 }
             }
         });
-        assert!(lower(&[], &block).is_ok());
+        assert!(lower(&[], &[], &block).is_ok());
     }
 
     #[test]
@@ -2790,7 +2825,7 @@ mod tests {
             }
         });
         let idents = [syn::Ident::new("xs", proc_macro2::Span::call_site())];
-        assert!(lower(&idents, &block).is_ok());
+        assert!(lower(&idents, &[], &block).is_ok());
     }
 
     #[test]
@@ -2863,7 +2898,7 @@ mod tests {
                 }
             }
         });
-        assert!(lower(&[], &block).is_ok());
+        assert!(lower(&[], &[], &block).is_ok());
     }
 
     #[test]
@@ -2935,5 +2970,37 @@ mod tests {
         });
         let err = error_of(&block);
         assert_eq!(err.into_iter().count(), 2);
+    }
+
+    // === Argument patterns ===
+
+    #[test]
+    fn arg_patterns_destructure_at_entry() {
+        let block: syn::Block = parse_quote!({
+            sink(a + b);
+        });
+        let source = syn::Ident::new("__arg0", proc_macro2::Span::call_site());
+        let pat: syn::Pat = parse_quote!((a, mut b));
+        let cfg = lower(&[source.clone()], &[(pat, source)], &block).unwrap();
+        let expected: syn::Stmt = parse_quote!(let (a, mut b) = __arg0;);
+        assert_eq!(cfg.blocks[cfg.entry].stmts[0], expected);
+        let a = binding(&cfg, "a");
+        let b = binding(&cfg, "b");
+        assert_eq!(cfg.bindings[a.0].kind, BindingKind::ArgPat);
+        assert!(cfg.bindings[a.0].mutability.is_none());
+        assert_eq!(cfg.bindings[b.0].kind, BindingKind::ArgPat);
+        assert!(cfg.bindings[b.0].mutability.is_some());
+        // The synthesized let consumes the argument.
+        assert!(cfg.blocks[cfg.entry].uses.contains(&binding(&cfg, "__arg0")));
+    }
+
+    #[test]
+    fn duplicate_arg_pattern_binding_is_rejected() {
+        let block: syn::Block = parse_quote!({});
+        let a = syn::Ident::new("a", proc_macro2::Span::call_site());
+        let source = syn::Ident::new("__arg1", proc_macro2::Span::call_site());
+        let pat: syn::Pat = parse_quote!((a, b));
+        let err = lower(&[a, source.clone()], &[(pat, source)], &block).unwrap_err();
+        assert!(err.to_string().contains("bound more than once"));
     }
 }
