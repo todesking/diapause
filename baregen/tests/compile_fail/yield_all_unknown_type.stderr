@@ -1,0 +1,5 @@
+error: cannot determine the type of the coroutine delegated to by yield_all!, which is stored in the state while it runs; bind it to a variable with an explicit type annotation: `let sub: Type = make_sub(..);`
+  --> tests/compile_fail/yield_all_unknown_type.rs:10:29
+   |
+10 |     let v: u32 = yield_all!(g);
+   |                             ^
