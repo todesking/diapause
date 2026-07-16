@@ -38,6 +38,14 @@ fn suspended_for_loop_round_trips_through_json() {
 }
 
 #[test]
+fn fingerprint_const_is_generated_without_the_flag() {
+    // `FINGERPRINT` exists on every state enum, `fingerprint` flag or
+    // not, for users who manage compatibility themselves.
+    let fp: u64 = running_sum::State::FINGERPRINT;
+    assert_eq!(fp, running_sum::State::FINGERPRINT);
+}
+
+#[test]
 fn serialized_state_exposes_the_iterator_cursor() {
     let mut c = running_sum(3);
     c.start();

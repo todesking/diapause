@@ -38,6 +38,8 @@ impl From<&ArgVar> for ArgInfo {
 }
 
 pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> {
+    // Hashed before the body is rewritten, from the exact source tokens.
+    let fingerprint = source_fingerprint(&attr, &item.sig, &item.block);
     let macro_args: MacroArgs = syn::parse2(attr)?;
 
     check_signature(&item.sig)?;
@@ -149,6 +151,12 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
             }
 
             impl #impl_generics State #ty_generics #where_clause {
+                /// Fingerprint of the coroutine source this state type was
+                /// generated from: an FNV-1a hash of the attribute
+                /// arguments, signature, and body tokens. Editing the
+                /// coroutine changes it; comments and formatting do not.
+                pub const FINGERPRINT: u64 = #fingerprint;
+
                 #drive_fn
             }
         }
@@ -525,6 +533,45 @@ fn bind_pat(mutability: &Option<syn::Token![mut]>, ident: &syn::Ident) -> TokenS
     quote!(#mutability #ident)
 }
 
+// === Source fingerprint ===
+
+/// Hashes the coroutine's source — attribute arguments, signature, and
+/// body — as seen by the macro, before any rewriting. Token-based, so
+/// comments and formatting do not affect it, but any edit to the tokens
+/// (including the attribute arguments) changes the value.
+///
+/// Stringification via `TokenStream::to_string` is stable in practice
+/// but not formally guaranteed across rustc/proc-macro2 versions; if it
+/// ever shifts, a recompile of unchanged source would change the
+/// fingerprint (documented in the README).
+fn source_fingerprint(attr: &TokenStream, sig: &syn::Signature, body: &syn::Block) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    for part in [
+        attr.to_string(),
+        quote!(#sig).to_string(),
+        quote!(#body).to_string(),
+    ] {
+        hash = fnv1a(hash, part.as_bytes());
+        // Separator so part boundaries cannot alias; `\0` never occurs
+        // in token stringification.
+        hash = fnv1a(hash, b"\0");
+    }
+    hash
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// 64-bit FNV-1a. Hand-rolled instead of `std::hash::DefaultHasher`
+/// because that algorithm is unspecified and may change between Rust
+/// versions, which would change fingerprints of unchanged source.
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
 // === Early-exit rewriting (`return` and `?`) ===
 
 /// Rewrites `return e` and `e?` anywhere in the body (inside opaque
@@ -871,6 +918,58 @@ mod tests {
             let x = yield_!(f()?);
         }));
         assert!(out.contains("yield_ ! (match :: baregen :: BareTry :: branch (f ())"));
+    }
+
+    #[test]
+    fn fnv1a_matches_known_vectors() {
+        // Reference values for FNV-1a 64: hashing must never change, or
+        // recompiled fingerprints would stop matching persisted states.
+        assert_eq!(fnv1a(FNV_OFFSET_BASIS, b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(FNV_OFFSET_BASIS, b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a(FNV_OFFSET_BASIS, b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn fingerprint_ignores_formatting_but_not_edits() {
+        let fp = |attr: TokenStream, f: syn::ItemFn| source_fingerprint(&attr, &f.sig, &f.block);
+        let base = fp(
+            quote!(yield = u32),
+            parse_quote! {
+                fn c(n: u32) {
+                    yield_!(n);
+                }
+            },
+        );
+        // Comments and whitespace are invisible at the token level.
+        let reformatted = fp(
+            quote!(yield = u32),
+            parse_quote! {
+                fn c(n: u32) {
+                    // a comment
+                    yield_!(n) ;
+                }
+            },
+        );
+        assert_eq!(base, reformatted);
+        // Attribute arguments and body edits both change the hash.
+        let edited_attr = fp(
+            quote!(yield = u64),
+            parse_quote! {
+                fn c(n: u32) {
+                    yield_!(n);
+                }
+            },
+        );
+        let edited_body = fp(
+            quote!(yield = u32),
+            parse_quote! {
+                fn c(n: u32) {
+                    yield_!(n + 1);
+                }
+            },
+        );
+        assert_ne!(base, edited_attr);
+        assert_ne!(base, edited_body);
     }
 
     #[test]
