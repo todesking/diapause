@@ -37,10 +37,11 @@ any code. `start()` runs the body up to the first `yield_!`; each
 
 ## Features
 
-- **Control flow**: `yield_!` works inside `if` / `match` / `loop` /
-  `while` / `while let` / `for`, at any nesting depth, mixed with
-  `break`, `continue` (including labeled forms), early `return`, and the
-  `?` operator on `Result` and `Option`. The generated `resume` is a
+- **Control flow**: `yield_!` works inside `if` / `if let` / `match` /
+  `loop` / `while` / `while let` / `for`, and inside the diverging block
+  of `let ... else`, at any nesting depth, mixed with `break`,
+  `continue` (including labeled forms), early `return`, and the `?`
+  operator on `Result` and `Option`. The generated `resume` is a
   dispatch loop over basic blocks, so join points are never duplicated.
 - **Value-producing control flow**: a yield-containing `if` / `match` /
   `loop` / block may initialize a `let` binding
@@ -122,12 +123,16 @@ produces a dedicated compile error with the workaround in the message.
 - **`yield_!` is statement-position only**: `yield_!(expr);` or
   `let x = yield_!(expr);`. It cannot appear inside expressions
   (`f(yield_!(1))`, `1 + yield_!(2)`), conditions, match scrutinees or
-  guards, `for`-head expressions, assignments (`x = yield_!(..)` —
-  resume values bind via `let` only), `if let` (use `match`), or
-  `unsafe` blocks. Yield-containing control flow produces a value only
-  as a whole `let` initializer or as the function's trailing expression
-  (see Features); in any other expression position, assign into an
-  `Option` in each branch and `unwrap()` after the join.
+  guards (including `if let` / `while let` / `let ... else`
+  scrutinees), `for`-head expressions, assignments (`x = yield_!(..)` —
+  resume values bind via `let` only), or `unsafe` blocks.
+  Yield-containing control flow produces a value only as a whole `let`
+  initializer or as the function's trailing expression (see Features);
+  in any other expression position, assign into an `Option` in each
+  branch and `unwrap()` after the join.
+- **Let chains are unsupported**: an `if`/`while` whose body contains a
+  `yield_!` cannot use an edition-2024 let chain
+  (`if let P = e && cond`); use nested `if let` or `match` instead.
 - **Value bindings crossing the join need an annotation**: in
   `let x = if c { yield_!(1); a } else { b };` the join is a state
   variant storing `x`, so write `let x: T = ...` (the usual
@@ -136,9 +141,14 @@ produces a dedicated compile error with the workaround in the message.
   syntactically determinable type: an explicit annotation, a suffixed
   or unambiguous literal (`123u8`, `true`), a move from a known
   variable, a function argument, or a range with known endpoints
-  (`0u32..n`). Match-arm and destructuring-`for` bindings have nowhere
-  to write a type annotation, so if they cross a yield, rebind first:
-  `let v2: Type = v;` at the top of the arm or loop body.
+  (`0u32..n`). Pattern bindings — match arms, `if let`, `while let`,
+  `let ... else`, destructuring `for` — have nowhere to write a type
+  annotation, so if they cross a yield, rebind first:
+  `let v2: Type = v;` right after they are bound.
+- **A `let ... else` block containing a `yield_!` must still diverge**,
+  but the macro cannot make rustc check that across suspension points;
+  a non-diverging block panics at run time when it falls through
+  instead of failing to compile.
 - **Borrows**: references are never stored in the state (the state
   machine is always `Unpin`; there is no self-reference). A direct
   borrow (`let y = &x;` / `let y = &mut x;`) crossing a yield is

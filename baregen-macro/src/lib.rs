@@ -41,8 +41,9 @@ mod ty_infer;
 ///
 /// # Supported control flow
 ///
-/// `yield_!` may appear inside `if`, `match`, `loop`, `while`,
-/// `while let`, and `for` at any nesting depth, combined with `break`,
+/// `yield_!` may appear inside `if`, `if let`, `match`, `loop`,
+/// `while`, `while let`, and `for`, and inside the diverging block of
+/// `let ... else`, at any nesting depth, combined with `break`,
 /// `continue` (including labeled forms), early `return`, and the `?`
 /// operator on `Result` and `Option`. Statements that contain no
 /// `yield_!` are kept verbatim; only yield-containing control flow is
@@ -64,12 +65,16 @@ mod ty_infer;
 /// - **Statement-position yield.** `yield_!` is only accepted as
 ///   `yield_!(expr);` or `let x = yield_!(expr);`. It cannot appear in
 ///   expressions (`f(yield_!(1))`, `1 + yield_!(2)`), conditions, match
-///   scrutinees or guards, `for`-head expressions, assignments
-///   (`x = yield_!(..)` — resume values bind via `let` only), `if let`
-///   (use `match`), `unsafe` blocks, or other macro invocations.
-///   Yield-containing control flow produces a value only in the two
-///   supported positions above; anywhere else, assign into an
-///   `Option<T>` in each branch and `unwrap()` after the join.
+///   scrutinees or guards (including `if let` / `while let` /
+///   `let ... else` scrutinees), `for`-head expressions, assignments
+///   (`x = yield_!(..)` — resume values bind via `let` only), `unsafe`
+///   blocks, or other macro invocations. Yield-containing control flow
+///   produces a value only in the two supported positions above;
+///   anywhere else, assign into an `Option<T>` in each branch and
+///   `unwrap()` after the join.
+/// - **No let chains.** An `if`/`while` whose body contains `yield_!`
+///   cannot use an edition-2024 let chain (`if let P = e && cond`);
+///   use nested `if let` or `match` instead.
 /// - **`break` with a value** may target a yield-containing loop only
 ///   when the loop is a `let` initializer or the function's trailing
 ///   expression.
@@ -79,10 +84,14 @@ mod ty_infer;
 ///   known variable, a function argument, or a range with a known
 ///   endpoint (`0u32..n`). This includes the iterator of a `for` loop
 ///   whose body yields: iterate over something with a known type.
-/// - **Pattern bindings crossing a yield.** Match-arm bindings and
-///   destructuring `for`-pattern bindings have nowhere to write a type
+/// - **Pattern bindings crossing a yield.** Bindings of match arms,
+///   `if let` / `while let` / `let ... else` patterns, and
+///   destructuring `for` patterns have nowhere to write a type
 ///   annotation, so they must not cross a yield; rebind first
-///   (`let v2: Type = v;`) at the top of the arm or loop body.
+///   (`let v2: Type = v;`) right after they are bound.
+/// - **`let ... else` divergence is not compile-checked** once the
+///   block contains a `yield_!`: a non-diverging `else` block panics
+///   at run time when it falls through instead of failing to compile.
 /// - **Borrows.** References are never stored in the state. A direct
 ///   borrow (`let y = &x;` / `let y = &mut x;`) crossing a yield is
 ///   dropped and reconstructed after resume; any other
