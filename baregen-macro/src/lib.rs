@@ -85,10 +85,10 @@ mod ty_infer;
 ///   endpoint (`0u32..n`). This includes the iterator of a `for` loop
 ///   whose body yields: iterate over something with a known type.
 /// - **Pattern bindings crossing a yield.** Bindings of match arms,
-///   `if let` / `while let` / `let ... else` patterns, and
-///   destructuring `for` patterns have nowhere to write a type
-///   annotation, so they must not cross a yield; rebind first
-///   (`let v2: Type = v;`) right after they are bound.
+///   `if let` / `while let` / `let ... else` patterns, destructuring
+///   `for` patterns, and destructuring argument patterns have nowhere
+///   to write a type annotation, so they must not cross a yield;
+///   rebind first (`let v2: Type = v;`) right after they are bound.
 /// - **`let ... else` divergence is not compile-checked** once the
 ///   block contains a `yield_!`: a non-diverging `else` block panics
 ///   at run time when it falls through instead of failing to compile.

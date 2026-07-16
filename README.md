@@ -56,6 +56,11 @@ any code. `start()` runs the body up to the first `yield_!`; each
 - **Generics, where clauses, reference arguments, and `impl Trait`
   arguments** are carried over to the generated state enum. Elided
   lifetimes are named automatically.
+- **Destructuring argument patterns** (`fn f((a, b): (u32, u32))`,
+  struct patterns, `_`, `ref`, `@`): the value is stored in the state
+  under a fresh name and the pattern is rebound at the top of the
+  body. A component crossing a yield needs an annotated rebind (see
+  Constraints).
 - **Snapshots**: `#[derive(Clone)]` written under the attribute is moved
   to the state enum, so a suspended coroutine can be cloned and both
   copies resumed independently.
@@ -142,9 +147,10 @@ produces a dedicated compile error with the workaround in the message.
   or unambiguous literal (`123u8`, `true`), a move from a known
   variable, a function argument, or a range with known endpoints
   (`0u32..n`). Pattern bindings — match arms, `if let`, `while let`,
-  `let ... else`, destructuring `for` — have nowhere to write a type
-  annotation, so if they cross a yield, rebind first:
-  `let v2: Type = v;` right after they are bound.
+  `let ... else`, destructuring `for`, destructuring argument
+  patterns — have nowhere to write a type annotation, so if they cross
+  a yield, rebind first: `let v2: Type = v;` right after they are
+  bound.
 - **A `let ... else` block containing a `yield_!` must still diverge**,
   but the macro cannot make rustc check that across suspension points;
   a non-diverging block panics at run time when it falls through
