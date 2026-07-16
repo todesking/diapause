@@ -60,6 +60,15 @@ mod ty_infer;
 /// trailing expression. The `let` form needs its type annotation
 /// whenever the value crosses the join into a state variant.
 ///
+/// A `yield_!` inside an expression is hoisted into its own
+/// `let __tmpN = yield_!(..);` statement when everything evaluated
+/// before it is a path, a literal, or another `yield_!`: call
+/// arguments (`f(yield_!(1), yield_!(2), g())`), binary operands
+/// (`yield_!(1) + 2`), assignment right-hand sides
+/// (`x = f(yield_!(1));`, `x += yield_!(..);`), trailing expressions
+/// (`yield_!(e)` evaluates to the resume value), `if` conditions,
+/// `match`/`if let`/`let ... else` scrutinees, and `for` heads.
+///
 /// `yield_all!(sub)` delegates to the coroutine held by the variable
 /// `sub`: its yields are forwarded to the caller, resume values are
 /// forwarded back in, and the expression evaluates to its completion
@@ -74,16 +83,20 @@ mod ty_infer;
 /// rules. Each violation is a dedicated compile error that names the
 /// workaround.
 ///
-/// - **Statement-position yield.** `yield_!` is only accepted as
-///   `yield_!(expr);` or `let x = yield_!(expr);`. It cannot appear in
-///   expressions (`f(yield_!(1))`, `1 + yield_!(2)`), conditions, match
-///   scrutinees or guards (including `if let` / `while let` /
-///   `let ... else` scrutinees), `for`-head expressions, assignments
-///   (`x = yield_!(..)` — resume values bind via `let` only), `unsafe`
-///   blocks, or other macro invocations. Yield-containing control flow
-///   produces a value only in the two supported positions above;
-///   anywhere else, assign into an `Option<T>` in each branch and
-///   `unwrap()` after the join.
+/// - **Hoistable-position yield.** `yield_!` is accepted as
+///   `yield_!(expr);`, `let x = yield_!(expr);`, or in an expression
+///   position where everything evaluated before it is a path, a
+///   literal, or another `yield_!` (it is then hoisted into a `let` in
+///   front of the statement). It cannot follow effectful or panicking
+///   code in the same statement (`f(g(), yield_!(1))` — bind the yield
+///   first), sit in a conditionally evaluated position
+///   (`c && yield_!(1)`, guards, nested `if`/`match` arms, closures),
+///   a `while` condition or `while let` scrutinee (re-evaluated every
+///   iteration), method-call arguments (receiver autoderef may run
+///   user `Deref` code first), `unsafe` blocks, or other macro
+///   invocations. Yield-containing control flow produces a value only
+///   in the two supported positions above; anywhere else, assign into
+///   an `Option<T>` in each branch and `unwrap()` after the join.
 /// - **No let chains.** An `if`/`while` whose body contains `yield_!`
 ///   cannot use an edition-2024 let chain (`if let P = e && cond`);
 ///   use nested `if let` or `match` instead.

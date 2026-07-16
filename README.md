@@ -49,6 +49,17 @@ any code. `start()` runs the body up to the first `yield_!`; each
   required when the value crosses the join) or stand as the function's
   trailing expression, including `break` with a value from such a
   `loop`.
+- **Expression-position yield with a pure prefix**: a `yield_!` inside
+  an expression is hoisted into its own `let __tmpN = yield_!(..);`
+  statement when everything evaluated before it is a path, a literal,
+  or another `yield_!` — `f(yield_!(1), yield_!(2), g())`,
+  `yield_!(1) + 2`, `x = f(yield_!(1));`, `x += yield_!(..);`, a
+  trailing `yield_!(e)` (evaluating to the resume value),
+  `if f(yield_!(1)) { .. }`, `match g(yield_!(1)) { .. }`, and
+  `for x in g(yield_!(1)) { .. }` all work. Effectful or panicking
+  code evaluated before the yield would be reordered across the
+  suspension by the hoist, so such positions remain errors (see
+  Constraints).
 - **Resume arguments** are ordinary values passed to `resume`, typed via
   the attribute (`resume = String`), with a separate zero-argument
   `start()` so no resume value can be silently dropped on the first
@@ -230,16 +241,22 @@ information — and every state transition is a compile-time rewrite.
 This shows up as the following rules; each unsupported construct
 produces a dedicated compile error with the workaround in the message.
 
-- **`yield_!` is statement-position only**: `yield_!(expr);` or
-  `let x = yield_!(expr);`. It cannot appear inside expressions
-  (`f(yield_!(1))`, `1 + yield_!(2)`), conditions, match scrutinees or
-  guards (including `if let` / `while let` / `let ... else`
-  scrutinees), `for`-head expressions, assignments (`x = yield_!(..)` —
-  resume values bind via `let` only), or `unsafe` blocks.
-  Yield-containing control flow produces a value only as a whole `let`
-  initializer or as the function's trailing expression (see Features);
-  in any other expression position, assign into an `Option` in each
-  branch and `unwrap()` after the join.
+- **`yield_!` needs a hoistable position**: `yield_!(expr);`,
+  `let x = yield_!(expr);`, or an expression position where everything
+  evaluated before the yield (in Rust's evaluation order) is a path, a
+  literal, or another `yield_!` — the yield is then hoisted into a
+  `let` in front of the statement. It cannot follow effectful or
+  panicking code in the same statement (`f(g(), yield_!(1))`,
+  `f() + yield_!(1)` — bind the yield with a `let` first), sit in a
+  conditionally evaluated position (`c && yield_!(1)`, match guards,
+  `if`/`match` arms nested inside an expression, closures), in a
+  `while` condition or `while let` scrutinee (re-evaluated every
+  iteration), in method-call arguments (receiver autoderef may run
+  user `Deref` code first), in `unsafe` blocks, or inside other macro
+  invocations. Yield-containing control flow produces a value only as
+  a whole `let` initializer or as the function's trailing expression
+  (see Features); in any other expression position, assign into an
+  `Option` in each branch and `unwrap()` after the join.
 - **Let chains are unsupported**: an `if`/`while` whose body contains a
   `yield_!` cannot use an edition-2024 let chain
   (`if let P = e && cond`); use nested `if let` or `match` instead.
