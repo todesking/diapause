@@ -73,3 +73,29 @@ fn original_borrow_stays_when_used_before_yield() {
     assert_eq!(c.start(), CoroutineState::Yielded(1));
     assert_eq!(c.resume(()), CoroutineState::Complete(12));
 }
+
+// The resume block after the first yield absorbs the match's join block
+// during CFG simplification, shifting the borrow `let` to a later
+// statement index. Dropping the borrow must not take `x += 10;` with it.
+#[baregen::coroutine(yield = i32)]
+fn borrow_let_in_merged_join_block() -> i32 {
+    let mut x: i32 = 1;
+    match () {
+        _ => {
+            yield_!(1);
+            x += 10;
+        }
+    }
+    let y = &mut x;
+    yield_!(2);
+    *y += 1;
+    x
+}
+
+#[test]
+fn statement_before_a_dropped_borrow_survives_block_merging() {
+    let mut c = borrow_let_in_merged_join_block();
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(()), CoroutineState::Complete(12));
+}

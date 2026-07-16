@@ -899,6 +899,34 @@ mod tests {
     }
 
     #[test]
+    fn def_stmt_survives_goto_chain_merging() {
+        // The resume block after the first yield absorbs the match's
+        // join block during simplification, shifting `let y = &mut x;`
+        // behind `bump();`. The removed statement must be the borrow,
+        // not whatever sits at its pre-merge index.
+        let block: syn::Block = parse_quote!({
+            let mut x: i32 = 1;
+            match () {
+                _ => {
+                    yield_!(1);
+                    bump();
+                }
+            }
+            let y = &mut x;
+            yield_!(2);
+            *y += 1;
+        });
+        let (cfg, a) = run(&block);
+        let s1 = resume_ids(&cfg)[0];
+        assert_eq!(
+            cfg.blocks[s1].stmts.len(),
+            2,
+            "expected the join block to be merged into the resume block"
+        );
+        assert_eq!(a.removed_stmts[s1], BTreeSet::from([1]));
+    }
+
+    #[test]
     fn borrow_used_before_yield_keeps_original_stmt() {
         let block: syn::Block = parse_quote!({
             let mut x: i32 = 1;

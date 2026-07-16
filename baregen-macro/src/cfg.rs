@@ -262,6 +262,14 @@ fn merge_goto_chains(cfg: &mut Cfg) {
         );
         let uses = std::mem::take(&mut cfg.blocks[c].uses);
         let defs = std::mem::take(&mut cfg.blocks[c].defs);
+        // c's statements land after b's existing ones, so the def_stmt
+        // indices of c's bindings shift by b's statement count.
+        let offset = cfg.blocks[b].stmts.len();
+        for d in &defs {
+            if let Some(i) = &mut cfg.bindings[d.0].def_stmt {
+                *i += offset;
+            }
+        }
         let bb = &mut cfg.blocks[b];
         bb.stmts.append(&mut stmts);
         bb.terminator = term;
