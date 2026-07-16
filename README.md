@@ -296,12 +296,13 @@ produces a dedicated compile error with the workaround in the message.
   of a local (`for x in &local`) — iterate by value, or borrow an
   argument.
 - **Jumps out of suspending loops**: a `break`/`continue` targeting a
-  loop that contains a `yield_!` must sit inside a statement that also
-  contains a `yield_!`; a plain `if done { break; }` after a yield is
-  an error. Move the exit condition into the loop header via a flag
-  variable, or restructure so the jump shares a statement with a yield.
+  loop that contains a `yield_!` works from anywhere in the loop body
+  (a plain `if done { break; }` after a yield is fine), with two rules:
   `break` with a value can target such a loop only when the loop is a
-  `let` initializer or the function's trailing expression.
+  `let` initializer or the function's trailing expression, and a jump
+  from inside a yield-free statement moves the variables of the target
+  state by name, so a binding declared in that same statement that
+  shadows one of them is rejected — rename the inner binding.
 - **`?` is supported on `Result` and `Option` only.** It desugars to
   calls on the internal `BareTry` / `BareFromResidual` traits (visible
   in error messages when `?` is used on other types); implementing them
