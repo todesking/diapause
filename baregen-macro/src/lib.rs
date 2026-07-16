@@ -59,6 +59,14 @@ mod ty_infer;
 /// trailing expression. The `let` form needs its type annotation
 /// whenever the value crosses the join into a state variant.
 ///
+/// `yield_all!(sub)` delegates to the coroutine held by the variable
+/// `sub`: its yields are forwarded to the caller, resume values are
+/// forwarded back in, and the expression evaluates to its completion
+/// value. Its state enum is stored by value inside the outer one, so
+/// `Clone` and serde derives compose across the nesting. Supported in
+/// statement position, as a whole `let` initializer, and as the
+/// function's trailing expression (see the constraint below).
+///
 /// # Constraints
 ///
 /// The transformation is purely syntactic, which imposes the following
@@ -78,6 +86,13 @@ mod ty_infer;
 /// - **No let chains.** An `if`/`while` whose body contains `yield_!`
 ///   cannot use an edition-2024 let chain (`if let P = e && cond`);
 ///   use nested `if let` or `match` instead.
+/// - **`yield_all!` takes a variable.** The delegated coroutine is
+///   stored in the state, so the operand must be a variable with a
+///   syntactically known type; bind it first
+///   (`let sub: Ty = make_sub(..);`). Its yield and resume types must
+///   match the outer coroutine's (mismatches are ordinary type errors)
+///   and it must not have been started yet (`start()` panics
+///   otherwise).
 /// - **`break` with a value** may target a yield-containing loop only
 ///   when the loop is a `let` initializer or the function's trailing
 ///   expression.

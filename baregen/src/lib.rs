@@ -33,9 +33,11 @@
 //! `yield_!` works inside `if` / `match` / `loop` / `while` /
 //! `while let` / `for` at any nesting depth, mixed with `break`,
 //! `continue`, early `return`, and the `?` operator on `Result` and
-//! `Option`. Because the state enum stores only concrete types, serde
-//! derives work with their ordinary semantics and a suspended coroutine
-//! can be serialized, deserialized elsewhere, and resumed.
+//! `Option`. [`yield_all!`] delegates to another coroutine, forwarding
+//! its yields and resume values. Because the state enum stores only
+//! concrete types, serde derives work with their ordinary semantics and
+//! a suspended coroutine can be serialized, deserialized elsewhere, and
+//! resumed — nested delegation states included.
 //!
 //! The macro never sees rustc's type information and works purely
 //! syntactically, which imposes rules on the body: `yield_!` is

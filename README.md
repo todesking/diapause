@@ -53,6 +53,12 @@ any code. `start()` runs the body up to the first `yield_!`; each
   the attribute (`resume = String`), with a separate zero-argument
   `start()` so no resume value can be silently dropped on the first
   call.
+- **Delegation**: `yield_all!(sub)` runs another coroutine to
+  completion — every value it yields is forwarded to the caller, every
+  resume value is forwarded back in, and the expression evaluates to
+  its completion value (Python's `yield from`). The inner state enum is
+  stored by value inside the outer one — no boxing — so `Clone` and
+  serde derives compose across arbitrary nesting depth.
 - **Generics, where clauses, reference arguments, and `impl Trait`
   arguments** are carried over to the generated state enum. Elided
   lifetimes are named automatically.
@@ -74,6 +80,46 @@ any code. `start()` runs the body up to the first `yield_!`; each
   edited source instead of resuming at a wrong program point.
 - **Panic safety**: a coroutine that panics mid-transition is left in a
   `Poisoned` state and panics on further use.
+
+## Delegating to a sub-coroutine
+
+`yield_all!` composes coroutines without giving up any of the state
+machinery: a coroutine suspended inside a delegation is still a plain
+enum value, holding the inner coroutine's state in place.
+
+```rust
+use baregen::{Coroutine, CoroutineState};
+use serde::{Deserialize, Serialize};
+
+#[baregen::coroutine(yield = u32, resume = u32)]
+#[derive(Serialize, Deserialize)]
+fn chunk(start: u32) -> u32 {
+    let a = yield_!(start);
+    start + a
+}
+
+#[baregen::coroutine(yield = u32, resume = u32)]
+#[derive(Serialize, Deserialize)]
+fn totals(n: u32) -> u32 {
+    let sub: chunk::State = chunk(n); // bind with a type annotation
+    let first: u32 = yield_all!(sub); // run `sub` to completion
+    let again = yield_!(first);
+    first + again
+}
+
+fn main() {
+    let mut c = totals(5);
+    assert_eq!(c.start(), CoroutineState::Yielded(5)); // chunk's yield
+
+    // Suspended inside `sub`: the outer state holds the inner state as
+    // an ordinary nested value, so persistence works across the nesting.
+    let json = serde_json::to_string(&c).unwrap();
+    let mut restored: totals::State = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(restored.resume(1), CoroutineState::Yielded(6)); // chunk completes with 5 + 1
+    assert_eq!(restored.resume(2), CoroutineState::Complete(8));
+}
+```
 
 ## Persisting a suspended coroutine
 
@@ -197,6 +243,17 @@ produces a dedicated compile error with the workaround in the message.
 - **Let chains are unsupported**: an `if`/`while` whose body contains a
   `yield_!` cannot use an edition-2024 let chain
   (`if let P = e && cond`); use nested `if let` or `match` instead.
+- **`yield_all!` takes a variable, not an expression**: the operand must
+  be a variable with a syntactically known type
+  (`let sub: chunk::State = chunk(..); ... yield_all!(sub)` — the state
+  stores the inner coroutine, so its type must be spellable). Its yield
+  and resume types must match the outer coroutine's; mismatches surface
+  as ordinary type errors. The inner coroutine must not have been
+  started yet (`start()` panics otherwise). Supported positions are the
+  same as for value-producing control flow: a statement
+  (`yield_all!(sub);`, completion value discarded), a whole `let`
+  initializer with a type annotation, or the function's trailing
+  expression.
 - **Value bindings crossing the join need an annotation**: in
   `let x = if c { yield_!(1); a } else { b };` the join is a state
   variant storing `x`, so write `let x: T = ...` (the usual
