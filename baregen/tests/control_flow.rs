@@ -167,6 +167,59 @@ fn if_let_in_value_position() {
     assert_eq!(c.resume(()), CoroutineState::Complete(8));
 }
 
+/// `let ... else` with a yield inside the diverging block. The pattern
+/// binding is rebound with an annotation so it can cross the later
+/// yield.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn unwrap_or_bail(opt: Option<u32>) -> u32 {
+    let Some(v) = opt else {
+        yield_!(404);
+        return 0;
+    };
+    let v2: u32 = v;
+    let r = yield_!(v2);
+    v2 + r
+}
+
+#[test]
+fn let_else_matched_continues() {
+    let mut c = unwrap_or_bail(Some(5));
+    assert_eq!(c.start(), CoroutineState::Yielded(5));
+    assert_eq!(c.resume(3), CoroutineState::Complete(8));
+}
+
+#[test]
+fn let_else_unmatched_diverges() {
+    let mut c = unwrap_or_bail(None);
+    assert_eq!(c.start(), CoroutineState::Yielded(404));
+    assert_eq!(c.resume(9), CoroutineState::Complete(0));
+}
+
+/// `let ... else` diverging via `break` out of a yielding loop.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn sum_messages() -> u32 {
+    let mut sum: u32 = 0;
+    loop {
+        let msg = yield_!(sum);
+        let Some(v) = msg.checked_sub(1) else {
+            yield_!(999);
+            break;
+        };
+        sum += v;
+    }
+    sum
+}
+
+#[test]
+fn let_else_break_exits_the_loop() {
+    let mut c = sum_messages();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(5), CoroutineState::Yielded(4));
+    assert_eq!(c.resume(3), CoroutineState::Yielded(6));
+    assert_eq!(c.resume(0), CoroutineState::Yielded(999));
+    assert_eq!(c.resume(0), CoroutineState::Complete(6));
+}
+
 // The design document's `totals` example.
 #[baregen::coroutine(yield = u32, resume = u32)]
 fn totals(n: u32) -> u32 {

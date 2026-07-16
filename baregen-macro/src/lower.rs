@@ -332,7 +332,8 @@ const ERR_STMT_POSITION: &str = "yield_! is only allowed in statement position: 
 const ERR_TRAILING_YIELD: &str =
     "yield_! as the trailing expression is not supported; add a semicolon";
 const ERR_FOREIGN_MACRO: &str = "yield_! cannot appear inside another macro invocation";
-const ERR_LET_ELSE: &str = "`let ... else` cannot be used with yield_!";
+const ERR_LET_ELSE_INIT: &str =
+    "yield_! in the initializer of `let ... else` is not supported";
 const ERR_SIMPLE_BINDING: &str =
     "the binding of `let ... = yield_!(...)` must be a simple identifier";
 const ERR_VALUE_LET_BINDING: &str =
@@ -683,6 +684,11 @@ impl Lowerer {
             syn::Stmt::Expr(syn::Expr::Continue(c), _) => self.lower_continue(c),
             _ if !contains_yield_stmt(stmt) => self.push_opaque(stmt),
             // From here on the statement contains a yield_! somewhere.
+            syn::Stmt::Local(local)
+                if matches!(&local.init, Some(init) if init.diverge.is_some()) =>
+            {
+                self.lower_let_else(local);
+            }
             syn::Stmt::Local(local) => self.lower_let_value(local),
             syn::Stmt::Expr(e, _) => self.lower_control_expr(e),
             // Stmt::Macro with yield tokens is caught as opaque; items
@@ -693,8 +699,8 @@ impl Lowerer {
 
     fn lower_let_yield(&mut self, local: &syn::Local) {
         let init = local.init.as_ref().expect("BUG: checked by caller");
-        if let Some((else_token, _)) = &init.diverge {
-            return self.err(syn::Error::new_spanned(else_token, ERR_LET_ELSE));
+        if init.diverge.is_some() {
+            return self.err(syn::Error::new_spanned(&init.expr, ERR_LET_ELSE_INIT));
         }
         let syn::Expr::Macro(m) = &*init.expr else {
             unreachable!()
@@ -726,9 +732,6 @@ impl Lowerer {
     /// annotation the analysis reports the usual annotate-the-type error.
     fn lower_let_value(&mut self, local: &syn::Local) {
         let init = local.init.as_ref().expect("BUG: a yield is inside the initializer");
-        if let Some((else_token, _)) = &init.diverge {
-            return self.err(syn::Error::new_spanned(else_token, ERR_LET_ELSE));
-        }
         let expr = strip_parens(&init.expr);
         if !matches!(
             expr,
@@ -777,6 +780,55 @@ impl Lowerer {
             .last_mut()
             .expect("BUG: no scope")
             .insert(pi.ident.to_string(), id);
+    }
+
+    /// `let pat = scrutinee else { .. };` containing a yield_! (rustc
+    /// requires the `else` block to diverge, so the yield is inside it):
+    /// desugared into a refutable two-arm `match` whose `_` arm is the
+    /// diverging block and whose pattern arm is the continuation of the
+    /// enclosing statement list. The pattern's bindings enter the
+    /// enclosing scope as arm-pattern bindings, so the usual
+    /// rebind-before-yield constraint applies to them.
+    fn lower_let_else(&mut self, local: &syn::Local) {
+        let init = local.init.as_ref().expect("BUG: checked by caller");
+        let (else_token, else_expr) = init.diverge.as_ref().expect("BUG: checked by caller");
+        let syn::Expr::Block(else_block) = &**else_expr else {
+            unreachable!("a `let ... else` body is always a block")
+        };
+        self.check_no_yield(&init.expr, ERR_LET_ELSE_INIT);
+        self.record_expr_uses(&init.expr, self.current);
+        let (pat, annotation) = match &local.pat {
+            syn::Pat::Type(pt) => (&*pt.pat, Some(&*pt.ty)),
+            other => (other, None),
+        };
+        // A `let pat: T = ..` ascription has no place on a match arm
+        // pattern; reapply it to the scrutinee instead.
+        let scrutinee: syn::Expr = match annotation {
+            Some(ty) => {
+                let e = &init.expr;
+                syn::parse_quote_spanned!(e.span() => { let __scrutinee: #ty = #e; __scrutinee })
+            }
+            None => (*init.expr).clone(),
+        };
+        let cont = self.new_block(false);
+        let else_bb = self.new_block(false);
+        self.terminate(refutable_match(&scrutinee, pat, cont, else_bb));
+        self.current = else_bb;
+        self.in_scope(|lw| lw.lower_stmt_list(&else_block.block.stmts, TailCtx::Discard));
+        // In valid code the `else` block diverges, so a fall-through
+        // terminator is unreachable; it only has to typecheck (`return`
+        // is rewritten into an opaque statement before lowering and a
+        // trailing `panic!()` stays opaque, so the block can still look
+        // open here). Invalid, non-diverging code reaches the
+        // `unreachable!` at run time instead of failing to compile.
+        if !self.is_current_terminated() {
+            self.terminate(Terminator::Return(syn::parse_quote_spanned!(
+                else_token.span() =>
+                    ::core::unreachable!("the `else` block of `let ... else` must diverge")
+            )));
+        }
+        self.current = cont;
+        self.define_pat_bindings(pat, cont, BindingKind::ArmPat, None);
     }
 
     /// Ends the current block with a `Yield` terminator and switches to
@@ -1937,6 +1989,80 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn let_else_becomes_a_refutable_match() {
+        let block: syn::Block = parse_quote!({
+            let Some(x2) = opt else {
+                yield_!(0);
+                return;
+            };
+            f(x2);
+        });
+        let cfg = lower_args(&["opt"], &block);
+        let Terminator::Match { arms, .. } = &cfg.blocks[0].terminator else {
+            panic!("let-else should lower to a match: {:?}", cfg.blocks[0].terminator);
+        };
+        assert_eq!(cfg.blocks[0].uses, ids(&[binding(&cfg, "opt")]));
+        assert_eq!(arms.len(), 2);
+        let wild: syn::Pat = parse_quote!(_);
+        assert_eq!(arms[1].pat, wild);
+        // The pattern arm is the continuation: it binds x2 and returns.
+        let cont = &cfg.blocks[arms[0].body];
+        assert_eq!(cont.defs, ids(&[binding(&cfg, "x2")]));
+        assert!(matches!(cont.terminator, Terminator::Return(_)));
+        // The `_` arm yields; its resume block ends in the synthetic
+        // unreachable fall-through (the `return;` stays opaque).
+        let Terminator::Yield { next, .. } = cfg.blocks[arms[1].body].terminator else {
+            panic!("else arm should yield");
+        };
+        let resume = &cfg.blocks[next];
+        assert_eq!(resume.stmts.len(), 1, "the rewritten `return` stays opaque");
+        assert!(matches!(resume.terminator, Terminator::Return(_)));
+    }
+
+    #[test]
+    fn let_else_break_terminates_the_else_arm() {
+        let block: syn::Block = parse_quote!({
+            loop {
+                let Some(x2) = opt else {
+                    yield_!(0);
+                    break;
+                };
+                g(x2);
+                yield_!(1);
+            }
+        });
+        let cfg = lower_args(&["opt"], &block);
+        // The break's resume block jumps to the loop exit; no synthetic
+        // unreachable fall-through survives simplification.
+        assert!(
+            cfg.blocks
+                .iter()
+                .all(|b| !matches!(&b.terminator, Terminator::Return(e)
+                    if quote::quote!(#e).to_string().contains("unreachable"))),
+        );
+    }
+
+    #[test]
+    fn let_else_annotation_moves_to_the_scrutinee() {
+        let block: syn::Block = parse_quote!({
+            let Some(x2): Option<u32> = opt else {
+                yield_!(0);
+                return;
+            };
+            f(x2);
+        });
+        let cfg = lower_args(&["opt"], &block);
+        let Terminator::Match { scrutinee, .. } = &cfg.blocks[0].terminator else {
+            panic!("let-else should lower to a match");
+        };
+        let expected: syn::Expr = parse_quote!({
+            let __scrutinee: Option<u32> = opt;
+            __scrutinee
+        });
+        assert_eq!(*scrutinee, expected);
+    }
+
     // === for loops ===
 
     #[test]
@@ -2770,13 +2896,19 @@ mod tests {
     }
 
     #[test]
-    fn let_else_with_yield_is_rejected() {
+    fn yield_in_let_else_initializer_is_rejected() {
         let block: syn::Block = parse_quote!({
             let x = yield_!(1) else {
                 return;
             };
         });
-        assert!(error_of(&block).to_string().contains("let ... else"));
+        assert!(error_of(&block).to_string().contains("initializer of `let ... else`"));
+        let block: syn::Block = parse_quote!({
+            let Some(x) = f(yield_!(1)) else {
+                return;
+            };
+        });
+        assert!(error_of(&block).to_string().contains("initializer of `let ... else`"));
     }
 
     #[test]
