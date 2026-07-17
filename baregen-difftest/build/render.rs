@@ -175,8 +175,15 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
         Stmt::Yield(e) => {
             out.push_str(&format!("{i}yield_!({});\n", expr(e)));
         }
-        Stmt::LetYield { name, arg } => {
-            out.push_str(&format!("{i}let {name} = yield_!({});\n", expr(arg)));
+        Stmt::LetYield { name, arg, annot } => {
+            let ty = if *annot { ": u32" } else { "" };
+            out.push_str(&format!("{i}let {name}{ty} = yield_!({});\n", expr(arg)));
+        }
+        Stmt::LetInfer { name, from } => {
+            out.push_str(&format!("{i}let mut {name} = {from};\n"));
+        }
+        Stmt::LetNegLit { name, val } => {
+            out.push_str(&format!("{i}let {name} = -{val}i32;\n"));
         }
         Stmt::LetYieldAdd { name, a, b } => {
             out.push_str(&format!(
@@ -296,6 +303,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
         Stmt::For {
             var,
             upper,
+            inclusive,
             label,
             body,
         } => {
@@ -303,7 +311,8 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                 Upper::Lit(n) => format!("{n}u32"),
                 Upper::Var(v) => v.clone(),
             };
-            out.push_str(&format!("{i}'l{label}: for {var} in 0u32..{up} {{\n"));
+            let dots = if *inclusive { "..=" } else { ".." };
+            out.push_str(&format!("{i}'l{label}: for {var} in 0u32{dots}{up} {{\n"));
             render_block(out, body, l + 1, world);
             out.push_str(&format!("{i}}}\n"));
         }
@@ -390,6 +399,11 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
             render_block(out, body, l + 1, world);
             out.push_str(&format!("{i}}};\n"));
         }
+        Stmt::LabeledBlock { label, body } => {
+            out.push_str(&format!("{i}'l{label}: {{\n"));
+            render_block(out, body, l + 1, world);
+            out.push_str(&format!("{i}}}\n"));
+        }
         Stmt::Break(label) => {
             out.push_str(&format!("{i}break 'l{label};\n"));
         }
@@ -398,6 +412,9 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
         }
         Stmt::Continue(label) => {
             out.push_str(&format!("{i}continue 'l{label};\n"));
+        }
+        Stmt::ContinueBare => {
+            out.push_str(&format!("{i}continue;\n"));
         }
         Stmt::Return(r) => {
             out.push_str(&format!("{i}return {};\n", ret_expr(r)));
@@ -499,10 +516,11 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
 fn expr(e: &Expr) -> String {
     match e {
         Expr::Lit(v) => format!("{v}u32"),
+        Expr::LitUn(v) => format!("{v}"),
         Expr::Var(n) => n.clone(),
-        Expr::WrapAdd(a, b) => format!("({}).wrapping_add({})", expr(a), expr(b)),
-        Expr::WrapSub(a, b) => format!("({}).wrapping_sub({})", expr(a), expr(b)),
-        Expr::WrapMul(a, b) => format!("({}).wrapping_mul({})", expr(a), expr(b)),
+        Expr::WrapAdd(a, b) => format!("({}).wrapping_add({})", expr_typed(a), expr(b)),
+        Expr::WrapSub(a, b) => format!("({}).wrapping_sub({})", expr_typed(a), expr(b)),
+        Expr::WrapMul(a, b) => format!("({}).wrapping_mul({})", expr_typed(a), expr(b)),
         Expr::Rem(a, m) => format!("(({}) % {m}u32)", expr(a)),
         // The operand is reduced below 16, so the i32 negation cannot
         // overflow; `as u32` wraps and never panics.
@@ -518,6 +536,25 @@ fn expr(e: &Expr) -> String {
             )
         }
         Expr::Index { arr, idx } => format!("({arr}[((({}) % 4u32) as usize)])", expr(idx)),
+    }
+}
+
+/// Like [`expr`], for positions whose type rustc will not infer from
+/// context (the receiver of a `wrapping_*` method call): unsuffixed
+/// literals are rendered suffixed, including one selected through a
+/// tuple field access, so the receiver type is never ambiguous.
+fn expr_typed(e: &Expr) -> String {
+    match e {
+        Expr::LitUn(v) => format!("{v}u32"),
+        Expr::TupleField(a, b, idx) => {
+            let (a, b) = if *idx == 0 {
+                (expr_typed(a), expr(b))
+            } else {
+                (expr(a), expr_typed(b))
+            };
+            format!("(({a}, {b}).{idx})")
+        }
+        _ => expr(e),
     }
 }
 

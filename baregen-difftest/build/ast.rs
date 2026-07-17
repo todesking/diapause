@@ -27,6 +27,9 @@ pub struct Case {
 
 pub enum Expr {
     Lit(u32),
+    /// An unsuffixed integer literal; every generated context infers it
+    /// as u32.
+    LitUn(u32),
     Var(String),
     WrapAdd(Box<Expr>, Box<Expr>),
     WrapSub(Box<Expr>, Box<Expr>),
@@ -117,10 +120,24 @@ pub enum Stmt {
     },
     /// `yield_!(expr);`
     Yield(Expr),
-    /// `let name = yield_!(arg);`
+    /// `let name = yield_!(arg);`, or `let name: u32 = yield_!(arg);`
+    /// when `annot` is set.
     LetYield {
         name: String,
         arg: Expr,
+        annot: bool,
+    },
+    /// `let mut name = from;` — an unannotated move/copy of a known
+    /// variable; the macro follows the source variable's type.
+    LetInfer {
+        name: String,
+        from: String,
+    },
+    /// `let name = -val i32;` — negation of a suffixed literal keeps
+    /// its type; the binding is never used afterwards.
+    LetNegLit {
+        name: String,
+        val: u32,
     },
     /// `let name: u32 = u32::wrapping_add(yield_!(a), yield_!(b));`
     /// — expression-position yields with a pure prefix.
@@ -205,10 +222,12 @@ pub enum Stmt {
         modulus: u32,
         body: Vec<Stmt>,
     },
-    /// `'lN: for var in 0u32..upper { .. }`
+    /// `'lN: for var in 0u32..upper { .. }` (or `0u32..=upper` when
+    /// `inclusive` is set).
     For {
         var: String,
         upper: Upper,
+        inclusive: bool,
         label: usize,
         body: Vec<Stmt>,
     },
@@ -251,10 +270,19 @@ pub enum Stmt {
         fuel_value: Expr,
         body: Vec<Stmt>,
     },
+    /// `'lN: { .. }` — a labeled block statement; jumps targeting its
+    /// label can only be plain `break`s.
+    LabeledBlock {
+        label: usize,
+        body: Vec<Stmt>,
+    },
     Break(usize),
     /// `break 'lN expr;` — targets a `ValueLoop` label.
     BreakValue(usize, Expr),
     Continue(usize),
+    /// `continue;` — targets the nearest enclosing loop (labeled
+    /// blocks are skipped by an unlabeled continue).
+    ContinueBare,
     Return(RetExpr),
     /// `let mut name: u32 = if cond { ..; then_e } else { ..; else_e };`
     LetIfValue {

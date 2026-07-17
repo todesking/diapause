@@ -66,6 +66,9 @@ struct LoopLabel {
     id: usize,
     /// Labels of `ValueLoop`s: breaks targeting them carry a value.
     value: bool,
+    /// Labels of `LabeledBlock`s: only plain `break` may target them,
+    /// and an unlabeled `continue` skips them.
+    block: bool,
 }
 
 struct Gen<'a> {
@@ -196,6 +199,7 @@ impl<'a> Gen<'a> {
             self.loop_labels.push(LoopLabel {
                 id: label,
                 value: true,
+                block: false,
             });
         }
         self.depth += 1;
@@ -305,6 +309,8 @@ impl<'a> Gen<'a> {
         let mut kinds: Vec<(u64, u8)> = vec![(3, 0), (3, 1), (2, 2), (1, 3), (2, 11)];
         kinds.push((1, 20));
         kinds.push((2, 21));
+        kinds.push((1, 23));
+        kinds.push((1, 25));
         if has_assignable {
             kinds.push((2, 4));
             kinds.push((1, 5));
@@ -335,6 +341,7 @@ impl<'a> Gen<'a> {
             if self.jump_possible() {
                 kinds.push((2, 16));
             }
+            kinds.push((1, 26));
         }
         if delegatable {
             kinds.push((2, 17));
@@ -364,9 +371,10 @@ impl<'a> Gen<'a> {
             2 => {
                 self.count_yields(1);
                 let arg = self.gen_expr(2);
+                let annot = self.rng.chance(1, 3);
                 let name = self.fresh("r");
                 self.push_var(&name, false, false);
-                Stmt::LetYield { name, arg }
+                Stmt::LetYield { name, arg, annot }
             }
             3 => {
                 self.count_yields(2);
@@ -433,14 +441,56 @@ impl<'a> Gen<'a> {
                 Stmt::LetArray { name, elems }
             }
             21 => self.gen_match_yield(),
-            _ => {
+            22 => {
                 self.count_yields(1);
                 Stmt::XorAssignYield {
                     name: self.pick_assignable(),
                     arg: self.gen_expr(1),
                 }
             }
+            23 => {
+                let from = self.pick_u32_var();
+                let name = self.fresh("m");
+                self.push_var(&name, true, false);
+                Stmt::LetInfer { name, from }
+            }
+            25 => {
+                // The i32 binding is deliberately kept out of the u32
+                // variable pool and never referenced again.
+                let name = self.fresh("n");
+                Stmt::LetNegLit {
+                    name,
+                    val: self.rng.below(16) as u32,
+                }
+            }
+            _ => self.gen_labeled_block(budget),
         }
+    }
+
+    fn gen_labeled_block(&mut self, budget: &mut i32) -> Stmt {
+        let label = self.fresh_label();
+        self.depth += 1;
+        self.loop_labels.push(LoopLabel {
+            id: label,
+            value: false,
+            block: true,
+        });
+        let body = self.gen_block(budget);
+        self.loop_labels.pop();
+        self.depth -= 1;
+        Stmt::LabeledBlock { label, body }
+    }
+
+    /// A u32 variable usable in plain expressions (arguments always
+    /// qualify, so the pool is never empty).
+    fn pick_u32_var(&mut self) -> String {
+        let names: Vec<&str> = self
+            .scope
+            .iter()
+            .filter(|v| !v.opt && !v.res && !v.arr)
+            .map(|v| v.name.as_str())
+            .collect();
+        (*self.rng.pick(&names)).to_string()
     }
 
     /// A statement-position `match` with non-block arm bodies; some
@@ -667,6 +717,7 @@ impl<'a> Gen<'a> {
         self.loop_labels.push(LoopLabel {
             id: label,
             value: false,
+            block: false,
         });
         let stmt = match self.rng.below(3) {
             0 => {
@@ -676,12 +727,21 @@ impl<'a> Gen<'a> {
                 } else {
                     Upper::Lit(1 + self.rng.below(4) as u32)
                 };
+                // KNOWN BUG, generation disabled: serde round-trip of a
+                // state suspended after an inclusive range's last
+                // element re-yields that element forever (serde's
+                // RangeInclusive impl drops the internal `exhausted`
+                // flag, and the state stores the iterator directly).
+                // Re-enable (`self.rng.chance(1, 4)`) once fixed.
+                let inclusive = false;
                 // Arguments are proptest-drawn from 0..16 and delegation
                 // arguments are reduced mod 16, so an argument-bounded
-                // range runs at most 15 times.
-                let iters = match &upper {
-                    Upper::Lit(n) => *n as u64,
-                    Upper::Var(_) => 15,
+                // range runs at most 15 times (16 inclusively).
+                let iters = match (&upper, inclusive) {
+                    (Upper::Lit(n), false) => *n as u64,
+                    (Upper::Lit(n), true) => *n as u64 + 1,
+                    (Upper::Var(_), false) => 15,
+                    (Upper::Var(_), true) => 16,
                 };
                 self.push_var(&var, false, false);
                 let body = self.gen_loop_body(iters, budget);
@@ -689,6 +749,7 @@ impl<'a> Gen<'a> {
                 Stmt::For {
                     var,
                     upper,
+                    inclusive,
                     label,
                     body,
                 }
@@ -735,6 +796,7 @@ impl<'a> Gen<'a> {
         self.loop_labels.push(LoopLabel {
             id: label,
             value: false,
+            block: false,
         });
         let mark = self.scope.len();
         self.push_var(&rebind, true, false);
@@ -768,6 +830,7 @@ impl<'a> Gen<'a> {
         self.loop_labels.push(LoopLabel {
             id: label,
             value: true,
+            block: false,
         });
         self.depth += 1;
         let body = self.gen_loop_body(limit as u64, budget);
@@ -788,9 +851,15 @@ impl<'a> Gen<'a> {
 
     fn gen_jump(&mut self) -> Option<Stmt> {
         if !self.loop_labels.is_empty() && (self.in_value || self.rng.chance(2, 3)) {
+            // An unlabeled continue targets the nearest enclosing loop.
+            // The innermost labeled construct must be a loop: crossing
+            // a labeled block without naming a label is E0695.
+            if self.loop_labels.last().is_some_and(|l| !l.block) && self.rng.chance(1, 5) {
+                return Some(Stmt::ContinueBare);
+            }
             let i = self.rng.below(self.loop_labels.len() as u64) as usize;
-            let LoopLabel { id, value } = self.loop_labels[i];
-            Some(if self.rng.chance(1, 2) {
+            let LoopLabel { id, value, block } = self.loop_labels[i];
+            Some(if block || self.rng.chance(1, 2) {
                 if value {
                     Stmt::BreakValue(id, self.gen_expr(2))
                 } else {
@@ -932,15 +1001,14 @@ impl<'a> Gen<'a> {
     fn gen_expr(&mut self, depth: u32) -> Expr {
         if depth == 0 || self.rng.chance(1, 2) {
             if self.rng.chance(3, 5) {
-                let names: Vec<&str> = self
-                    .scope
-                    .iter()
-                    .filter(|v| !v.opt && !v.res && !v.arr)
-                    .map(|v| v.name.as_str())
-                    .collect();
-                Expr::Var((*self.rng.pick(&names)).to_string())
+                Expr::Var(self.pick_u32_var())
             } else {
-                Expr::Lit(self.rng.below(16) as u32)
+                let v = self.rng.below(16) as u32;
+                if self.rng.chance(1, 4) {
+                    Expr::LitUn(v)
+                } else {
+                    Expr::Lit(v)
+                }
             }
         } else {
             let has_arr = self.scope.iter().any(|v| v.arr);
