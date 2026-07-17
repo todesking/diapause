@@ -278,3 +278,133 @@ pub(crate) fn phantom_for_unused_params<'a>(
     // Send/Sync/Copy/Clone.
     Some(syn::parse_quote!((#(fn() -> #unused_types,)* #(fn() -> &#unused_lifetimes (),)*)))
 }
+
+#[cfg(test)]
+mod tests {
+    use proc_macro2::TokenStream;
+    use syn::parse_quote;
+
+    fn expand_err(item: syn::ItemFn) -> syn::Error {
+        crate::expand::expand(TokenStream::new(), item).unwrap_err()
+    }
+
+    fn expand_err_msg(item: syn::ItemFn) -> String {
+        expand_err(item).to_string()
+    }
+
+    #[test]
+    fn const_functions_are_rejected() {
+        let msg = expand_err_msg(parse_quote!(
+            const fn c() {}
+        ));
+        assert!(
+            msg.contains("does not support const functions"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn async_functions_are_rejected() {
+        let msg = expand_err_msg(parse_quote!(
+            async fn c() {}
+        ));
+        assert!(
+            msg.contains("does not support async functions"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unsafe_functions_are_rejected() {
+        let msg = expand_err_msg(parse_quote!(
+            unsafe fn c() {}
+        ));
+        assert!(
+            msg.contains("does not support unsafe functions"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn extern_functions_are_rejected() {
+        let msg = expand_err_msg(parse_quote!(
+            extern "C" fn c() {}
+        ));
+        assert!(
+            msg.contains("does not support extern functions"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn variadic_functions_are_rejected() {
+        // A plain variadic fn is syntactically valid to syn (rustc
+        // rejects it semantically); an `extern` variadic would hit the
+        // abi check first.
+        let msg = expand_err_msg(parse_quote!(
+            fn c(x: u32, ...) {}
+        ));
+        assert!(
+            msg.contains("does not support variadic functions"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn methods_are_rejected() {
+        let msg = expand_err_msg(parse_quote!(
+            fn c(&self) {}
+        ));
+        assert!(msg.contains("cannot be applied to methods"), "got: {msg}");
+    }
+
+    #[test]
+    fn elided_reference_lifetime_in_return_type_is_rejected() {
+        let msg = expand_err_msg(parse_quote!(
+            fn c(x: &'static u32) -> &u32 {
+                x
+            }
+        ));
+        assert!(
+            msg.contains("elided lifetimes in the return type"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("use a named lifetime"), "got: {msg}");
+    }
+
+    #[test]
+    fn underscore_lifetime_in_return_type_is_rejected() {
+        let msg = expand_err_msg(parse_quote!(
+            fn c() -> Wrapper<'_> {
+                todo!()
+            }
+        ));
+        assert!(
+            msg.contains("elided lifetimes in the return type"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn impl_trait_in_return_type_is_rejected() {
+        let msg = expand_err_msg(parse_quote!(
+            fn c() -> impl Iterator<Item = u32> {
+                todo!()
+            }
+        ));
+        assert!(
+            msg.contains("`impl Trait` in the return type is not supported"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn return_type_errors_are_combined() {
+        let err = expand_err(parse_quote!(
+            fn c() -> (&u32, impl Sized) {
+                todo!()
+            }
+        ));
+        assert_eq!(err.into_iter().count(), 2);
+    }
+}
