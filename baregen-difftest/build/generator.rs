@@ -192,22 +192,24 @@ impl<'a> Gen<'a> {
         let has_assignable = self.scope.iter().any(|v| v.assignable && !v.opt);
         let has_opt = self.has_opt_var();
         let has_res = self.has_res_var();
-        let delegatable =
-            !self.in_value && self.loop_depth == 0 && self.prior.iter().any(|p| !p.has_delegate);
+        // Value-position if/match arms run at most once, so delegation
+        // there cannot compound trace length; `loop_depth == 0` still
+        // keeps it out of every loop body, including value loops.
+        let delegatable = self.loop_depth == 0 && self.prior.iter().any(|p| !p.has_delegate);
 
         let mut kinds: Vec<(u64, u8)> = vec![(3, 0), (3, 1), (2, 2), (1, 3), (2, 11)];
         if has_assignable {
             kinds.push((2, 4));
             kinds.push((1, 5));
         }
-        if has_opt && self.flavor == Flavor::OptionU32 && !self.in_value {
+        if has_opt && self.flavor == Flavor::OptionU32 {
             kinds.push((2, 15));
         }
         // Weighted higher than the Option counterparts: the `?`-with-
         // From-conversion path is the whole point of this flavor.
         if self.flavor == Flavor::ResultU32 {
             kinds.push((4, 18));
-            if has_res && !self.in_value {
+            if has_res {
                 kinds.push((6, 19));
             }
         }
