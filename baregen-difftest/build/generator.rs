@@ -427,13 +427,15 @@ impl<'a> Gen<'a> {
         let scrut = self.gen_expr(2);
         let modulus = 2 + self.rng.below(2) as u32;
         self.depth += 1;
-        let mut arms: Vec<Vec<Stmt>> = (0..modulus).map(|_| self.gen_block(budget)).collect();
+        let mut arms: Vec<(Option<Cond>, Vec<Stmt>)> = (0..modulus)
+            .map(|j| (self.gen_arm_guard(j, modulus), self.gen_block(budget)))
+            .collect();
         self.depth -= 1;
         if self.rng.chance(1, 4)
             && let Some(jump) = self.gen_jump()
         {
             let i = self.rng.below(modulus as u64) as usize;
-            arms[i].push(jump);
+            arms[i].1.push(jump);
         }
         Stmt::Match {
             scrut,
@@ -704,8 +706,12 @@ impl<'a> Gen<'a> {
         self.in_value = true;
         let saved_labels = std::mem::take(&mut self.loop_labels);
         self.depth += 1;
-        let arms: Vec<(Vec<Stmt>, Expr)> = (0..modulus)
-            .map(|_| self.gen_block_with_tail(budget))
+        let arms: Vec<(Option<Cond>, Vec<Stmt>, Expr)> = (0..modulus)
+            .map(|j| {
+                let guard = self.gen_arm_guard(j, modulus);
+                let (b, e) = self.gen_block_with_tail(budget);
+                (guard, b, e)
+            })
             .collect();
         self.depth -= 1;
         self.loop_labels = saved_labels;
@@ -752,6 +758,17 @@ impl<'a> Gen<'a> {
                     2 + self.rng.below(5) as u32,
                 ),
             }
+        }
+    }
+
+    /// Pure guard for a literal match arm (never for the trailing `_`
+    /// arm, which must stay unguarded for exhaustiveness). `Cond` is
+    /// yield-free by construction, so guards stay pure.
+    fn gen_arm_guard(&mut self, arm: u32, modulus: u32) -> Option<Cond> {
+        if arm + 1 < modulus && self.rng.chance(2, 5) {
+            Some(self.gen_cond())
+        } else {
+            None
         }
     }
 

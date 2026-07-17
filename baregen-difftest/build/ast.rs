@@ -142,10 +142,12 @@ pub enum Stmt {
     },
     /// `match (scrut) % modulus { 0 => .., .., _ => .. }` with
     /// `modulus` arms (last one is `_`), literal patterns only.
+    /// Literal arms may carry a pure (yield-free) guard; a false guard
+    /// falls through to the `_` arm.
     Match {
         scrut: Expr,
         modulus: u32,
-        arms: Vec<Vec<Stmt>>,
+        arms: Vec<(Option<Cond>, Vec<Stmt>)>,
     },
     /// `let 0u32 = (scrut) % modulus else { ..; <jump> };` — the else
     /// block always ends in a diverging jump, and the pattern has no
@@ -215,12 +217,13 @@ pub enum Stmt {
         else_b: Vec<Stmt>,
         else_e: Expr,
     },
-    /// `let mut name: u32 = match (scrut) % modulus { .. };`
+    /// `let mut name: u32 = match (scrut) % modulus { .. };` — literal
+    /// arms may carry a pure guard, as in `Match`.
     LetMatchValue {
         name: String,
         scrut: Expr,
         modulus: u32,
-        arms: Vec<(Vec<Stmt>, Expr)>,
+        arms: Vec<(Option<Cond>, Vec<Stmt>, Expr)>,
     },
     /// `yield_all!` delegation to an earlier generated case. This is
     /// the one construct rendered differently per world: the reference

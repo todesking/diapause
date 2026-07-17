@@ -196,12 +196,8 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
             arms,
         } => {
             out.push_str(&format!("{i}match ({}) % {modulus}u32 {{\n", expr(scrut)));
-            for (j, arm) in arms.iter().enumerate() {
-                let pat = if j + 1 == *modulus as usize {
-                    "_".to_string()
-                } else {
-                    format!("{j}u32")
-                };
+            for (j, (guard, arm)) in arms.iter().enumerate() {
+                let pat = arm_pat(j, *modulus, guard);
                 out.push_str(&format!("{}{pat} => {{\n", ind(l + 1)));
                 render_block(out, arm, l + 2, world);
                 out.push_str(&format!("{}}}\n", ind(l + 1)));
@@ -355,12 +351,8 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                 "{i}let mut {name}: u32 = match ({}) % {modulus}u32 {{\n",
                 expr(scrut)
             ));
-            for (j, (arm, e)) in arms.iter().enumerate() {
-                let pat = if j + 1 == *modulus as usize {
-                    "_".to_string()
-                } else {
-                    format!("{j}u32")
-                };
+            for (j, (guard, arm, e)) in arms.iter().enumerate() {
+                let pat = arm_pat(j, *modulus, guard);
                 out.push_str(&format!("{}{pat} => {{\n", ind(l + 1)));
                 render_block(out, arm, l + 2, world);
                 out.push_str(&format!("{}{}\n", ind(l + 2), expr(e)));
@@ -446,6 +438,20 @@ fn ret_expr(r: &RetExpr) -> String {
         RetExpr::OptVar(n) => n.clone(),
         RetExpr::OkWrapped(e) => format!("Ok({})", expr(e)),
         RetExpr::ErrWrapped(e) => format!("Err(baregen_difftest::Err1({}))", expr(e)),
+    }
+}
+
+/// Pattern (plus optional pure guard) of match arm `j`. The trailing
+/// `_` arm is never guarded.
+fn arm_pat(j: usize, modulus: u32, guard: &Option<Cond>) -> String {
+    let pat = if j + 1 == modulus as usize {
+        "_".to_string()
+    } else {
+        format!("{j}u32")
+    };
+    match guard {
+        Some(c) => format!("{pat} if {}", cond(c)),
+        None => pat,
     }
 }
 
