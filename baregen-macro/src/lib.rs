@@ -7,6 +7,8 @@ use proc_macro::TokenStream;
 mod analyze_cfg;
 mod args;
 mod cfg;
+#[cfg(test)]
+mod coverage_corpus;
 mod expand;
 mod hoist;
 mod lower;
