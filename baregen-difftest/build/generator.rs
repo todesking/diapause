@@ -127,7 +127,45 @@ impl<'a> Gen<'a> {
         let fingerprint = self.rng.chance(1, 4);
         let mut budget = 4 + self.rng.below(10) as i32;
         let stmts = self.gen_block(&mut budget);
-        let tail = if self.yields == 0 || self.rng.chance(3, 10) {
+        let tail = self.gen_tail();
+        Case {
+            body: Body { stmts, tail },
+            flavor: self.flavor,
+            fingerprint,
+            bound: self.bound,
+        }
+    }
+
+    fn gen_tail(&mut self) -> Tail {
+        // Tail-position delegation: the sub-case's completion value is
+        // this coroutine's, so it must have the same flavor.
+        if self.rng.chance(1, 8) {
+            let candidates: Vec<usize> = self
+                .prior
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.flavor == self.flavor && self.delegation_fits(p.bound))
+                .map(|(i, _)| i)
+                .collect();
+            if !candidates.is_empty() {
+                let sub_case = *self.rng.pick(&candidates);
+                self.bound += self.prior[sub_case].bound;
+                let args = (
+                    Expr::Rem(Box::new(self.gen_expr(1)), 16),
+                    Expr::Rem(Box::new(self.gen_expr(1)), 16),
+                );
+                let sub_var = self.fresh("s");
+                return Tail::Delegate {
+                    sub_case,
+                    sub_var,
+                    args,
+                };
+            }
+        }
+        if self.rng.chance(1, 7) {
+            return self.gen_tail_break_loop();
+        }
+        if self.yields == 0 || self.rng.chance(3, 10) {
             self.count_yields(1);
             let e = self.gen_expr(2);
             match self.flavor {
@@ -137,12 +175,51 @@ impl<'a> Gen<'a> {
             }
         } else {
             Tail::Ret(self.gen_ret_expr())
-        };
-        Case {
-            body: Body { stmts, tail },
-            flavor: self.flavor,
-            fingerprint,
-            bound: self.bound,
+        }
+    }
+
+    /// A value-bearing fuel loop as the function's trailing expression.
+    /// Like a `ValueLoop`, the loop is a value expression: enclosing
+    /// labels are hidden (there are none at the tail anyway) and
+    /// `return` is banned inside; only for the U32 flavor is its own
+    /// label jumpable, because generated `break`-values are u32.
+    fn gen_tail_break_loop(&mut self) -> Tail {
+        let counter = self.fresh("c");
+        let limit = 1 + self.rng.below(3) as u32;
+        let label = self.fresh_label();
+        self.push_var(&counter, false, false);
+        let fuel = self.gen_ret_expr();
+        let prev_in_value = self.in_value;
+        self.in_value = true;
+        let saved_labels = std::mem::take(&mut self.loop_labels);
+        if self.flavor == Flavor::U32 {
+            self.loop_labels.push(LoopLabel {
+                id: label,
+                value: true,
+            });
+        }
+        self.depth += 1;
+        let mut budget = 2 + self.rng.below(4) as i32;
+        let mut body = self.gen_loop_body(limit as u64, &mut budget);
+        self.depth -= 1;
+        self.loop_labels = saved_labels;
+        self.in_value = prev_in_value;
+        if self.yields == 0 {
+            // Keep the every-case-yields invariant even when neither
+            // the statements nor the loop body yielded.
+            let e = self.gen_expr(1);
+            let saved = self.loop_mult;
+            self.loop_mult *= limit as u64;
+            self.count_yields(1);
+            self.loop_mult = saved;
+            body.insert(0, Stmt::Yield(e));
+        }
+        Tail::BreakLoop {
+            counter,
+            limit,
+            label,
+            fuel,
+            body,
         }
     }
 

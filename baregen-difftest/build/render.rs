@@ -101,6 +101,51 @@ fn render_body(body: &Body, level: usize, world: World) -> String {
         Tail::Yield(e) => out.push_str(&format!("{i}yield_!({})\n", expr(e))),
         Tail::YieldWrapped(e) => out.push_str(&format!("{i}Some(yield_!({}))\n", expr(e))),
         Tail::YieldOk(e) => out.push_str(&format!("{i}Ok(yield_!({}))\n", expr(e))),
+        Tail::BreakLoop {
+            counter,
+            limit,
+            label,
+            fuel,
+            body,
+        } => {
+            out.push_str(&format!("{i}let mut {counter}: u32 = 0u32;\n"));
+            out.push_str(&format!("{i}'l{label}: loop {{\n"));
+            out.push_str(&format!(
+                "{}if {counter} >= {limit}u32 {{\n{}break 'l{label} {};\n{}}}\n",
+                ind(level + 1),
+                ind(level + 2),
+                ret_expr(fuel),
+                ind(level + 1)
+            ));
+            out.push_str(&format!(
+                "{}{counter} = {counter}.wrapping_add(1u32);\n",
+                ind(level + 1)
+            ));
+            render_block(&mut out, body, level + 1, world);
+            out.push_str(&format!("{i}}}\n"));
+        }
+        // Trailing delegation: the coroutine world delegates with
+        // `yield_all!`, the reference world calls the sub-case's
+        // reference function; either way the result is the tail value.
+        Tail::Delegate {
+            sub_case,
+            sub_var,
+            args,
+        } => {
+            let (e1, e2) = (expr(&args.0), expr(&args.1));
+            let sub_mod = format!("crate::case_{sub_case:03}");
+            match world {
+                World::Coroutine => {
+                    out.push_str(&format!(
+                        "{i}let {sub_var}: {sub_mod}::co::State = {sub_mod}::co({e1}, {e2});\n"
+                    ));
+                    out.push_str(&format!("{i}yield_all!({sub_var})\n"));
+                }
+                World::Reference => {
+                    out.push_str(&format!("{i}{sub_mod}::reference({e1}, {e2})\n"));
+                }
+            }
+        }
     }
     out
 }

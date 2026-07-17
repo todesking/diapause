@@ -294,6 +294,25 @@ pub enum Tail {
     YieldWrapped(Expr),
     /// Trailing `Ok(yield_!(e))` (ResultU32 flavor).
     YieldOk(Expr),
+    /// A value-bearing loop as the function's trailing expression:
+    /// `let mut c: u32 = 0u32; 'lN: loop { if c >= limit { break 'lN
+    /// fuel; } .. }` — every `break 'lN` carries a completion value
+    /// (the `OpaqueJumpKind::Complete` path).
+    BreakLoop {
+        counter: String,
+        limit: u32,
+        label: usize,
+        fuel: RetExpr,
+        body: Vec<Stmt>,
+    },
+    /// Trailing `yield_all!(sub)` — the delegated case's completion
+    /// value becomes this coroutine's completion value, so the
+    /// sub-case has the same flavor.
+    Delegate {
+        sub_case: usize,
+        sub_var: String,
+        args: (Expr, Expr),
+    },
 }
 
 pub struct Body {
