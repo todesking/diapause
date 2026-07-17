@@ -7,12 +7,24 @@
 /// The coroutine's return type. `OptionU32` bodies may use the `?`
 /// operator and `None`-returning paths. `ResultU32` bodies
 /// (`Result<u32, Err1>`) apply `?` to `Result<u32, Err2>` values,
-/// exercising From-based error conversion.
+/// exercising From-based error conversion. `Unit` bodies complete with
+/// `()` (rendered as `-> ()` or with no return type at all).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Flavor {
     U32,
     OptionU32,
     ResultU32,
+    Unit,
+}
+
+/// The case's `fingerprint` attribute argument.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FpMode {
+    Off,
+    /// Bare `fingerprint` — hash of the coroutine's source.
+    Source,
+    /// `fingerprint = "tag"` — the manual-tag string form.
+    Tag,
 }
 
 /// Shape of the coroutine's argument list. Non-plain shapes bind
@@ -45,7 +57,13 @@ pub struct Case {
     pub body: Body,
     pub flavor: Flavor,
     pub shape: ArgShape,
-    pub fingerprint: bool,
+    /// `yield = ()`: every yield renders as the argument-less
+    /// `yield_!()` and the yield values carry no information.
+    pub unit_yield: bool,
+    /// `Unit` flavor only: render `-> ()` instead of omitting the
+    /// return type.
+    pub explicit_unit: bool,
+    pub fingerprint: FpMode,
     /// Static worst-case yield count of one run, including delegated
     /// sub-cases; later cases use it to gate their own delegations.
     pub bound: u64,
@@ -114,6 +132,9 @@ pub enum RetExpr {
     OkWrapped(Expr),
     /// `Err(Err1(expr))` (ResultU32 flavor).
     ErrWrapped(Expr),
+    /// `()` (Unit flavor); a `return` statement renders it as a bare
+    /// `return;`.
+    Unit,
 }
 
 /// What a delegation binds its completion value to.
@@ -386,6 +407,12 @@ pub enum Tail {
     YieldWrapped(Expr),
     /// Trailing `Ok(yield_!(e))` (ResultU32 flavor).
     YieldOk(Expr),
+    /// `yield_!(e);` as the last statement of a Unit-flavor body, with
+    /// no trailing expression: the function ends right after resuming.
+    YieldUnit(Expr),
+    /// No trailing expression at all (Unit flavor) — the implicit `()`
+    /// return path.
+    ImplicitUnit,
     /// A value-bearing loop as the function's trailing expression:
     /// `let mut c: u32 = 0u32; 'lN: loop { if c >= limit { break 'lN
     /// fuel; } .. }` — every `break 'lN` carries a completion value

@@ -38,6 +38,9 @@ const YIELD_BOUND: u64 = 2_000;
 pub struct PriorCase {
     pub flavor: Flavor,
     pub shape: ArgShape,
+    /// `yield_all!` requires matching yield types, so unit-yield cases
+    /// delegate only to unit-yield cases and vice versa.
+    pub unit_yield: bool,
     pub bound: u64,
 }
 
@@ -88,15 +91,23 @@ struct Gen<'a> {
     /// Worst-case yields of the statements generated so far.
     bound: u64,
     in_value: bool,
+    /// `yield = ()`: yields render argument-less.
+    unit_yield: bool,
+    /// Generate a body with no suspension point at all (the coroutine
+    /// completes on `start()`), exercising the yield-free expansion.
+    no_yields: bool,
 }
 
 impl<'a> Gen<'a> {
     fn new(mut rng: Rng, prior: &'a [PriorCase]) -> Self {
-        let flavor = match rng.below(4) {
+        let flavor = match rng.below(5) {
             0 => Flavor::OptionU32,
             1 => Flavor::ResultU32,
+            2 => Flavor::Unit,
             _ => Flavor::U32,
         };
+        let unit_yield = rng.chance(1, 8);
+        let no_yields = rng.chance(1, 12);
         let shape = match rng.below(6) {
             0 => ArgShape::Tuple,
             1 => ArgShape::Mixed,
@@ -128,11 +139,22 @@ impl<'a> Gen<'a> {
             loop_mult: 1,
             bound: 0,
             in_value: false,
+            unit_yield,
+            no_yields,
         }
     }
 
     fn gen_case(mut self) -> Case {
-        let fingerprint = self.rng.chance(1, 4);
+        let fingerprint = if self.rng.chance(1, 4) {
+            if self.rng.chance(1, 3) {
+                FpMode::Tag
+            } else {
+                FpMode::Source
+            }
+        } else {
+            FpMode::Off
+        };
+        let explicit_unit = self.rng.chance(1, 2);
         let mut budget = 4 + self.rng.below(10) as i32;
         let stmts = self.gen_block(&mut budget);
         let tail = self.gen_tail();
@@ -140,9 +162,20 @@ impl<'a> Gen<'a> {
             body: Body { stmts, tail },
             flavor: self.flavor,
             shape: self.shape,
+            unit_yield: self.unit_yield,
+            explicit_unit,
             fingerprint,
             bound: self.bound,
         }
+    }
+
+    /// Whether the prior case is a valid delegation target here:
+    /// matching yield type, static bound within the gate, and (in a
+    /// no-yields body) itself yield-free.
+    fn delegation_ok(&self, p: &PriorCase) -> bool {
+        p.unit_yield == self.unit_yield
+            && self.delegation_fits(p.bound)
+            && (!self.no_yields || p.bound == 0)
     }
 
     fn gen_tail(&mut self) -> Tail {
@@ -153,7 +186,7 @@ impl<'a> Gen<'a> {
                 .prior
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| p.flavor == self.flavor && self.delegation_fits(p.bound))
+                .filter(|(_, p)| p.flavor == self.flavor && self.delegation_ok(p))
                 .map(|(i, _)| i)
                 .collect();
             if !candidates.is_empty() {
@@ -173,17 +206,22 @@ impl<'a> Gen<'a> {
         if self.rng.chance(1, 7) {
             return self.gen_tail_break_loop();
         }
-        if self.yields == 0 || self.rng.chance(3, 10) {
+        if !self.no_yields && (self.yields == 0 || self.rng.chance(3, 10)) {
             self.count_yields(1);
             let e = self.gen_expr(2);
-            match self.flavor {
+            return match self.flavor {
                 Flavor::U32 => Tail::Yield(e),
                 Flavor::OptionU32 => Tail::YieldWrapped(e),
                 Flavor::ResultU32 => Tail::YieldOk(e),
-            }
-        } else {
-            Tail::Ret(self.gen_ret_expr())
+                // The trailing expression must be `()`, so the yield
+                // becomes the last statement instead.
+                Flavor::Unit => Tail::YieldUnit(e),
+            };
         }
+        if self.flavor == Flavor::Unit && self.rng.chance(1, 2) {
+            return Tail::ImplicitUnit;
+        }
+        Tail::Ret(self.gen_ret_expr())
     }
 
     /// A value-bearing fuel loop as the function's trailing expression.
@@ -213,7 +251,7 @@ impl<'a> Gen<'a> {
         self.depth -= 1;
         self.loop_labels = saved_labels;
         self.in_value = prev_in_value;
-        if self.yields == 0 {
+        if self.yields == 0 && !self.no_yields {
             // Keep the every-case-yields invariant even when neither
             // the statements nor the loop body yielded.
             let e = self.gen_expr(1);
@@ -309,9 +347,14 @@ impl<'a> Gen<'a> {
         // Delegation anywhere (loop bodies, value positions, chains
         // through other delegating cases) as long as the static yield
         // bound stays under YIELD_BOUND.
-        let delegatable = self.prior.iter().any(|p| self.delegation_fits(p.bound));
+        let delegatable = self.prior.iter().any(|p| self.delegation_ok(p));
 
-        let mut kinds: Vec<(u64, u8)> = vec![(3, 0), (3, 1), (2, 2), (1, 3), (2, 11)];
+        let mut kinds: Vec<(u64, u8)> = vec![(3, 0), (2, 11)];
+        if !self.no_yields {
+            kinds.push((3, 1));
+            kinds.push((2, 2));
+            kinds.push((1, 3));
+        }
         kinds.push((1, 20));
         kinds.push((2, 21));
         kinds.push((1, 23));
@@ -321,8 +364,10 @@ impl<'a> Gen<'a> {
         kinds.push((1, 29));
         if has_assignable {
             kinds.push((2, 4));
-            kinds.push((1, 5));
-            kinds.push((1, 22));
+            if !self.no_yields {
+                kinds.push((1, 5));
+                kinds.push((1, 22));
+            }
         }
         if has_opt && self.flavor == Flavor::OptionU32 {
             kinds.push((2, 15));
@@ -551,7 +596,7 @@ impl<'a> Gen<'a> {
         let arms: Vec<(Option<Cond>, bool, Expr)> = (0..modulus)
             .map(|j| {
                 let guard = self.gen_arm_guard(j, modulus);
-                let yields = self.rng.chance(3, 5);
+                let yields = !self.no_yields && self.rng.chance(3, 5);
                 (guard, yields, self.gen_expr(1))
             })
             .collect();
@@ -943,6 +988,7 @@ impl<'a> Gen<'a> {
                     RetExpr::OkWrapped(self.gen_expr(2))
                 }
             }
+            Flavor::Unit => RetExpr::Unit,
         }
     }
 
@@ -951,7 +997,7 @@ impl<'a> Gen<'a> {
             .prior
             .iter()
             .enumerate()
-            .filter(|(_, p)| self.delegation_fits(p.bound))
+            .filter(|(_, p)| self.delegation_ok(p))
             .map(|(i, _)| i)
             .collect();
         let sub_case = *self.rng.pick(&candidates);
@@ -960,7 +1006,8 @@ impl<'a> Gen<'a> {
         self.bound += self.loop_mult * self.prior[sub_case].bound;
         let args = self.gen_delegate_args(sub_shape);
         let sub_var = self.fresh("s");
-        let bind = if self.rng.chance(1, 3) {
+        // A unit completion value is not worth binding.
+        let bind = if sub_flavor == Flavor::Unit || self.rng.chance(1, 3) {
             DelegateBind::Discard
         } else {
             match sub_flavor {
@@ -981,6 +1028,7 @@ impl<'a> Gen<'a> {
                     self.push_res_var(&name);
                     DelegateBind::Res(name)
                 }
+                Flavor::Unit => unreachable!("unit subs are always discarded"),
             }
         };
         Stmt::Delegate {

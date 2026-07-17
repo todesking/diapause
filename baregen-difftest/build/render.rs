@@ -16,20 +16,40 @@ enum World {
     Reference,
 }
 
+/// Everything render functions need besides the AST node: the target
+/// world and whether yields render argument-less (`yield = ()`).
+#[derive(Clone, Copy)]
+struct Ctx {
+    world: World,
+    unit_yield: bool,
+}
+
 pub fn render_case(idx: usize, case: &Case) -> String {
     let name = format!("case_{idx:03}");
-    let ret_ty = match case.flavor {
-        Flavor::U32 => "u32",
-        Flavor::OptionU32 => "Option<u32>",
+    let ret = match case.flavor {
+        Flavor::U32 => " -> u32",
+        Flavor::OptionU32 => " -> Option<u32>",
         // Fully qualified: the coroutine attribute moves the body into a
         // generated module, so bare imported names would not resolve.
-        Flavor::ResultU32 => "Result<u32, baregen_difftest::Err1>",
+        Flavor::ResultU32 => " -> Result<u32, baregen_difftest::Err1>",
+        // The unit return type is either spelled out or elided entirely.
+        Flavor::Unit => {
+            if case.explicit_unit {
+                " -> ()"
+            } else {
+                ""
+            }
+        }
     };
-    let attr = if case.fingerprint {
-        "#[baregen::coroutine(yield = u32, resume = u32, fingerprint)]"
-    } else {
-        "#[baregen::coroutine(yield = u32, resume = u32)]"
+    let yield_ty = if case.unit_yield { "()" } else { "u32" };
+    let fp = match case.fingerprint {
+        FpMode::Off => "",
+        FpMode::Source => ", fingerprint",
+        // The manual-tag string form; the tag's content is irrelevant
+        // to a single-binary run, it only has to parse and hash.
+        FpMode::Tag => ", fingerprint = \"difftest-tag\"",
     };
+    let attr = format!("#[baregen::coroutine(yield = {yield_ty}, resume = u32{fp})]");
     let sig = match case.shape {
         ArgShape::Plain => "a0: u32, a1: u32",
         ArgShape::Tuple => "(b0, b1): (u32, u32)",
@@ -51,20 +71,20 @@ pub fn render_case(idx: usize, case: &Case) -> String {
         ArgShape::Tuple => ("", "a0, a1", "(a0, a1)"),
         ArgShape::Mixed => ("\n        a2 in 0u32..16u32,", "a0, a1, a2", "(a0, a1), a2"),
     };
-    let co_body = format!(
-        "{}{}",
-        rebind(2),
-        render_body(&case.body, 2, World::Coroutine)
-    );
-    let ref_body = format!(
-        "{}{}",
-        rebind(2),
-        render_body(&case.body, 2, World::Reference)
-    );
+    let co_ctx = Ctx {
+        world: World::Coroutine,
+        unit_yield: case.unit_yield,
+    };
+    let ref_ctx = Ctx {
+        world: World::Reference,
+        unit_yield: case.unit_yield,
+    };
+    let co_body = format!("{}{}", rebind(2), render_body(&case.body, 2, co_ctx));
+    let ref_body = format!("{}{}", rebind(2), render_body(&case.body, 2, ref_ctx));
     let source = format!(
-        "{attr}\nfn co({sig}) -> {ret_ty} {{\n{}{}}}",
+        "{attr}\nfn co({sig}){ret} {{\n{}{}}}",
         rebind(1),
-        render_body(&case.body, 1, World::Coroutine)
+        render_body(&case.body, 1, co_ctx)
     );
     format!(
         r####"
@@ -88,10 +108,10 @@ mod {name} {{
 
     {attr}
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
-    pub fn co({sig}) -> {ret_ty} {{
+    pub fn co({sig}){ret} {{
 {co_body}    }}
 
-    pub fn reference({sig}) -> {ret_ty} {{
+    pub fn reference({sig}){ret} {{
 {ref_body}    }}
 }}
 
@@ -120,17 +140,19 @@ fn ind(level: usize) -> String {
     "    ".repeat(level)
 }
 
-fn render_body(body: &Body, level: usize, world: World) -> String {
+fn render_body(body: &Body, level: usize, ctx: Ctx) -> String {
     let mut out = String::new();
     for s in &body.stmts {
-        render_stmt(&mut out, s, level, world);
+        render_stmt(&mut out, s, level, ctx);
     }
     let i = ind(level);
     match &body.tail {
         Tail::Ret(r) => out.push_str(&format!("{i}{}\n", ret_expr(r))),
-        Tail::Yield(e) => out.push_str(&format!("{i}yield_!({})\n", expr(e))),
-        Tail::YieldWrapped(e) => out.push_str(&format!("{i}Some(yield_!({}))\n", expr(e))),
-        Tail::YieldOk(e) => out.push_str(&format!("{i}Ok(yield_!({}))\n", expr(e))),
+        Tail::Yield(e) => out.push_str(&format!("{i}{}\n", yc(e, ctx))),
+        Tail::YieldWrapped(e) => out.push_str(&format!("{i}Some({})\n", yc(e, ctx))),
+        Tail::YieldOk(e) => out.push_str(&format!("{i}Ok({})\n", yc(e, ctx))),
+        Tail::YieldUnit(e) => out.push_str(&format!("{i}{};\n", yc(e, ctx))),
+        Tail::ImplicitUnit => {}
         Tail::BreakLoop {
             counter,
             limit,
@@ -151,7 +173,7 @@ fn render_body(body: &Body, level: usize, world: World) -> String {
                 "{}{counter} = {counter}.wrapping_add(1u32);\n",
                 ind(level + 1)
             ));
-            render_block(&mut out, body, level + 1, world);
+            render_block(&mut out, body, level + 1, ctx);
             out.push_str(&format!("{i}}}\n"));
         }
         // Trailing delegation: the coroutine world delegates with
@@ -165,7 +187,7 @@ fn render_body(body: &Body, level: usize, world: World) -> String {
         } => {
             let call = call_args(*sub_shape, args);
             let sub_mod = format!("crate::case_{sub_case:03}");
-            match world {
+            match ctx.world {
                 World::Coroutine => {
                     out.push_str(&format!(
                         "{i}let {sub_var}: {sub_mod}::co::State = {sub_mod}::co({call});\n"
@@ -181,13 +203,13 @@ fn render_body(body: &Body, level: usize, world: World) -> String {
     out
 }
 
-fn render_block(out: &mut String, stmts: &[Stmt], level: usize, world: World) {
+fn render_block(out: &mut String, stmts: &[Stmt], level: usize, ctx: Ctx) {
     for s in stmts {
-        render_stmt(out, s, level, world);
+        render_stmt(out, s, level, ctx);
     }
 }
 
-fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
+fn render_stmt(out: &mut String, s: &Stmt, l: usize, ctx: Ctx) {
     let i = ind(l);
     match s {
         Stmt::Let { name, expr: e } => {
@@ -204,11 +226,11 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
             out.push_str(&format!("{i}{name} = {};\n", expr(e)));
         }
         Stmt::Yield(e) => {
-            out.push_str(&format!("{i}yield_!({});\n", expr(e)));
+            out.push_str(&format!("{i}{};\n", yc(e, ctx)));
         }
         Stmt::LetYield { name, arg, annot } => {
             let ty = if *annot { ": u32" } else { "" };
-            out.push_str(&format!("{i}let {name}{ty} = yield_!({});\n", expr(arg)));
+            out.push_str(&format!("{i}let {name}{ty} = {};\n", yc(arg, ctx)));
         }
         Stmt::LetInfer { name, from } => {
             out.push_str(&format!("{i}let mut {name} = {from};\n"));
@@ -259,19 +281,19 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
         }
         Stmt::LetYieldAdd { name, a, b } => {
             out.push_str(&format!(
-                "{i}let {name}: u32 = u32::wrapping_add(yield_!({}), yield_!({}));\n",
-                expr(a),
-                expr(b)
+                "{i}let {name}: u32 = u32::wrapping_add({}, {});\n",
+                yc(a, ctx),
+                yc(b, ctx)
             ));
         }
         Stmt::AssignYieldAdd { name, arg } => {
             out.push_str(&format!(
-                "{i}{name} = u32::wrapping_add({name}, yield_!({}));\n",
-                expr(arg)
+                "{i}{name} = u32::wrapping_add({name}, {});\n",
+                yc(arg, ctx)
             ));
         }
         Stmt::XorAssignYield { name, arg } => {
-            out.push_str(&format!("{i}{name} ^= yield_!({});\n", expr(arg)));
+            out.push_str(&format!("{i}{name} ^= {};\n", yc(arg, ctx)));
         }
         Stmt::LetArray { name, elems } => {
             let elems: Vec<String> = elems.iter().map(expr).collect();
@@ -302,14 +324,14 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
             else_b,
         } => {
             out.push_str(&format!("{i}if {} {{\n", cond(c)));
-            render_block(out, then_b, l + 1, world);
+            render_block(out, then_b, l + 1, ctx);
             for (c, b) in else_ifs {
                 out.push_str(&format!("{i}}} else if {} {{\n", cond(c)));
-                render_block(out, b, l + 1, world);
+                render_block(out, b, l + 1, ctx);
             }
             if let Some(eb) = else_b {
                 out.push_str(&format!("{i}}} else {{\n"));
-                render_block(out, eb, l + 1, world);
+                render_block(out, eb, l + 1, ctx);
             }
             out.push_str(&format!("{i}}}\n"));
         }
@@ -322,10 +344,10 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
         } => {
             out.push_str(&format!("{i}if let Some({bind}) = {opt} {{\n"));
             out.push_str(&format!("{}let mut {rebind}: u32 = {bind};\n", ind(l + 1)));
-            render_block(out, then_b, l + 1, world);
+            render_block(out, then_b, l + 1, ctx);
             if let Some(eb) = else_b {
                 out.push_str(&format!("{i}}} else {{\n"));
-                render_block(out, eb, l + 1, world);
+                render_block(out, eb, l + 1, ctx);
             }
             out.push_str(&format!("{i}}}\n"));
         }
@@ -338,7 +360,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
             for (j, (guard, arm)) in arms.iter().enumerate() {
                 let pat = arm_pat(j, *modulus, guard);
                 out.push_str(&format!("{}{pat} => {{\n", ind(l + 1)));
-                render_block(out, arm, l + 2, world);
+                render_block(out, arm, l + 2, ctx);
                 out.push_str(&format!("{}}}\n", ind(l + 1)));
             }
             out.push_str(&format!("{i}}}\n"));
@@ -351,11 +373,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
             out.push_str(&format!("{i}match ({}) % {modulus}u32 {{\n", expr(scrut)));
             for (j, (guard, yields, e)) in arms.iter().enumerate() {
                 let pat = arm_pat(j, *modulus, guard);
-                let body = if *yields {
-                    format!("yield_!({})", expr(e))
-                } else {
-                    expr(e)
-                };
+                let body = if *yields { yc(e, ctx) } else { expr(e) };
                 out.push_str(&format!("{}{pat} => {body},\n", ind(l + 1)));
             }
             out.push_str(&format!("{i}}};\n"));
@@ -369,7 +387,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                 "{i}let 0u32 = ({}) % {modulus}u32 else {{\n",
                 expr(scrut)
             ));
-            render_block(out, body, l + 1, world);
+            render_block(out, body, l + 1, ctx);
             out.push_str(&format!("{i}}};\n"));
         }
         Stmt::For {
@@ -385,7 +403,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
             };
             let dots = if *inclusive { "..=" } else { ".." };
             out.push_str(&format!("{i}'l{label}: for {var} in 0u32{dots}{up} {{\n"));
-            render_block(out, body, l + 1, world);
+            render_block(out, body, l + 1, ctx);
             out.push_str(&format!("{i}}}\n"));
         }
         Stmt::While {
@@ -400,7 +418,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                 "{}{counter} = {counter}.wrapping_add(1u32);\n",
                 ind(l + 1)
             ));
-            render_block(out, body, l + 1, world);
+            render_block(out, body, l + 1, ctx);
             out.push_str(&format!("{i}}}\n"));
         }
         Stmt::WhileLet {
@@ -423,7 +441,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                 ind(l + 2),
                 ind(l + 1)
             ));
-            render_block(out, body, l + 1, world);
+            render_block(out, body, l + 1, ctx);
             out.push_str(&format!("{i}}}\n"));
         }
         Stmt::Loop {
@@ -444,7 +462,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                 "{}{counter} = {counter}.wrapping_add(1u32);\n",
                 ind(l + 1)
             ));
-            render_block(out, body, l + 1, world);
+            render_block(out, body, l + 1, ctx);
             out.push_str(&format!("{i}}}\n"));
         }
         Stmt::ValueLoop {
@@ -468,12 +486,12 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                 "{}{counter} = {counter}.wrapping_add(1u32);\n",
                 ind(l + 1)
             ));
-            render_block(out, body, l + 1, world);
+            render_block(out, body, l + 1, ctx);
             out.push_str(&format!("{i}}};\n"));
         }
         Stmt::LabeledBlock { label, body } => {
             out.push_str(&format!("{i}'l{label}: {{\n"));
-            render_block(out, body, l + 1, world);
+            render_block(out, body, l + 1, ctx);
             out.push_str(&format!("{i}}}\n"));
         }
         Stmt::Break(label) => {
@@ -488,6 +506,10 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
         Stmt::ContinueBare => {
             out.push_str(&format!("{i}continue;\n"));
         }
+        // A unit return renders as the bare `return;` form.
+        Stmt::Return(RetExpr::Unit) => {
+            out.push_str(&format!("{i}return;\n"));
+        }
         Stmt::Return(r) => {
             out.push_str(&format!("{i}return {};\n", ret_expr(r)));
         }
@@ -500,10 +522,10 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
             else_e,
         } => {
             out.push_str(&format!("{i}let mut {name}: u32 = if {} {{\n", cond(c)));
-            render_block(out, then_b, l + 1, world);
+            render_block(out, then_b, l + 1, ctx);
             out.push_str(&format!("{}{}\n", ind(l + 1), expr(then_e)));
             out.push_str(&format!("{i}}} else {{\n"));
-            render_block(out, else_b, l + 1, world);
+            render_block(out, else_b, l + 1, ctx);
             out.push_str(&format!("{}{}\n", ind(l + 1), expr(else_e)));
             out.push_str(&format!("{i}}};\n"));
         }
@@ -520,7 +542,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
             for (j, (guard, arm, e)) in arms.iter().enumerate() {
                 let pat = arm_pat(j, *modulus, guard);
                 out.push_str(&format!("{}{pat} => {{\n", ind(l + 1)));
-                render_block(out, arm, l + 2, world);
+                render_block(out, arm, l + 2, ctx);
                 out.push_str(&format!("{}{}\n", ind(l + 2), expr(e)));
                 out.push_str(&format!("{}}}\n", ind(l + 1)));
             }
@@ -538,7 +560,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
             // moves body code into a nested generated module, which would
             // change what `super` refers to.
             let sub_mod = format!("crate::case_{sub_case:03}");
-            match world {
+            match ctx.world {
                 World::Coroutine => {
                     out.push_str(&format!(
                         "{i}let {sub_var}: {sub_mod}::co::State = {sub_mod}::co({call});\n"
@@ -650,6 +672,17 @@ fn ret_expr(r: &RetExpr) -> String {
         RetExpr::OptVar(n) => n.clone(),
         RetExpr::OkWrapped(e) => format!("Ok({})", expr(e)),
         RetExpr::ErrWrapped(e) => format!("Err(baregen_difftest::Err1({}))", expr(e)),
+        RetExpr::Unit => "()".to_string(),
+    }
+}
+
+/// `yield_!(e)` — or the argument-less `yield_!()` when the case's
+/// yield type is `()`.
+fn yc(e: &Expr, ctx: Ctx) -> String {
+    if ctx.unit_yield {
+        "yield_!()".to_string()
+    } else {
+        format!("yield_!({})", expr(e))
     }
 }
 

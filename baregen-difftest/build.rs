@@ -48,6 +48,7 @@ fn main() {
         prior.push(generator::PriorCase {
             flavor: case.flavor,
             shape: case.shape,
+            unit_yield: case.unit_yield,
             bound: case.bound,
         });
     }

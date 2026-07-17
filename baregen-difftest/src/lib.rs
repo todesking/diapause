@@ -28,6 +28,26 @@ pub struct Trace<R> {
 /// many suspensions in one run means a generator bug.
 const MAX_YIELDS: usize = 10_000;
 
+/// How a yield value is recorded in a [`Trace`]. `()` yields (the
+/// argument-less `yield_!()` form, coroutines with `yield = ()`) carry
+/// no information, so recording them as a constant loses nothing while
+/// keeping yield count and resume scheduling under test.
+pub trait YieldRepr: Copy {
+    fn repr(self) -> u32;
+}
+
+impl YieldRepr for u32 {
+    fn repr(self) -> u32 {
+        self
+    }
+}
+
+impl YieldRepr for () {
+    fn repr(self) -> u32 {
+        0
+    }
+}
+
 /// Error types for the `Result` flavor: generated bodies apply `?` to
 /// `Result<u32, Err2>` values inside coroutines returning
 /// `Result<u32, Err1>`, exercising the From-based error conversion of
@@ -92,6 +112,12 @@ pub mod oracle {
         })
     }
 
+    /// `yield_!()` in a reference body: records the unit yield (as 0,
+    /// see [`crate::YieldRepr`]) and returns the scripted resume value.
+    pub fn yield_value_unit() -> u32 {
+        yield_value(0)
+    }
+
     /// Runs a reference body under the given resume script and captures
     /// its trace. If `f` panics the stale script is simply overwritten
     /// by the next run on this thread.
@@ -116,6 +142,9 @@ pub mod oracle {
 /// consumes its `yield_!` tokens before name resolution).
 #[macro_export]
 macro_rules! yield_ {
+    () => {
+        $crate::oracle::yield_value_unit()
+    };
     ($e:expr) => {
         $crate::oracle::yield_value($e)
     };
@@ -129,7 +158,8 @@ fn resume_at(resumes: &[u32], i: usize) -> u32 {
 /// script exactly as the oracle does.
 pub fn drive_plain<C>(mut c: C, resumes: &[u32]) -> Result<Trace<C::Return>, String>
 where
-    C: Coroutine<u32, Yield = u32>,
+    C: Coroutine<u32>,
+    C::Yield: YieldRepr,
 {
     let mut yields = Vec::new();
     let mut step = c.start();
@@ -139,7 +169,7 @@ where
                 if yields.len() >= MAX_YIELDS {
                     return Err(format!("state machine exceeded {MAX_YIELDS} yields"));
                 }
-                yields.push(v);
+                yields.push(v.repr());
                 step = c.resume(resume_at(resumes, yields.len() - 1));
             }
             CoroutineState::Complete(v) => {
@@ -159,7 +189,8 @@ where
 /// the `Clone` path stay under test for the whole run.
 pub fn drive_tortured<C>(mut c: C, resumes: &[u32]) -> Result<Trace<C::Return>, String>
 where
-    C: Coroutine<u32, Yield = u32> + Clone + Serialize + DeserializeOwned,
+    C: Coroutine<u32> + Clone + Serialize + DeserializeOwned,
+    C::Yield: YieldRepr + PartialEq + core::fmt::Debug,
     C::Return: PartialEq + core::fmt::Debug,
 {
     let mut yields = Vec::new();
@@ -170,7 +201,7 @@ where
                 if yields.len() >= MAX_YIELDS {
                     return Err(format!("state machine exceeded {MAX_YIELDS} yields"));
                 }
-                yields.push(v);
+                yields.push(v.repr());
                 let i = yields.len() - 1;
                 let json = serde_json::to_string(&c)
                     .map_err(|e| format!("serialize failed at suspension {i}: {e}"))?;
@@ -208,7 +239,8 @@ pub fn check_case<C>(
     reference: impl FnOnce() -> C::Return,
     machine: C,
 ) where
-    C: Coroutine<u32, Yield = u32> + Clone + Serialize + DeserializeOwned,
+    C: Coroutine<u32> + Clone + Serialize + DeserializeOwned,
+    C::Yield: YieldRepr + PartialEq + core::fmt::Debug,
     C::Return: PartialEq + core::fmt::Debug,
 {
     let expected = oracle::run_reference(reference, resumes);
