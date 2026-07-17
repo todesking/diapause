@@ -33,11 +33,35 @@ pub enum Expr {
     WrapMul(Box<Expr>, Box<Expr>),
     /// `expr % lit` with a non-zero literal modulus.
     Rem(Box<Expr>, u32),
+    /// `((-(((e) % 16u32) as i32)) as u32)` — unary minus plus two
+    /// casts; the operand is reduced below 16 so the i32 negation can
+    /// never overflow, and `as u32` wraps (never panics).
+    NegCast(Box<Expr>),
+    /// `((((e) as u64)) as u32)` — a widening/narrowing cast round-trip.
+    CastRound(Box<Expr>),
+    /// `((({a}), ({b})).{idx})` — a tuple literal consumed by field
+    /// access, `idx` in {0, 1}.
+    TupleField(Box<Expr>, Box<Expr>, u8),
+    /// `(baregen_difftest::Pair { x: a, y: b }.x)` — a struct literal
+    /// consumed by field access.
+    PairField {
+        x: Box<Expr>,
+        y: Box<Expr>,
+        second: bool,
+    },
+    /// `({arr}[((idx) % 4u32) as usize])` — indexing into a `[u32; 4]`
+    /// variable; the index is reduced mod 4, so it is always in bounds.
+    Index {
+        arr: String,
+        idx: Box<Expr>,
+    },
 }
 
 pub enum Cond {
     Lt(Expr, Expr),
     ModIsZero(Expr, u32),
+    And(Box<Cond>, Box<Cond>),
+    Or(Box<Cond>, Box<Cond>),
 }
 
 /// Upper bound of a `for` range: a literal or a function argument
@@ -110,6 +134,18 @@ pub enum Stmt {
         name: String,
         arg: Expr,
     },
+    /// `name ^= yield_!(arg);` — compound assignment with a hoistable
+    /// yield on the right (XOR: total on u32, unlike `+=`).
+    XorAssignYield {
+        name: String,
+        arg: Expr,
+    },
+    /// `let name: [u32; 4] = [e0, e1, e2, e3];` — a fixed-length array
+    /// pool for `Expr::Index`.
+    LetArray {
+        name: String,
+        elems: Vec<Expr>,
+    },
     /// `let name: u32 = opt?;` (OptionU32 flavor only).
     LetTry {
         name: String,
@@ -130,6 +166,8 @@ pub enum Stmt {
     If {
         cond: Cond,
         then_b: Vec<Stmt>,
+        /// `else if` links between the `if` and the final `else`.
+        else_ifs: Vec<(Cond, Vec<Stmt>)>,
         else_b: Option<Vec<Stmt>>,
     },
     /// `if let Some(bind) = opt { let mut rebind: u32 = bind; .. }` —
@@ -150,6 +188,14 @@ pub enum Stmt {
         scrut: Expr,
         modulus: u32,
         arms: Vec<(Option<Cond>, Vec<Stmt>)>,
+    },
+    /// `match (scrut) % modulus { 0u32 => yield_!(e), .., _ => e };` —
+    /// a statement-position match with non-block arm bodies; an arm is
+    /// either `yield_!(e)` (the `bool` is true) or a pure expression.
+    MatchYield {
+        scrut: Expr,
+        modulus: u32,
+        arms: Vec<(Option<Cond>, bool, Expr)>,
     },
     /// `let 0u32 = (scrut) % modulus else { ..; <jump> };` — the else
     /// block always ends in a diverging jump, and the pattern has no

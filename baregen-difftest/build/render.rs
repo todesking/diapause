@@ -146,6 +146,16 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                 expr(arg)
             ));
         }
+        Stmt::XorAssignYield { name, arg } => {
+            out.push_str(&format!("{i}{name} ^= yield_!({});\n", expr(arg)));
+        }
+        Stmt::LetArray { name, elems } => {
+            let elems: Vec<String> = elems.iter().map(expr).collect();
+            out.push_str(&format!(
+                "{i}let {name}: [u32; 4] = [{}];\n",
+                elems.join(", ")
+            ));
+        }
         Stmt::LetTry { name, opt } => {
             out.push_str(&format!("{i}let {name}: u32 = {opt}?;\n"));
         }
@@ -164,10 +174,15 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
         Stmt::If {
             cond: c,
             then_b,
+            else_ifs,
             else_b,
         } => {
             out.push_str(&format!("{i}if {} {{\n", cond(c)));
             render_block(out, then_b, l + 1, world);
+            for (c, b) in else_ifs {
+                out.push_str(&format!("{i}}} else if {} {{\n", cond(c)));
+                render_block(out, b, l + 1, world);
+            }
             if let Some(eb) = else_b {
                 out.push_str(&format!("{i}}} else {{\n"));
                 render_block(out, eb, l + 1, world);
@@ -203,6 +218,23 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                 out.push_str(&format!("{}}}\n", ind(l + 1)));
             }
             out.push_str(&format!("{i}}}\n"));
+        }
+        Stmt::MatchYield {
+            scrut,
+            modulus,
+            arms,
+        } => {
+            out.push_str(&format!("{i}match ({}) % {modulus}u32 {{\n", expr(scrut)));
+            for (j, (guard, yields, e)) in arms.iter().enumerate() {
+                let pat = arm_pat(j, *modulus, guard);
+                let body = if *yields {
+                    format!("yield_!({})", expr(e))
+                } else {
+                    expr(e)
+                };
+                out.push_str(&format!("{}{pat} => {body},\n", ind(l + 1)));
+            }
+            out.push_str(&format!("{i}}};\n"));
         }
         Stmt::LetElse {
             scrut,
@@ -427,6 +459,20 @@ fn expr(e: &Expr) -> String {
         Expr::WrapSub(a, b) => format!("({}).wrapping_sub({})", expr(a), expr(b)),
         Expr::WrapMul(a, b) => format!("({}).wrapping_mul({})", expr(a), expr(b)),
         Expr::Rem(a, m) => format!("(({}) % {m}u32)", expr(a)),
+        // The operand is reduced below 16, so the i32 negation cannot
+        // overflow; `as u32` wraps and never panics.
+        Expr::NegCast(a) => format!("((-((({}) % 16u32) as i32)) as u32)", expr(a)),
+        Expr::CastRound(a) => format!("((({}) as u64) as u32)", expr(a)),
+        Expr::TupleField(a, b, idx) => format!("(({}, {}).{idx})", expr(a), expr(b)),
+        Expr::PairField { x, y, second } => {
+            let field = if *second { "y" } else { "x" };
+            format!(
+                "(baregen_difftest::Pair {{ x: {}, y: {} }}.{field})",
+                expr(x),
+                expr(y)
+            )
+        }
+        Expr::Index { arr, idx } => format!("({arr}[((({}) % 4u32) as usize)])", expr(idx)),
     }
 }
 
@@ -459,5 +505,7 @@ fn cond(c: &Cond) -> String {
     match c {
         Cond::Lt(a, b) => format!("({}) < ({})", expr(a), expr(b)),
         Cond::ModIsZero(e, m) => format!("({}) % {m}u32 == 0u32", expr(e)),
+        Cond::And(a, b) => format!("({}) && ({})", cond(a), cond(b)),
+        Cond::Or(a, b) => format!("({}) || ({})", cond(a), cond(b)),
     }
 }

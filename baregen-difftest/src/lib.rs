@@ -39,6 +39,16 @@ pub struct Err1(pub u32);
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
 pub struct Err2(pub u32);
 
+/// Fixed struct for generated struct-literal + field-access expressions
+/// (`baregen_difftest::Pair { x: .., y: .. }.x`). `Copy` like every
+/// other generated value type; instances only appear inside pure
+/// subexpressions and never cross a suspension.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+pub struct Pair {
+    pub x: u32,
+    pub y: u32,
+}
+
 impl From<Err2> for Err1 {
     fn from(e: Err2) -> Self {
         Err1(e.0)

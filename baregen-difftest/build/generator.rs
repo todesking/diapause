@@ -58,6 +58,8 @@ struct Var {
     opt: bool,
     /// `Result<u32, _>` variables are only used as `?` operands.
     res: bool,
+    /// `[u32; 4]` variables are only used as `Expr::Index` bases.
+    arr: bool,
 }
 
 struct LoopLabel {
@@ -100,12 +102,14 @@ impl<'a> Gen<'a> {
                     assignable: false,
                     opt: false,
                     res: false,
+                    arr: false,
                 },
                 Var {
                     name: "a1".into(),
                     assignable: false,
                     opt: false,
                     res: false,
+                    arr: false,
                 },
             ],
             loop_labels: Vec::new(),
@@ -222,9 +226,12 @@ impl<'a> Gen<'a> {
         let delegatable = self.prior.iter().any(|p| self.delegation_fits(p.bound));
 
         let mut kinds: Vec<(u64, u8)> = vec![(3, 0), (3, 1), (2, 2), (1, 3), (2, 11)];
+        kinds.push((1, 20));
+        kinds.push((2, 21));
         if has_assignable {
             kinds.push((2, 4));
             kinds.push((1, 5));
+            kinds.push((1, 22));
         }
         if has_opt && self.flavor == Flavor::OptionU32 {
             kinds.push((2, 15));
@@ -336,12 +343,49 @@ impl<'a> Gen<'a> {
                 self.push_res_var(&name);
                 Stmt::LetResult { name, init }
             }
-            _ => {
+            19 => {
                 let res = self.pick_res_var();
                 let name = self.fresh("v");
                 self.push_var(&name, false, false);
                 Stmt::LetTryResult { name, res }
             }
+            20 => {
+                let elems = (0..4).map(|_| self.gen_expr(1)).collect();
+                let name = self.fresh("arr");
+                self.push_arr_var(&name);
+                Stmt::LetArray { name, elems }
+            }
+            21 => self.gen_match_yield(),
+            _ => {
+                self.count_yields(1);
+                Stmt::XorAssignYield {
+                    name: self.pick_assignable(),
+                    arg: self.gen_expr(1),
+                }
+            }
+        }
+    }
+
+    /// A statement-position `match` with non-block arm bodies; some
+    /// arms are `yield_!(e)`, the rest are pure expressions. Exactly
+    /// one arm runs, so at most one yield is counted.
+    fn gen_match_yield(&mut self) -> Stmt {
+        let scrut = self.gen_expr(2);
+        let modulus = 2 + self.rng.below(2) as u32;
+        let arms: Vec<(Option<Cond>, bool, Expr)> = (0..modulus)
+            .map(|j| {
+                let guard = self.gen_arm_guard(j, modulus);
+                let yields = self.rng.chance(3, 5);
+                (guard, yields, self.gen_expr(1))
+            })
+            .collect();
+        if arms.iter().any(|a| a.1) {
+            self.count_yields(1);
+        }
+        Stmt::MatchYield {
+            scrut,
+            modulus,
+            arms,
         }
     }
 
@@ -351,6 +395,7 @@ impl<'a> Gen<'a> {
             assignable,
             opt,
             res: false,
+            arr: false,
         });
     }
 
@@ -360,7 +405,28 @@ impl<'a> Gen<'a> {
             assignable: false,
             opt: false,
             res: true,
+            arr: false,
         });
+    }
+
+    fn push_arr_var(&mut self, name: &str) {
+        self.scope.push(Var {
+            name: name.to_string(),
+            assignable: false,
+            opt: false,
+            res: false,
+            arr: true,
+        });
+    }
+
+    fn pick_arr_var(&mut self) -> String {
+        let names: Vec<&str> = self
+            .scope
+            .iter()
+            .filter(|v| v.arr)
+            .map(|v| v.name.as_str())
+            .collect();
+        (*self.rng.pick(&names)).to_string()
     }
 
     fn pick_assignable(&mut self) -> String {
@@ -397,16 +463,37 @@ impl<'a> Gen<'a> {
         let cond = self.gen_cond();
         self.depth += 1;
         let mut then_b = self.gen_block(budget);
+        let mut else_ifs: Vec<(Cond, Vec<Stmt>)> = Vec::new();
+        while *budget > 0 && else_ifs.len() < 2 && self.rng.chance(1, 4) {
+            let c = self.gen_cond();
+            let b = self.gen_block(budget);
+            else_ifs.push((c, b));
+        }
         let mut else_b = if self.rng.chance(1, 2) {
             Some(self.gen_block(budget))
         } else {
             None
         };
         self.depth -= 1;
-        self.maybe_append_jump(&mut then_b, &mut else_b);
+        // At most one branch may end in a diverging jump, so a
+        // fall-through path always remains.
+        if self.rng.chance(1, 4)
+            && let Some(jump) = self.gen_jump()
+        {
+            let n = 1 + else_ifs.len() + usize::from(else_b.is_some());
+            let k = self.rng.below(n as u64) as usize;
+            if k == 0 {
+                then_b.push(jump);
+            } else if k <= else_ifs.len() {
+                else_ifs[k - 1].1.push(jump);
+            } else {
+                else_b.as_mut().expect("k counted else_b").push(jump);
+            }
+        }
         Stmt::If {
             cond,
             then_b,
+            else_ifs,
             else_b,
         }
     }
@@ -771,7 +858,7 @@ impl<'a> Gen<'a> {
                 let names: Vec<&str> = self
                     .scope
                     .iter()
-                    .filter(|v| !v.opt && !v.res)
+                    .filter(|v| !v.opt && !v.res && !v.arr)
                     .map(|v| v.name.as_str())
                     .collect();
                 Expr::Var((*self.rng.pick(&names)).to_string())
@@ -779,7 +866,9 @@ impl<'a> Gen<'a> {
                 Expr::Lit(self.rng.below(16) as u32)
             }
         } else {
-            match self.rng.below(4) {
+            let has_arr = self.scope.iter().any(|v| v.arr);
+            let n = if has_arr { 9 } else { 8 };
+            match self.rng.below(n) {
                 0 => Expr::WrapAdd(
                     Box::new(self.gen_expr(depth - 1)),
                     Box::new(self.gen_expr(depth - 1)),
@@ -792,10 +881,26 @@ impl<'a> Gen<'a> {
                     Box::new(self.gen_expr(depth - 1)),
                     Box::new(self.gen_expr(depth - 1)),
                 ),
-                _ => Expr::Rem(
+                3 => Expr::Rem(
                     Box::new(self.gen_expr(depth - 1)),
                     2 + self.rng.below(5) as u32,
                 ),
+                4 => Expr::NegCast(Box::new(self.gen_expr(depth - 1))),
+                5 => Expr::CastRound(Box::new(self.gen_expr(depth - 1))),
+                6 => Expr::TupleField(
+                    Box::new(self.gen_expr(depth - 1)),
+                    Box::new(self.gen_expr(depth - 1)),
+                    self.rng.below(2) as u8,
+                ),
+                7 => Expr::PairField {
+                    x: Box::new(self.gen_expr(depth - 1)),
+                    y: Box::new(self.gen_expr(depth - 1)),
+                    second: self.rng.chance(1, 2),
+                },
+                _ => Expr::Index {
+                    arr: self.pick_arr_var(),
+                    idx: Box::new(self.gen_expr(depth - 1)),
+                },
             }
         }
     }
@@ -812,6 +917,22 @@ impl<'a> Gen<'a> {
     }
 
     fn gen_cond(&mut self) -> Cond {
+        // One level of `&&` / `||` composition; leaves stay pure, so
+        // composed conditions are still valid match guards.
+        if self.rng.chance(1, 5) {
+            let a = Box::new(self.gen_cond_leaf());
+            let b = Box::new(self.gen_cond_leaf());
+            if self.rng.chance(1, 2) {
+                Cond::And(a, b)
+            } else {
+                Cond::Or(a, b)
+            }
+        } else {
+            self.gen_cond_leaf()
+        }
+    }
+
+    fn gen_cond_leaf(&mut self) -> Cond {
         if self.rng.chance(1, 2) {
             Cond::Lt(self.gen_expr(1), self.gen_expr(1))
         } else {
