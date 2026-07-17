@@ -261,6 +261,31 @@ fn until_stop() -> u32 {
     count
 }
 
+/// The `if !go { .. break; }` statement contains no yield, so it stays
+/// opaque and its `break` becomes a jump marker; the `assert!` next to
+/// it is a foreign macro the marker replacement must leave alone.
+#[baregen::coroutine(yield = u32, resume = bool)]
+fn until_stop_checked() -> u32 {
+    let mut count: u32 = 0;
+    loop {
+        let go = yield_!(count);
+        if !go {
+            assert!(count < 10, "runaway loop");
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+#[test]
+fn foreign_macro_beside_an_opaque_break() {
+    let mut c = until_stop_checked();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(true), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(false), CoroutineState::Complete(1));
+}
+
 #[test]
 fn loop_with_break_in_nested_if() {
     let mut c = until_stop();

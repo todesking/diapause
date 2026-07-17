@@ -180,7 +180,7 @@ impl Context<'_> {
                 uses[b].remove(&t);
                 rebuilds[root].insert(t);
                 let BorrowSource::Direct { source, .. } = &self.cfg.bindings[t.0].borrow else {
-                    unreachable!()
+                    unreachable!("BUG: is_foreign_borrow admits only direct borrows")
                 };
                 if let Some(s) = source {
                     uses[b].insert(*s);

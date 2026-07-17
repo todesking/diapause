@@ -635,8 +635,13 @@ impl Lowerer {
             }
             syn::Stmt::Local(local) => self.lower_let_value(local),
             syn::Stmt::Expr(e, _) => self.lower_control_expr(e),
-            // Stmt::Macro with yield tokens is caught as opaque; items
-            // never contain our yield.
+            // Unreachable in practice: only `Stmt::Macro`/`Stmt::Item`
+            // remain here, and neither can contain a yield by this
+            // point — `yield_!`/`yield_all!` statement macros were
+            // handled above, a foreign macro's tokens don't count as
+            // yields, and items are separate scopes skipped by the yield
+            // scan — so both fall into the no-yield arm instead. Kept
+            // for match exhaustiveness, with opaque as a safe fallback.
             _ => self.push_opaque(stmt),
         }
     }
@@ -647,7 +652,7 @@ impl Lowerer {
             return self.err(syn::Error::new_spanned(&init.expr, ERR_LET_ELSE_INIT));
         }
         let syn::Expr::Macro(m) = &*init.expr else {
-            unreachable!()
+            unreachable!("BUG: checked by the caller")
         };
         let (pat, ty) = match &local.pat {
             syn::Pat::Type(pt) => (&*pt.pat, Some((*pt.ty).clone())),
@@ -960,7 +965,7 @@ impl Lowerer {
             return self.err(syn::Error::new_spanned(&init.expr, ERR_LET_ELSE_INIT));
         }
         let syn::Expr::Macro(m) = &*init.expr else {
-            unreachable!()
+            unreachable!("BUG: checked by the caller")
         };
         self.lower_value_let(local, |lw, ctx| lw.lower_yield_all(&m.mac, ctx));
     }

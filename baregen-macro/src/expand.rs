@@ -669,6 +669,8 @@ impl VisitMut for JumpMarkerReplacer<'_, '_> {
     fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
         syn::visit_mut::visit_expr_mut(self, e);
         let syn::Expr::Macro(m) = e else { return };
+        // A foreign macro sharing a jump-carrying block with a marker
+        // (e.g. an `assert!` beside a rewritten `break`) passes through.
         if !lower::is_jump_marker(&m.mac) {
             return;
         }

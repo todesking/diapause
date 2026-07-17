@@ -105,7 +105,8 @@ impl Hoister {
                 syn::Expr::Macro(_) => {}
                 e => self.head(e),
             },
-            _ => {}
+            // Items are separate scopes; nothing hoists out of them.
+            syn::Stmt::Item(_) => {}
         }
         std::mem::take(&mut self.prefix)
     }
@@ -151,6 +152,9 @@ impl Hoister {
             syn::Expr::Macro(_) => self.pure = false,
             syn::Expr::Path(_) | syn::Expr::Lit(_) => {}
             syn::Expr::Paren(p) => self.walk(&mut p.expr),
+            // Invisible-delimiter groups appear when the body reaches us
+            // through another macro's expansion (an `$expr` fragment
+            // substituted by `macro_rules!`); treat them as parentheses.
             syn::Expr::Group(g) => self.walk(&mut g.expr),
             syn::Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) => {
                 self.walk(&mut b.left);
