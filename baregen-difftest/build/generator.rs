@@ -1,78 +1,127 @@
 //! Random generation of supported coroutine bodies.
 //!
 //! Validity is guaranteed by construction:
-//! - every `let` is annotated `u32` (syntactic-type rule), names are
-//!   globally fresh (no shadowing, so opaque jumps are always legal);
-//! - loops are fuel-bounded, so every body terminates on any input;
+//! - every `let` is annotated (syntactic-type rule), names are globally
+//!   fresh (no shadowing, so opaque jumps are always legal), and
+//!   pattern bindings (`if let` / `while let`) are rebound immediately
+//!   so they never cross a yield;
+//! - loops are fuel-bounded (`for` over bounded ranges, counters
+//!   incremented before the body, `while let` scrutinees strictly
+//!   increasing toward a literal limit), so every body terminates;
 //! - a conditional gets at most one branch ending in a jump, so the
-//!   trailing expression is always statically reachable;
-//! - inside value-position `if`/`match` no jumps are generated at all,
-//!   and enclosing loop labels are hidden from nested generation;
+//!   trailing expression is always statically reachable; a `let else`
+//!   block always ends in a jump, so it always diverges;
+//! - inside value-position expressions (`let x = if/match/loop`) no
+//!   `return` is generated and enclosing loop labels are hidden, so
+//!   jumps never escape a value expression;
 //! - all arithmetic is wrapping and `%` uses non-zero literals, so no
-//!   generated program can panic.
+//!   generated program can panic;
+//! - `yield_all!` targets only earlier cases that contain no delegation
+//!   themselves, and only outside loops, so delegation cannot compound
+//!   into runaway trace lengths.
 
 use crate::ast::*;
 use crate::rng::Rng;
 
-pub fn generate(seed: u64, index: usize) -> Body {
+/// What later cases need to know about an earlier one to delegate to it.
+pub struct PriorCase {
+    pub flavor: Flavor,
+    pub has_delegate: bool,
+}
+
+pub fn generate(seed: u64, index: usize, prior: &[PriorCase]) -> Case {
     let case_seed = seed
         ^ (index as u64)
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             .wrapping_add(0x5EED);
-    Gen::new(Rng::new(case_seed)).gen_body()
+    Gen::new(Rng::new(case_seed), prior).gen_case()
 }
 
 struct Var {
     name: String,
-    /// Only `let mut` bindings may be assignment targets; loop
+    /// Only `let mut` u32 bindings may be assignment targets; loop
     /// variables and counters are read-only to preserve termination.
     assignable: bool,
+    /// `Option<u32>` variables live in the same scope stack but are
+    /// only used as `if let` / `while let` / `?` operands.
+    opt: bool,
 }
 
-struct Gen {
+struct LoopLabel {
+    id: usize,
+    /// Labels of `ValueLoop`s: breaks targeting them carry a value.
+    value: bool,
+}
+
+struct Gen<'a> {
     rng: Rng,
+    prior: &'a [PriorCase],
+    flavor: Flavor,
     scope: Vec<Var>,
-    loop_labels: Vec<usize>,
+    loop_labels: Vec<LoopLabel>,
     next_var: usize,
     next_label: usize,
     depth: usize,
+    loop_depth: usize,
     yields: usize,
     in_value: bool,
+    has_delegate: bool,
 }
 
-impl Gen {
-    fn new(rng: Rng) -> Self {
+impl<'a> Gen<'a> {
+    fn new(mut rng: Rng, prior: &'a [PriorCase]) -> Self {
+        let flavor = if rng.chance(1, 4) {
+            Flavor::OptionU32
+        } else {
+            Flavor::U32
+        };
         Gen {
             rng,
+            prior,
+            flavor,
             scope: vec![
                 Var {
                     name: "a0".into(),
                     assignable: false,
+                    opt: false,
                 },
                 Var {
                     name: "a1".into(),
                     assignable: false,
+                    opt: false,
                 },
             ],
             loop_labels: Vec::new(),
             next_var: 0,
             next_label: 0,
             depth: 0,
+            loop_depth: 0,
             yields: 0,
             in_value: false,
+            has_delegate: false,
         }
     }
 
-    fn gen_body(&mut self) -> Body {
+    fn gen_case(mut self) -> Case {
+        let fingerprint = self.rng.chance(1, 4);
         let mut budget = 4 + self.rng.below(10) as i32;
         let stmts = self.gen_block(&mut budget);
         let tail = if self.yields == 0 || self.rng.chance(3, 10) {
             self.yields += 1;
-            Tail::Yield(self.gen_expr(2))
+            let e = self.gen_expr(2);
+            match self.flavor {
+                Flavor::U32 => Tail::Yield(e),
+                Flavor::OptionU32 => Tail::YieldWrapped(e),
+            }
         } else {
-            Tail::Expr(self.gen_expr(2))
+            Tail::Ret(self.gen_ret_expr())
         };
-        Body { stmts, tail }
+        Case {
+            body: Body { stmts, tail },
+            flavor: self.flavor,
+            fingerprint,
+            has_delegate: self.has_delegate,
+        }
     }
 
     fn fresh(&mut self, prefix: &str) -> String {
@@ -117,14 +166,31 @@ impl Gen {
         (stmts, e)
     }
 
+    fn has_opt_var(&self) -> bool {
+        self.scope.iter().any(|v| v.opt)
+    }
+
+    /// Whether a diverging jump can be generated here (needed as the
+    /// mandatory terminator of a `let else` block).
+    fn jump_possible(&self) -> bool {
+        !self.in_value || !self.loop_labels.is_empty()
+    }
+
     fn gen_stmt(&mut self, budget: &mut i32) -> Stmt {
         *budget -= 1;
         let structural = self.depth < 4 && *budget > 0;
-        let has_assignable = self.scope.iter().any(|v| v.assignable);
-        let mut kinds: Vec<(u64, u8)> = vec![(3, 0), (3, 1), (2, 2), (1, 3)];
+        let has_assignable = self.scope.iter().any(|v| v.assignable && !v.opt);
+        let has_opt = self.has_opt_var();
+        let delegatable =
+            !self.in_value && self.loop_depth == 0 && self.prior.iter().any(|p| !p.has_delegate);
+
+        let mut kinds: Vec<(u64, u8)> = vec![(3, 0), (3, 1), (2, 2), (1, 3), (2, 11)];
         if has_assignable {
             kinds.push((2, 4));
             kinds.push((1, 5));
+        }
+        if has_opt && self.flavor == Flavor::OptionU32 && !self.in_value {
+            kinds.push((2, 15));
         }
         if structural {
             kinds.push((3, 6));
@@ -132,7 +198,19 @@ impl Gen {
             kinds.push((3, 8));
             kinds.push((1, 9));
             kinds.push((1, 10));
+            kinds.push((1, 14));
+            if has_opt {
+                kinds.push((2, 12));
+                kinds.push((2, 13));
+            }
+            if self.jump_possible() {
+                kinds.push((2, 16));
+            }
         }
+        if delegatable {
+            kinds.push((2, 17));
+        }
+
         let total: u64 = kinds.iter().map(|k| k.0).sum();
         let mut roll = self.rng.below(total);
         let mut kind = 0u8;
@@ -147,10 +225,7 @@ impl Gen {
             0 => {
                 let expr = self.gen_expr(2);
                 let name = self.fresh("v");
-                self.scope.push(Var {
-                    name: name.clone(),
-                    assignable: true,
-                });
+                self.push_var(&name, true, false);
                 Stmt::Let { name, expr }
             }
             1 => {
@@ -161,10 +236,7 @@ impl Gen {
                 self.yields += 1;
                 let arg = self.gen_expr(2);
                 let name = self.fresh("r");
-                self.scope.push(Var {
-                    name: name.clone(),
-                    assignable: false,
-                });
+                self.push_var(&name, false, false);
                 Stmt::LetYield { name, arg }
             }
             3 => {
@@ -172,10 +244,7 @@ impl Gen {
                 let a = self.gen_expr(1);
                 let b = self.gen_expr(1);
                 let name = self.fresh("r");
-                self.scope.push(Var {
-                    name: name.clone(),
-                    assignable: false,
-                });
+                self.push_var(&name, false, false);
                 Stmt::LetYieldAdd { name, a, b }
             }
             4 => Stmt::Assign {
@@ -193,15 +262,54 @@ impl Gen {
             7 => self.gen_match(budget),
             8 => self.gen_loop(budget),
             9 => self.gen_let_if_value(budget),
-            _ => self.gen_let_match_value(budget),
+            10 => self.gen_let_match_value(budget),
+            11 => {
+                let init = if self.rng.chance(3, 4) {
+                    Some(self.gen_expr(2))
+                } else {
+                    None
+                };
+                let name = self.fresh("o");
+                self.push_var(&name, false, true);
+                Stmt::LetOption { name, init }
+            }
+            12 => self.gen_if_let(budget),
+            13 => self.gen_while_let(budget),
+            14 => self.gen_value_loop(budget),
+            15 => {
+                let opt = self.pick_opt_var();
+                let name = self.fresh("v");
+                self.push_var(&name, false, false);
+                Stmt::LetTry { name, opt }
+            }
+            16 => self.gen_let_else(budget),
+            _ => self.gen_delegate(),
         }
+    }
+
+    fn push_var(&mut self, name: &str, assignable: bool, opt: bool) {
+        self.scope.push(Var {
+            name: name.to_string(),
+            assignable,
+            opt,
+        });
     }
 
     fn pick_assignable(&mut self) -> String {
         let names: Vec<&str> = self
             .scope
             .iter()
-            .filter(|v| v.assignable)
+            .filter(|v| v.assignable && !v.opt)
+            .map(|v| v.name.as_str())
+            .collect();
+        (*self.rng.pick(&names)).to_string()
+    }
+
+    fn pick_opt_var(&mut self) -> String {
+        let names: Vec<&str> = self
+            .scope
+            .iter()
+            .filter(|v| v.opt)
             .map(|v| v.name.as_str())
             .collect();
         (*self.rng.pick(&names)).to_string()
@@ -217,17 +325,49 @@ impl Gen {
             None
         };
         self.depth -= 1;
-        if !self.in_value && self.rng.chance(1, 4) {
-            let jump = self.gen_jump();
-            match (&mut else_b, self.rng.chance(1, 2)) {
-                (Some(b), true) => b.push(jump),
-                _ => then_b.push(jump),
-            }
-        }
+        self.maybe_append_jump(&mut then_b, &mut else_b);
         Stmt::If {
             cond,
             then_b,
             else_b,
+        }
+    }
+
+    fn gen_if_let(&mut self, budget: &mut i32) -> Stmt {
+        let opt = self.pick_opt_var();
+        let bind = self.fresh("p");
+        let rebind = self.fresh("x");
+        self.depth += 1;
+        let mark = self.scope.len();
+        self.push_var(&rebind, true, false);
+        let mut then_b = self.gen_block(budget);
+        self.scope.truncate(mark);
+        let mut else_b = if self.rng.chance(1, 2) {
+            Some(self.gen_block(budget))
+        } else {
+            None
+        };
+        self.depth -= 1;
+        self.maybe_append_jump(&mut then_b, &mut else_b);
+        Stmt::IfLet {
+            opt,
+            bind,
+            rebind,
+            then_b,
+            else_b,
+        }
+    }
+
+    /// With some probability, append a diverging jump to at most one
+    /// branch of a conditional, so a fall-through path always remains.
+    fn maybe_append_jump(&mut self, then_b: &mut Vec<Stmt>, else_b: &mut Option<Vec<Stmt>>) {
+        if self.rng.chance(1, 4)
+            && let Some(jump) = self.gen_jump()
+        {
+            match (else_b.as_mut(), self.rng.chance(1, 2)) {
+                (Some(b), true) => b.push(jump),
+                _ => then_b.push(jump),
+            }
         }
     }
 
@@ -237,8 +377,9 @@ impl Gen {
         self.depth += 1;
         let mut arms: Vec<Vec<Stmt>> = (0..modulus).map(|_| self.gen_block(budget)).collect();
         self.depth -= 1;
-        if !self.in_value && self.rng.chance(1, 4) {
-            let jump = self.gen_jump();
+        if self.rng.chance(1, 4)
+            && let Some(jump) = self.gen_jump()
+        {
             let i = self.rng.below(modulus as u64) as usize;
             arms[i].push(jump);
         }
@@ -249,10 +390,31 @@ impl Gen {
         }
     }
 
+    fn gen_let_else(&mut self, budget: &mut i32) -> Stmt {
+        let scrut = self.gen_expr(2);
+        let modulus = 2 + self.rng.below(3) as u32;
+        self.depth += 1;
+        let mut body = self.gen_block(budget);
+        self.depth -= 1;
+        let jump = self
+            .gen_jump()
+            .expect("gen_let_else called where no jump is possible");
+        body.push(jump);
+        Stmt::LetElse {
+            scrut,
+            modulus,
+            body,
+        }
+    }
+
     fn gen_loop(&mut self, budget: &mut i32) -> Stmt {
         let label = self.fresh_label();
         self.depth += 1;
-        self.loop_labels.push(label);
+        self.loop_depth += 1;
+        self.loop_labels.push(LoopLabel {
+            id: label,
+            value: false,
+        });
         let stmt = match self.rng.below(3) {
             0 => {
                 let var = self.fresh("i");
@@ -261,10 +423,7 @@ impl Gen {
                 } else {
                     Upper::Lit(1 + self.rng.below(4) as u32)
                 };
-                self.scope.push(Var {
-                    name: var.clone(),
-                    assignable: false,
-                });
+                self.push_var(&var, false, false);
                 let body = self.gen_block(budget);
                 self.scope.pop();
                 Stmt::For {
@@ -279,10 +438,7 @@ impl Gen {
                 let limit = 1 + self.rng.below(4) as u32;
                 // The counter is declared just before the loop, so it
                 // stays in scope for the rest of the enclosing block.
-                self.scope.push(Var {
-                    name: counter.clone(),
-                    assignable: false,
-                });
+                self.push_var(&counter, false, false);
                 let body = self.gen_block(budget);
                 Stmt::While {
                     counter,
@@ -294,10 +450,7 @@ impl Gen {
             _ => {
                 let counter = self.fresh("c");
                 let limit = 1 + self.rng.below(4) as u32;
-                self.scope.push(Var {
-                    name: counter.clone(),
-                    assignable: false,
-                });
+                self.push_var(&counter, false, false);
                 let body = self.gen_block(budget);
                 Stmt::Loop {
                     counter,
@@ -308,20 +461,143 @@ impl Gen {
             }
         };
         self.loop_labels.pop();
+        self.loop_depth -= 1;
         self.depth -= 1;
         stmt
     }
 
-    fn gen_jump(&mut self) -> Stmt {
-        if !self.loop_labels.is_empty() && self.rng.chance(2, 3) {
-            let l = *self.rng.pick(&self.loop_labels);
-            if self.rng.chance(1, 2) {
-                Stmt::Break(l)
+    fn gen_while_let(&mut self, budget: &mut i32) -> Stmt {
+        let opt = self.pick_opt_var();
+        let bind = self.fresh("p");
+        let rebind = self.fresh("x");
+        let limit = 1 + self.rng.below(4) as u32;
+        let label = self.fresh_label();
+        self.depth += 1;
+        self.loop_depth += 1;
+        self.loop_labels.push(LoopLabel {
+            id: label,
+            value: false,
+        });
+        let mark = self.scope.len();
+        self.push_var(&rebind, true, false);
+        let body = self.gen_block(budget);
+        self.scope.truncate(mark);
+        self.loop_labels.pop();
+        self.loop_depth -= 1;
+        self.depth -= 1;
+        Stmt::WhileLet {
+            opt,
+            bind,
+            rebind,
+            limit,
+            label,
+            body,
+        }
+    }
+
+    fn gen_value_loop(&mut self, budget: &mut i32) -> Stmt {
+        let counter = self.fresh("c");
+        let limit = 1 + self.rng.below(4) as u32;
+        let label = self.fresh_label();
+        self.push_var(&counter, false, false);
+        let fuel_value = self.gen_expr(1);
+        // The loop is a value expression: hide enclosing labels and ban
+        // `return`, but its own (value-carrying) label is jumpable.
+        let prev_in_value = self.in_value;
+        self.in_value = true;
+        let saved_labels = std::mem::take(&mut self.loop_labels);
+        self.loop_labels.push(LoopLabel {
+            id: label,
+            value: true,
+        });
+        self.depth += 1;
+        self.loop_depth += 1;
+        let body = self.gen_block(budget);
+        self.loop_depth -= 1;
+        self.depth -= 1;
+        self.loop_labels = saved_labels;
+        self.in_value = prev_in_value;
+        let name = self.fresh("v");
+        self.push_var(&name, true, false);
+        Stmt::ValueLoop {
+            name,
+            counter,
+            limit,
+            label,
+            fuel_value,
+            body,
+        }
+    }
+
+    fn gen_jump(&mut self) -> Option<Stmt> {
+        if !self.loop_labels.is_empty() && (self.in_value || self.rng.chance(2, 3)) {
+            let i = self.rng.below(self.loop_labels.len() as u64) as usize;
+            let LoopLabel { id, value } = self.loop_labels[i];
+            Some(if self.rng.chance(1, 2) {
+                if value {
+                    Stmt::BreakValue(id, self.gen_expr(2))
+                } else {
+                    Stmt::Break(id)
+                }
             } else {
-                Stmt::Continue(l)
-            }
+                Stmt::Continue(id)
+            })
+        } else if !self.in_value {
+            Some(Stmt::Return(self.gen_ret_expr()))
         } else {
-            Stmt::Return(self.gen_expr(2))
+            None
+        }
+    }
+
+    fn gen_ret_expr(&mut self) -> RetExpr {
+        match self.flavor {
+            Flavor::U32 => RetExpr::Plain(self.gen_expr(2)),
+            Flavor::OptionU32 => {
+                if self.rng.chance(1, 5) {
+                    RetExpr::NoneLit
+                } else if self.has_opt_var() && self.rng.chance(1, 4) {
+                    RetExpr::OptVar(self.pick_opt_var())
+                } else {
+                    RetExpr::Wrapped(self.gen_expr(2))
+                }
+            }
+        }
+    }
+
+    fn gen_delegate(&mut self) -> Stmt {
+        let candidates: Vec<usize> = self
+            .prior
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.has_delegate)
+            .map(|(i, _)| i)
+            .collect();
+        let sub_case = *self.rng.pick(&candidates);
+        let sub_flavor = self.prior[sub_case].flavor;
+        let args = (self.gen_expr(1), self.gen_expr(1));
+        let sub_var = self.fresh("s");
+        let bind = if self.rng.chance(1, 3) {
+            DelegateBind::Discard
+        } else {
+            match sub_flavor {
+                Flavor::U32 => {
+                    let name = self.fresh("v");
+                    self.push_var(&name, false, false);
+                    DelegateBind::U32(name)
+                }
+                Flavor::OptionU32 => {
+                    let name = self.fresh("o");
+                    self.push_var(&name, false, true);
+                    DelegateBind::Opt(name)
+                }
+            }
+        };
+        self.has_delegate = true;
+        Stmt::Delegate {
+            sub_case,
+            sub_var,
+            args,
+            bind,
         }
     }
 
@@ -329,6 +605,7 @@ impl Gen {
         let cond = self.gen_cond();
         let prev = self.in_value;
         self.in_value = true;
+        // Hide enclosing loops so no jump can escape the value expression.
         let saved_labels = std::mem::take(&mut self.loop_labels);
         self.depth += 1;
         let (then_b, then_e) = self.gen_block_with_tail(budget);
@@ -337,10 +614,7 @@ impl Gen {
         self.loop_labels = saved_labels;
         self.in_value = prev;
         let name = self.fresh("v");
-        self.scope.push(Var {
-            name: name.clone(),
-            assignable: true,
-        });
+        self.push_var(&name, true, false);
         Stmt::LetIfValue {
             name,
             cond,
@@ -365,10 +639,7 @@ impl Gen {
         self.loop_labels = saved_labels;
         self.in_value = prev;
         let name = self.fresh("v");
-        self.scope.push(Var {
-            name: name.clone(),
-            assignable: true,
-        });
+        self.push_var(&name, true, false);
         Stmt::LetMatchValue {
             name,
             scrut,
@@ -380,7 +651,12 @@ impl Gen {
     fn gen_expr(&mut self, depth: u32) -> Expr {
         if depth == 0 || self.rng.chance(1, 2) {
             if self.rng.chance(3, 5) {
-                let names: Vec<&str> = self.scope.iter().map(|v| v.name.as_str()).collect();
+                let names: Vec<&str> = self
+                    .scope
+                    .iter()
+                    .filter(|v| !v.opt)
+                    .map(|v| v.name.as_str())
+                    .collect();
                 Expr::Var((*self.rng.pick(&names)).to_string())
             } else {
                 Expr::Lit(self.rng.below(16) as u32)

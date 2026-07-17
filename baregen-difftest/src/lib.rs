@@ -15,11 +15,13 @@ use baregen::{Coroutine, CoroutineState};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// The yield values and completion value of one full run.
+/// The yield values and completion value of one full run. `R` is the
+/// coroutine's return type (`u32`, or `Option<u32>` for bodies that
+/// exercise the `?` operator).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Trace {
+pub struct Trace<R> {
     pub yields: Vec<u32>,
-    pub complete: u32,
+    pub complete: R,
 }
 
 /// Generated bodies are terminating by construction, so exceeding this
@@ -66,7 +68,7 @@ pub mod oracle {
     /// Runs a reference body under the given resume script and captures
     /// its trace. If `f` panics the stale script is simply overwritten
     /// by the next run on this thread.
-    pub fn run_reference(f: impl FnOnce() -> u32, resumes: &[u32]) -> super::Trace {
+    pub fn run_reference<R>(f: impl FnOnce() -> R, resumes: &[u32]) -> super::Trace<R> {
         assert!(!resumes.is_empty(), "resume script must be non-empty");
         SCRIPT.with(|s| {
             *s.borrow_mut() = Some(Script {
@@ -98,9 +100,9 @@ fn resume_at(resumes: &[u32], i: usize) -> u32 {
 
 /// Drives the state machine to completion, feeding the cycled resume
 /// script exactly as the oracle does.
-pub fn drive_plain<C>(mut c: C, resumes: &[u32]) -> Result<Trace, String>
+pub fn drive_plain<C>(mut c: C, resumes: &[u32]) -> Result<Trace<C::Return>, String>
 where
-    C: Coroutine<u32, Yield = u32, Return = u32>,
+    C: Coroutine<u32, Yield = u32>,
 {
     let mut yields = Vec::new();
     let mut step = c.start();
@@ -128,9 +130,10 @@ where
 /// state and its clone are resumed with the same value and must take
 /// the same step. The run continues on the clone, so both the serde and
 /// the `Clone` path stay under test for the whole run.
-pub fn drive_tortured<C>(mut c: C, resumes: &[u32]) -> Result<Trace, String>
+pub fn drive_tortured<C>(mut c: C, resumes: &[u32]) -> Result<Trace<C::Return>, String>
 where
-    C: Coroutine<u32, Yield = u32, Return = u32> + Clone + Serialize + DeserializeOwned,
+    C: Coroutine<u32, Yield = u32> + Clone + Serialize + DeserializeOwned,
+    C::Return: PartialEq + core::fmt::Debug,
 {
     let mut yields = Vec::new();
     let mut step = c.start();
@@ -175,10 +178,11 @@ pub fn check_case<C>(
     source: &str,
     args: &[u32],
     resumes: &[u32],
-    reference: impl FnOnce() -> u32,
+    reference: impl FnOnce() -> C::Return,
     machine: C,
 ) where
-    C: Coroutine<u32, Yield = u32, Return = u32> + Clone + Serialize + DeserializeOwned,
+    C: Coroutine<u32, Yield = u32> + Clone + Serialize + DeserializeOwned,
+    C::Return: PartialEq + core::fmt::Debug,
 {
     let expected = oracle::run_reference(reference, resumes);
     match drive_plain(machine.clone(), resumes) {

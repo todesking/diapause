@@ -4,6 +4,22 @@
 //! conditions, fuel-bounded loops, fresh names so no shadowing) and
 //! panic-free (wrapping arithmetic, `%` by non-zero literals only).
 
+/// The coroutine's return type. `OptionU32` bodies may use the `?`
+/// operator and `None`-returning paths.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Flavor {
+    U32,
+    OptionU32,
+}
+
+/// A whole test case: one coroutine body plus its per-case knobs.
+pub struct Case {
+    pub body: Body,
+    pub flavor: Flavor,
+    pub fingerprint: bool,
+    pub has_delegate: bool,
+}
+
 pub enum Expr {
     Lit(u32),
     Var(String),
@@ -26,11 +42,38 @@ pub enum Upper {
     Var(String),
 }
 
+/// A value of the coroutine's return type, for `return` and the tail.
+pub enum RetExpr {
+    /// `expr` (U32 flavor).
+    Plain(Expr),
+    /// `Some(expr)` (OptionU32 flavor).
+    Wrapped(Expr),
+    /// `None` (OptionU32 flavor).
+    NoneLit,
+    /// An `Option<u32>` variable (OptionU32 flavor).
+    OptVar(String),
+}
+
+/// What a delegation binds its completion value to.
+pub enum DelegateBind {
+    /// `yield_all!(sub);` — value discarded.
+    Discard,
+    /// `let name: u32 = yield_all!(sub);`
+    U32(String),
+    /// `let mut name: Option<u32> = yield_all!(sub);`
+    Opt(String),
+}
+
 pub enum Stmt {
     /// `let mut name: u32 = expr;`
     Let {
         name: String,
         expr: Expr,
+    },
+    /// `let mut name: Option<u32> = Some(expr) / None;`
+    LetOption {
+        name: String,
+        init: Option<Expr>,
     },
     /// `name = expr;`
     Assign {
@@ -56,8 +99,23 @@ pub enum Stmt {
         name: String,
         arg: Expr,
     },
+    /// `let name: u32 = opt?;` (OptionU32 flavor only).
+    LetTry {
+        name: String,
+        opt: String,
+    },
     If {
         cond: Cond,
+        then_b: Vec<Stmt>,
+        else_b: Option<Vec<Stmt>>,
+    },
+    /// `if let Some(bind) = opt { let mut rebind: u32 = bind; .. }` —
+    /// the pattern binding is rebound immediately so it never crosses
+    /// a yield.
+    IfLet {
+        opt: String,
+        bind: String,
+        rebind: String,
         then_b: Vec<Stmt>,
         else_b: Option<Vec<Stmt>>,
     },
@@ -67,6 +125,14 @@ pub enum Stmt {
         scrut: Expr,
         modulus: u32,
         arms: Vec<Vec<Stmt>>,
+    },
+    /// `let 0u32 = (scrut) % modulus else { ..; <jump> };` — the else
+    /// block always ends in a diverging jump, and the pattern has no
+    /// bindings.
+    LetElse {
+        scrut: Expr,
+        modulus: u32,
+        body: Vec<Stmt>,
     },
     /// `'lN: for var in 0u32..upper { .. }`
     For {
@@ -83,6 +149,18 @@ pub enum Stmt {
         label: usize,
         body: Vec<Stmt>,
     },
+    /// `'lN: while let Some(bind) = opt { let mut rebind = bind;
+    /// opt = if rebind < limit { Some(rebind + 1) } else { None }; .. }`
+    /// — the scrutinee strictly increases toward `limit` before the
+    /// body runs, so every run terminates.
+    WhileLet {
+        opt: String,
+        bind: String,
+        rebind: String,
+        limit: u32,
+        label: usize,
+        body: Vec<Stmt>,
+    },
     /// `let mut counter = 0; 'lN: loop { if counter >= limit { break; } counter += 1; .. }`
     Loop {
         counter: String,
@@ -90,9 +168,23 @@ pub enum Stmt {
         label: usize,
         body: Vec<Stmt>,
     },
+    /// `let mut counter = 0; let mut name: u32 = 'lN: loop {
+    /// if counter >= limit { break 'lN fuel_value; } counter += 1; .. };`
+    /// — a value-producing loop; every break to its label carries a
+    /// value.
+    ValueLoop {
+        name: String,
+        counter: String,
+        limit: u32,
+        label: usize,
+        fuel_value: Expr,
+        body: Vec<Stmt>,
+    },
     Break(usize),
+    /// `break 'lN expr;` — targets a `ValueLoop` label.
+    BreakValue(usize, Expr),
     Continue(usize),
-    Return(Expr),
+    Return(RetExpr),
     /// `let mut name: u32 = if cond { ..; then_e } else { ..; else_e };`
     LetIfValue {
         name: String,
@@ -109,12 +201,25 @@ pub enum Stmt {
         modulus: u32,
         arms: Vec<(Vec<Stmt>, Expr)>,
     },
+    /// `yield_all!` delegation to an earlier generated case. This is
+    /// the one construct rendered differently per world: the reference
+    /// side calls the sub-case's reference function directly (the
+    /// sub-coroutine's state type does not exist in the plain-function
+    /// world).
+    Delegate {
+        sub_case: usize,
+        sub_var: String,
+        args: (Expr, Expr),
+        bind: DelegateBind,
+    },
 }
 
 pub enum Tail {
-    Expr(Expr),
+    Ret(RetExpr),
     /// Trailing `yield_!(e)` — evaluates to the resume value.
     Yield(Expr),
+    /// Trailing `Some(yield_!(e))` (OptionU32 flavor).
+    YieldWrapped(Expr),
 }
 
 pub struct Body {
