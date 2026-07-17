@@ -21,6 +21,9 @@ pub fn render_case(idx: usize, case: &Case) -> String {
     let ret_ty = match case.flavor {
         Flavor::U32 => "u32",
         Flavor::OptionU32 => "Option<u32>",
+        // Fully qualified: the coroutine attribute moves the body into a
+        // generated module, so bare imported names would not resolve.
+        Flavor::ResultU32 => "Result<u32, baregen_difftest::Err1>",
     };
     let attr = if case.fingerprint {
         "#[baregen::coroutine(yield = u32, resume = u32, fingerprint)]"
@@ -43,6 +46,7 @@ pub fn render_case(idx: usize, case: &Case) -> String {
     unused_labels,
     unused_parens,
     unused_comparisons,
+    unused_must_use,
     unreachable_code,
     dead_code,
     clippy::all
@@ -96,6 +100,7 @@ fn render_body(body: &Body, level: usize, world: World) -> String {
         Tail::Ret(r) => out.push_str(&format!("{i}{}\n", ret_expr(r))),
         Tail::Yield(e) => out.push_str(&format!("{i}yield_!({})\n", expr(e))),
         Tail::YieldWrapped(e) => out.push_str(&format!("{i}Some(yield_!({}))\n", expr(e))),
+        Tail::YieldOk(e) => out.push_str(&format!("{i}Ok(yield_!({}))\n", expr(e))),
     }
     out
 }
@@ -143,6 +148,18 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
         }
         Stmt::LetTry { name, opt } => {
             out.push_str(&format!("{i}let {name}: u32 = {opt}?;\n"));
+        }
+        Stmt::LetResult { name, init } => {
+            let init = match init {
+                Ok(e) => format!("Ok({})", expr(e)),
+                Err(e) => format!("Err(baregen_difftest::Err2({}))", expr(e)),
+            };
+            out.push_str(&format!(
+                "{i}let {name}: Result<u32, baregen_difftest::Err2> = {init};\n"
+            ));
+        }
+        Stmt::LetTryResult { name, res } => {
+            out.push_str(&format!("{i}let {name}: u32 = {res}?;\n"));
         }
         Stmt::If {
             cond: c,
@@ -379,6 +396,11 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                                 "{i}let mut {name}: Option<u32> = yield_all!({sub_var});\n"
                             ));
                         }
+                        DelegateBind::Res(name) => {
+                            out.push_str(&format!(
+                                "{i}let {name}: Result<u32, baregen_difftest::Err1> = yield_all!({sub_var});\n"
+                            ));
+                        }
                     }
                 }
                 World::Reference => {
@@ -392,6 +414,11 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                         }
                         DelegateBind::Opt(name) => {
                             out.push_str(&format!("{i}let mut {name}: Option<u32> = {call};\n"));
+                        }
+                        DelegateBind::Res(name) => {
+                            out.push_str(&format!(
+                                "{i}let {name}: Result<u32, baregen_difftest::Err1> = {call};\n"
+                            ));
                         }
                     }
                 }
@@ -417,6 +444,8 @@ fn ret_expr(r: &RetExpr) -> String {
         RetExpr::Wrapped(e) => format!("Some({})", expr(e)),
         RetExpr::NoneLit => "None".to_string(),
         RetExpr::OptVar(n) => n.clone(),
+        RetExpr::OkWrapped(e) => format!("Ok({})", expr(e)),
+        RetExpr::ErrWrapped(e) => format!("Err(baregen_difftest::Err1({}))", expr(e)),
     }
 }
 

@@ -28,6 +28,23 @@ pub struct Trace<R> {
 /// many suspensions in one run means a generator bug.
 const MAX_YIELDS: usize = 10_000;
 
+/// Error types for the `Result` flavor: generated bodies apply `?` to
+/// `Result<u32, Err2>` values inside coroutines returning
+/// `Result<u32, Err1>`, exercising the From-based error conversion of
+/// `BareFromResidual`. `Copy` so generated `?` operands can be reused
+/// freely, like the `Option<u32>` variables.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+pub struct Err1(pub u32);
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+pub struct Err2(pub u32);
+
+impl From<Err2> for Err1 {
+    fn from(e: Err2) -> Self {
+        Err1(e.0)
+    }
+}
+
 pub mod oracle {
     //! Reference-execution side: `yield_!` in a reference function calls
     //! [`yield_value`], so the plain function's own control flow decides

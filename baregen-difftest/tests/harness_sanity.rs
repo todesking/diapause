@@ -109,6 +109,62 @@ fn harness_accepts_option_flavor_pair() {
     }
 }
 
+// A Result-returning pair exercising `?` on `Result<u32, Err2>` inside
+// a `Result<u32, Err1>` coroutine — the `Err2 -> Err1` From conversion
+// the generator emits for the ResultU32 flavor. Paths are fully
+// qualified because the coroutine attribute moves the body into a
+// generated module.
+#[baregen::coroutine(yield = u32, resume = u32)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+fn fallible_sum(n: u32) -> Result<u32, baregen_difftest::Err1> {
+    let mut acc: u32 = 0u32;
+    for i in 0u32..n {
+        let r = yield_!(acc);
+        let step: Result<u32, baregen_difftest::Err2> = if r.is_multiple_of(3u32) {
+            Ok(r)
+        } else {
+            Err(baregen_difftest::Err2(r))
+        };
+        let x: u32 = step?;
+        acc = acc.wrapping_add(i).wrapping_add(x);
+    }
+    if acc.is_multiple_of(5u32) {
+        return Err(baregen_difftest::Err1(acc));
+    }
+    Ok(yield_!(acc))
+}
+
+fn fallible_sum_ref(n: u32) -> Result<u32, baregen_difftest::Err1> {
+    let mut acc: u32 = 0u32;
+    for i in 0u32..n {
+        let r = yield_!(acc);
+        let step: Result<u32, baregen_difftest::Err2> = if r.is_multiple_of(3u32) {
+            Ok(r)
+        } else {
+            Err(baregen_difftest::Err2(r))
+        };
+        let x: u32 = step?;
+        acc = acc.wrapping_add(i).wrapping_add(x);
+    }
+    if acc.is_multiple_of(5u32) {
+        return Err(baregen_difftest::Err1(acc));
+    }
+    Ok(yield_!(acc))
+}
+
+#[test]
+fn harness_accepts_result_flavor_pair() {
+    for resumes in [vec![0], vec![3, 6, 9], vec![1], vec![0, 3, 2]] {
+        check_case(
+            "fallible_sum",
+            &[3],
+            &resumes,
+            || fallible_sum_ref(3),
+            fallible_sum(3),
+        );
+    }
+}
+
 #[test]
 fn harness_detects_divergence() {
     fn wrong_ref(n: u32) -> u32 {
@@ -125,5 +181,34 @@ fn harness_detects_divergence() {
     assert!(
         result.is_err(),
         "harness failed to detect a diverging reference"
+    );
+}
+
+#[test]
+fn harness_detects_result_divergence() {
+    fn wrong_ref(n: u32) -> Result<u32, baregen_difftest::Err1> {
+        let mut acc: u32 = 0u32;
+        for i in 0u32..n {
+            let r = yield_!(acc);
+            // Diverges: carries a shifted value into the error.
+            let step: Result<u32, baregen_difftest::Err2> = if r.is_multiple_of(3u32) {
+                Ok(r)
+            } else {
+                Err(baregen_difftest::Err2(r.wrapping_add(1u32)))
+            };
+            let x: u32 = step?;
+            acc = acc.wrapping_add(i).wrapping_add(x);
+        }
+        if acc.is_multiple_of(5u32) {
+            return Err(baregen_difftest::Err1(acc));
+        }
+        Ok(yield_!(acc))
+    }
+    let result = std::panic::catch_unwind(|| {
+        check_case("wrong result", &[3], &[1], || wrong_ref(3), fallible_sum(3))
+    });
+    assert!(
+        result.is_err(),
+        "harness failed to detect a diverging Result reference"
     );
 }

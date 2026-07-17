@@ -5,11 +5,14 @@
 //! panic-free (wrapping arithmetic, `%` by non-zero literals only).
 
 /// The coroutine's return type. `OptionU32` bodies may use the `?`
-/// operator and `None`-returning paths.
+/// operator and `None`-returning paths. `ResultU32` bodies
+/// (`Result<u32, Err1>`) apply `?` to `Result<u32, Err2>` values,
+/// exercising From-based error conversion.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Flavor {
     U32,
     OptionU32,
+    ResultU32,
 }
 
 /// A whole test case: one coroutine body plus its per-case knobs.
@@ -52,6 +55,10 @@ pub enum RetExpr {
     NoneLit,
     /// An `Option<u32>` variable (OptionU32 flavor).
     OptVar(String),
+    /// `Ok(expr)` (ResultU32 flavor).
+    OkWrapped(Expr),
+    /// `Err(Err1(expr))` (ResultU32 flavor).
+    ErrWrapped(Expr),
 }
 
 /// What a delegation binds its completion value to.
@@ -62,6 +69,8 @@ pub enum DelegateBind {
     U32(String),
     /// `let mut name: Option<u32> = yield_all!(sub);`
     Opt(String),
+    /// `let name: Result<u32, Err1> = yield_all!(sub);`
+    Res(String),
 }
 
 pub enum Stmt {
@@ -103,6 +112,18 @@ pub enum Stmt {
     LetTry {
         name: String,
         opt: String,
+    },
+    /// `let name: Result<u32, Err2> = Ok(expr) / Err(Err2(expr));`
+    /// (ResultU32 flavor only).
+    LetResult {
+        name: String,
+        init: Result<Expr, Expr>,
+    },
+    /// `let name: u32 = res?;` (ResultU32 flavor only) — the error
+    /// side goes through `From`-based conversion.
+    LetTryResult {
+        name: String,
+        res: String,
     },
     If {
         cond: Cond,
@@ -220,6 +241,8 @@ pub enum Tail {
     Yield(Expr),
     /// Trailing `Some(yield_!(e))` (OptionU32 flavor).
     YieldWrapped(Expr),
+    /// Trailing `Ok(yield_!(e))` (ResultU32 flavor).
+    YieldOk(Expr),
 }
 
 pub struct Body {

@@ -18,7 +18,8 @@
 //!   generated program can panic;
 //! - `yield_all!` targets only earlier cases that contain no delegation
 //!   themselves, and only outside loops, so delegation cannot compound
-//!   into runaway trace lengths.
+//!   into runaway trace lengths; its arguments are reduced mod 16 so
+//!   argument-bounded loops in the sub-case stay small.
 
 use crate::ast::*;
 use crate::rng::Rng;
@@ -45,6 +46,8 @@ struct Var {
     /// `Option<u32>` variables live in the same scope stack but are
     /// only used as `if let` / `while let` / `?` operands.
     opt: bool,
+    /// `Result<u32, _>` variables are only used as `?` operands.
+    res: bool,
 }
 
 struct LoopLabel {
@@ -70,10 +73,10 @@ struct Gen<'a> {
 
 impl<'a> Gen<'a> {
     fn new(mut rng: Rng, prior: &'a [PriorCase]) -> Self {
-        let flavor = if rng.chance(1, 4) {
-            Flavor::OptionU32
-        } else {
-            Flavor::U32
+        let flavor = match rng.below(4) {
+            0 => Flavor::OptionU32,
+            1 => Flavor::ResultU32,
+            _ => Flavor::U32,
         };
         Gen {
             rng,
@@ -84,11 +87,13 @@ impl<'a> Gen<'a> {
                     name: "a0".into(),
                     assignable: false,
                     opt: false,
+                    res: false,
                 },
                 Var {
                     name: "a1".into(),
                     assignable: false,
                     opt: false,
+                    res: false,
                 },
             ],
             loop_labels: Vec::new(),
@@ -112,6 +117,7 @@ impl<'a> Gen<'a> {
             match self.flavor {
                 Flavor::U32 => Tail::Yield(e),
                 Flavor::OptionU32 => Tail::YieldWrapped(e),
+                Flavor::ResultU32 => Tail::YieldOk(e),
             }
         } else {
             Tail::Ret(self.gen_ret_expr())
@@ -170,6 +176,10 @@ impl<'a> Gen<'a> {
         self.scope.iter().any(|v| v.opt)
     }
 
+    fn has_res_var(&self) -> bool {
+        self.scope.iter().any(|v| v.res)
+    }
+
     /// Whether a diverging jump can be generated here (needed as the
     /// mandatory terminator of a `let else` block).
     fn jump_possible(&self) -> bool {
@@ -181,6 +191,7 @@ impl<'a> Gen<'a> {
         let structural = self.depth < 4 && *budget > 0;
         let has_assignable = self.scope.iter().any(|v| v.assignable && !v.opt);
         let has_opt = self.has_opt_var();
+        let has_res = self.has_res_var();
         let delegatable =
             !self.in_value && self.loop_depth == 0 && self.prior.iter().any(|p| !p.has_delegate);
 
@@ -191,6 +202,14 @@ impl<'a> Gen<'a> {
         }
         if has_opt && self.flavor == Flavor::OptionU32 && !self.in_value {
             kinds.push((2, 15));
+        }
+        // Weighted higher than the Option counterparts: the `?`-with-
+        // From-conversion path is the whole point of this flavor.
+        if self.flavor == Flavor::ResultU32 {
+            kinds.push((4, 18));
+            if has_res && !self.in_value {
+                kinds.push((6, 19));
+            }
         }
         if structural {
             kinds.push((3, 6));
@@ -283,7 +302,20 @@ impl<'a> Gen<'a> {
                 Stmt::LetTry { name, opt }
             }
             16 => self.gen_let_else(budget),
-            _ => self.gen_delegate(),
+            17 => self.gen_delegate(),
+            18 => {
+                let e = self.gen_expr(2);
+                let init = if self.rng.chance(3, 4) { Ok(e) } else { Err(e) };
+                let name = self.fresh("q");
+                self.push_res_var(&name);
+                Stmt::LetResult { name, init }
+            }
+            _ => {
+                let res = self.pick_res_var();
+                let name = self.fresh("v");
+                self.push_var(&name, false, false);
+                Stmt::LetTryResult { name, res }
+            }
         }
     }
 
@@ -292,6 +324,16 @@ impl<'a> Gen<'a> {
             name: name.to_string(),
             assignable,
             opt,
+            res: false,
+        });
+    }
+
+    fn push_res_var(&mut self, name: &str) {
+        self.scope.push(Var {
+            name: name.to_string(),
+            assignable: false,
+            opt: false,
+            res: true,
         });
     }
 
@@ -310,6 +352,16 @@ impl<'a> Gen<'a> {
             .scope
             .iter()
             .filter(|v| v.opt)
+            .map(|v| v.name.as_str())
+            .collect();
+        (*self.rng.pick(&names)).to_string()
+    }
+
+    fn pick_res_var(&mut self) -> String {
+        let names: Vec<&str> = self
+            .scope
+            .iter()
+            .filter(|v| v.res)
             .map(|v| v.name.as_str())
             .collect();
         (*self.rng.pick(&names)).to_string()
@@ -561,6 +613,13 @@ impl<'a> Gen<'a> {
                     RetExpr::Wrapped(self.gen_expr(2))
                 }
             }
+            Flavor::ResultU32 => {
+                if self.rng.chance(1, 5) {
+                    RetExpr::ErrWrapped(self.gen_expr(2))
+                } else {
+                    RetExpr::OkWrapped(self.gen_expr(2))
+                }
+            }
         }
     }
 
@@ -574,7 +633,13 @@ impl<'a> Gen<'a> {
             .collect();
         let sub_case = *self.rng.pick(&candidates);
         let sub_flavor = self.prior[sub_case].flavor;
-        let args = (self.gen_expr(1), self.gen_expr(1));
+        // Reduced mod 16 to keep sub-case arguments in the same domain
+        // as the proptest-generated ones: `for` loops bounded by an
+        // argument (`Upper::Var`) are only fuel-bounded on that domain.
+        let args = (
+            Expr::Rem(Box::new(self.gen_expr(1)), 16),
+            Expr::Rem(Box::new(self.gen_expr(1)), 16),
+        );
         let sub_var = self.fresh("s");
         let bind = if self.rng.chance(1, 3) {
             DelegateBind::Discard
@@ -589,6 +654,13 @@ impl<'a> Gen<'a> {
                     let name = self.fresh("o");
                     self.push_var(&name, false, true);
                     DelegateBind::Opt(name)
+                }
+                Flavor::ResultU32 => {
+                    // The bound `Result<u32, Err1>` is a valid `?`
+                    // operand too (reflexive `From<Err1> for Err1`).
+                    let name = self.fresh("q");
+                    self.push_res_var(&name);
+                    DelegateBind::Res(name)
                 }
             }
         };
@@ -654,7 +726,7 @@ impl<'a> Gen<'a> {
                 let names: Vec<&str> = self
                     .scope
                     .iter()
-                    .filter(|v| !v.opt)
+                    .filter(|v| !v.opt && !v.res)
                     .map(|v| v.name.as_str())
                     .collect();
                 Expr::Var((*self.rng.pick(&names)).to_string())
