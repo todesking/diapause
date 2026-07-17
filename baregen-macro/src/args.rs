@@ -77,3 +77,46 @@ impl Parse for MacroArgs {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use quote::quote;
+    use syn::parse_quote;
+
+    /// The error message `expand` produces for a coroutine whose
+    /// attribute arguments are `attr`.
+    fn expand_err(attr: proc_macro2::TokenStream) -> String {
+        let item: syn::ItemFn = parse_quote! {
+            fn c() {
+                yield_!(());
+            }
+        };
+        crate::expand::expand(attr, item).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn unknown_argument_is_rejected() {
+        let msg = expand_err(quote!(banana = i32));
+        assert!(
+            msg.contains("unknown argument, expected `yield`, `resume`, or `fingerprint`"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn duplicate_type_arguments_are_rejected() {
+        let msg = expand_err(quote!(yield = i32, yield = u32));
+        assert!(msg.contains("duplicate `yield` argument"), "got: {msg}");
+        let msg = expand_err(quote!(resume = i32, resume = u32));
+        assert!(msg.contains("duplicate `resume` argument"), "got: {msg}");
+    }
+
+    #[test]
+    fn duplicate_fingerprint_is_rejected() {
+        let msg = expand_err(quote!(fingerprint, fingerprint = "tag"));
+        assert!(
+            msg.contains("duplicate `fingerprint` argument"),
+            "got: {msg}"
+        );
+    }
+}
