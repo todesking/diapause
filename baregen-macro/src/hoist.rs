@@ -63,8 +63,11 @@ impl Hoister {
         self.pure = true;
         debug_assert!(self.prefix.is_empty(), "BUG: prefix not drained");
         match stmt {
-            // A bare trailing `yield_!(..)` produces the resume value:
-            // bind it and make the binding the tail expression.
+            // A brace-delimited `yield_! { .. }` without a semicolon
+            // parses as `Stmt::Macro` (syn 2 parses trailing paren and
+            // bracket macros as `Stmt::Expr(Expr::Macro, None)`, handled
+            // below). Bare, it produces the resume value: bind it and
+            // make the binding the tail expression.
             syn::Stmt::Macro(sm) if is_yield_macro(&sm.mac) && sm.semi_token.is_none() => {
                 let mut e = syn::Expr::Macro(syn::ExprMacro {
                     attrs: std::mem::take(&mut sm.attrs),
@@ -445,6 +448,21 @@ mod tests {
             parse_quote!({ yield_!(1) }),
             parse_quote!({
                 let __tmp0 = yield_!(1);
+                __tmp0
+            }),
+        );
+    }
+
+    #[test]
+    fn trailing_brace_yield_becomes_a_bound_tail() {
+        // The brace-delimited invocation is the one trailing-macro form
+        // that parses as `Stmt::Macro` without a semicolon.
+        assert_hoists(
+            parse_quote!({
+                yield_! { 1 }
+            }),
+            parse_quote!({
+                let __tmp0 = yield_! { 1 };
                 __tmp0
             }),
         );

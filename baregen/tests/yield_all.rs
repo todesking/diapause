@@ -68,6 +68,23 @@ fn tail_position_returns_the_completion_value() {
     assert_eq!(c.resume(2), CoroutineState::Complete(103));
 }
 
+/// A brace-delimited invocation is the one trailing-macro form that
+/// reaches lowering as `Stmt::Macro` without a semicolon (syn parses
+/// trailing paren/bracket macros as trailing expressions).
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn tail_position_brace(start: u32) -> u32 {
+    let g: inner_sum::State = inner_sum(start);
+    yield_all! { g }
+}
+
+#[test]
+fn brace_delimited_tail_delegation_returns_the_completion_value() {
+    let mut c = tail_position_brace(100);
+    assert_eq!(c.start(), CoroutineState::Yielded(100));
+    assert_eq!(c.resume(1), CoroutineState::Yielded(101));
+    assert_eq!(c.resume(2), CoroutineState::Complete(103));
+}
+
 #[baregen::coroutine(yield = u32)]
 fn completes_immediately() -> u32 {
     7

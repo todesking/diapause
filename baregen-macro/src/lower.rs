@@ -447,9 +447,12 @@ impl Lowerer {
                     has_value_tail = true;
                     self.lower_tail_expr(stmt, e, ctx);
                 }
-                // A trailing macro invocation parses as `Stmt::Macro`,
-                // not as a trailing expression; `yield_all!(g)` is the
-                // one macro that produces a value there.
+                // A brace-delimited trailing macro (`yield_all! { g }`)
+                // parses as `Stmt::Macro` without a semicolon; paren and
+                // bracket invocations parse as a trailing expression
+                // (`Stmt::Expr(Expr::Macro, None)`) and take the arm
+                // above. `yield_all!` is the one macro that produces a
+                // value here.
                 syn::Stmt::Macro(sm)
                     if i + 1 == n && sm.semi_token.is_none() && is_yield_all_macro(&sm.mac) =>
                 {
