@@ -40,14 +40,14 @@ fn main() {
     );
     // Cases are generated in order: a case may delegate (yield_all!)
     // only to earlier cases, so later generation needs the flavor and
-    // delegation status of everything before it.
+    // worst-case yield bound of everything before it.
     let mut prior: Vec<generator::PriorCase> = Vec::new();
     for i in 0..cases {
         let case = generator::generate(seed, i, &prior);
         out.push_str(&render::render_case(i, &case));
         prior.push(generator::PriorCase {
             flavor: case.flavor,
-            has_delegate: case.has_delegate,
+            bound: case.bound,
         });
     }
 

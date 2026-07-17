@@ -20,7 +20,9 @@ pub struct Case {
     pub body: Body,
     pub flavor: Flavor,
     pub fingerprint: bool,
-    pub has_delegate: bool,
+    /// Static worst-case yield count of one run, including delegated
+    /// sub-cases; later cases use it to gate their own delegations.
+    pub bound: u64,
 }
 
 pub enum Expr {

@@ -16,18 +16,28 @@
 //!   jumps never escape a value expression;
 //! - all arithmetic is wrapping and `%` uses non-zero literals, so no
 //!   generated program can panic;
-//! - `yield_all!` targets only earlier cases that contain no delegation
-//!   themselves, and only outside loops, so delegation cannot compound
-//!   into runaway trace lengths; its arguments are reduced mod 16 so
+//! - `yield_all!` targets only earlier cases, and every case carries a
+//!   static worst-case yield bound; a delegation (even inside loops or
+//!   chained through other delegating cases) is generated only while
+//!   the current case's bound stays under [`YIELD_BOUND`], so trace
+//!   lengths cannot run away; its arguments are reduced mod 16 so
 //!   argument-bounded loops in the sub-case stay small.
 
 use crate::ast::*;
 use crate::rng::Rng;
 
+/// Cap on a case's static worst-case yield count when adding a
+/// delegation. The harness aborts a run at MAX_YIELDS = 10_000
+/// (src/lib.rs), so 2_000 leaves a 5x margin; real traces stay far
+/// below the worst case because arguments, branches, and early jumps
+/// cut loops short, and the proptest resume script only steers resume
+/// values, never adds yields.
+const YIELD_BOUND: u64 = 2_000;
+
 /// What later cases need to know about an earlier one to delegate to it.
 pub struct PriorCase {
     pub flavor: Flavor,
-    pub has_delegate: bool,
+    pub bound: u64,
 }
 
 pub fn generate(seed: u64, index: usize, prior: &[PriorCase]) -> Case {
@@ -65,10 +75,12 @@ struct Gen<'a> {
     next_var: usize,
     next_label: usize,
     depth: usize,
-    loop_depth: usize,
     yields: usize,
+    /// Product of the iteration bounds of all enclosing loops.
+    loop_mult: u64,
+    /// Worst-case yields of the statements generated so far.
+    bound: u64,
     in_value: bool,
-    has_delegate: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -100,10 +112,10 @@ impl<'a> Gen<'a> {
             next_var: 0,
             next_label: 0,
             depth: 0,
-            loop_depth: 0,
             yields: 0,
+            loop_mult: 1,
+            bound: 0,
             in_value: false,
-            has_delegate: false,
         }
     }
 
@@ -112,7 +124,7 @@ impl<'a> Gen<'a> {
         let mut budget = 4 + self.rng.below(10) as i32;
         let stmts = self.gen_block(&mut budget);
         let tail = if self.yields == 0 || self.rng.chance(3, 10) {
-            self.yields += 1;
+            self.count_yields(1);
             let e = self.gen_expr(2);
             match self.flavor {
                 Flavor::U32 => Tail::Yield(e),
@@ -126,8 +138,20 @@ impl<'a> Gen<'a> {
             body: Body { stmts, tail },
             flavor: self.flavor,
             fingerprint,
-            has_delegate: self.has_delegate,
+            bound: self.bound,
         }
+    }
+
+    /// Records `n` yields at the current loop-nesting multiplier.
+    fn count_yields(&mut self, n: u64) {
+        self.yields += n as usize;
+        self.bound += self.loop_mult * n;
+    }
+
+    /// Whether delegating to a case with the given bound keeps this
+    /// case's worst-case yield count under [`YIELD_BOUND`].
+    fn delegation_fits(&self, sub_bound: u64) -> bool {
+        self.bound + self.loop_mult * sub_bound <= YIELD_BOUND
     }
 
     fn fresh(&mut self, prefix: &str) -> String {
@@ -192,10 +216,10 @@ impl<'a> Gen<'a> {
         let has_assignable = self.scope.iter().any(|v| v.assignable && !v.opt);
         let has_opt = self.has_opt_var();
         let has_res = self.has_res_var();
-        // Value-position if/match arms run at most once, so delegation
-        // there cannot compound trace length; `loop_depth == 0` still
-        // keeps it out of every loop body, including value loops.
-        let delegatable = self.loop_depth == 0 && self.prior.iter().any(|p| !p.has_delegate);
+        // Delegation anywhere (loop bodies, value positions, chains
+        // through other delegating cases) as long as the static yield
+        // bound stays under YIELD_BOUND.
+        let delegatable = self.prior.iter().any(|p| self.delegation_fits(p.bound));
 
         let mut kinds: Vec<(u64, u8)> = vec![(3, 0), (3, 1), (2, 2), (1, 3), (2, 11)];
         if has_assignable {
@@ -250,18 +274,18 @@ impl<'a> Gen<'a> {
                 Stmt::Let { name, expr }
             }
             1 => {
-                self.yields += 1;
+                self.count_yields(1);
                 Stmt::Yield(self.gen_expr(2))
             }
             2 => {
-                self.yields += 1;
+                self.count_yields(1);
                 let arg = self.gen_expr(2);
                 let name = self.fresh("r");
                 self.push_var(&name, false, false);
                 Stmt::LetYield { name, arg }
             }
             3 => {
-                self.yields += 2;
+                self.count_yields(2);
                 let a = self.gen_expr(1);
                 let b = self.gen_expr(1);
                 let name = self.fresh("r");
@@ -273,7 +297,7 @@ impl<'a> Gen<'a> {
                 expr: self.gen_expr(2),
             },
             5 => {
-                self.yields += 1;
+                self.count_yields(1);
                 Stmt::AssignYieldAdd {
                     name: self.pick_assignable(),
                     arg: self.gen_expr(1),
@@ -463,10 +487,19 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// Generates a loop body with the loop's iteration bound folded
+    /// into the yield-bound multiplier.
+    fn gen_loop_body(&mut self, iters: u64, budget: &mut i32) -> Vec<Stmt> {
+        let saved = self.loop_mult;
+        self.loop_mult *= iters;
+        let body = self.gen_block(budget);
+        self.loop_mult = saved;
+        body
+    }
+
     fn gen_loop(&mut self, budget: &mut i32) -> Stmt {
         let label = self.fresh_label();
         self.depth += 1;
-        self.loop_depth += 1;
         self.loop_labels.push(LoopLabel {
             id: label,
             value: false,
@@ -479,8 +512,15 @@ impl<'a> Gen<'a> {
                 } else {
                     Upper::Lit(1 + self.rng.below(4) as u32)
                 };
+                // Arguments are proptest-drawn from 0..16 and delegation
+                // arguments are reduced mod 16, so an argument-bounded
+                // range runs at most 15 times.
+                let iters = match &upper {
+                    Upper::Lit(n) => *n as u64,
+                    Upper::Var(_) => 15,
+                };
                 self.push_var(&var, false, false);
-                let body = self.gen_block(budget);
+                let body = self.gen_loop_body(iters, budget);
                 self.scope.pop();
                 Stmt::For {
                     var,
@@ -495,7 +535,7 @@ impl<'a> Gen<'a> {
                 // The counter is declared just before the loop, so it
                 // stays in scope for the rest of the enclosing block.
                 self.push_var(&counter, false, false);
-                let body = self.gen_block(budget);
+                let body = self.gen_loop_body(limit as u64, budget);
                 Stmt::While {
                     counter,
                     limit,
@@ -507,7 +547,7 @@ impl<'a> Gen<'a> {
                 let counter = self.fresh("c");
                 let limit = 1 + self.rng.below(4) as u32;
                 self.push_var(&counter, false, false);
-                let body = self.gen_block(budget);
+                let body = self.gen_loop_body(limit as u64, budget);
                 Stmt::Loop {
                     counter,
                     limit,
@@ -517,7 +557,6 @@ impl<'a> Gen<'a> {
             }
         };
         self.loop_labels.pop();
-        self.loop_depth -= 1;
         self.depth -= 1;
         stmt
     }
@@ -529,17 +568,17 @@ impl<'a> Gen<'a> {
         let limit = 1 + self.rng.below(4) as u32;
         let label = self.fresh_label();
         self.depth += 1;
-        self.loop_depth += 1;
         self.loop_labels.push(LoopLabel {
             id: label,
             value: false,
         });
         let mark = self.scope.len();
         self.push_var(&rebind, true, false);
-        let body = self.gen_block(budget);
+        // The scrutinee strictly increases from at worst 0 up to `limit`
+        // before going None, so the body runs at most limit + 1 times.
+        let body = self.gen_loop_body(limit as u64 + 1, budget);
         self.scope.truncate(mark);
         self.loop_labels.pop();
-        self.loop_depth -= 1;
         self.depth -= 1;
         Stmt::WhileLet {
             opt,
@@ -567,9 +606,7 @@ impl<'a> Gen<'a> {
             value: true,
         });
         self.depth += 1;
-        self.loop_depth += 1;
-        let body = self.gen_block(budget);
-        self.loop_depth -= 1;
+        let body = self.gen_loop_body(limit as u64, budget);
         self.depth -= 1;
         self.loop_labels = saved_labels;
         self.in_value = prev_in_value;
@@ -632,11 +669,12 @@ impl<'a> Gen<'a> {
             .prior
             .iter()
             .enumerate()
-            .filter(|(_, p)| !p.has_delegate)
+            .filter(|(_, p)| self.delegation_fits(p.bound))
             .map(|(i, _)| i)
             .collect();
         let sub_case = *self.rng.pick(&candidates);
         let sub_flavor = self.prior[sub_case].flavor;
+        self.bound += self.loop_mult * self.prior[sub_case].bound;
         // Reduced mod 16 to keep sub-case arguments in the same domain
         // as the proptest-generated ones: `for` loops bounded by an
         // argument (`Upper::Var`) are only fuel-bounded on that domain.
@@ -668,7 +706,6 @@ impl<'a> Gen<'a> {
                 }
             }
         };
-        self.has_delegate = true;
         Stmt::Delegate {
             sub_case,
             sub_var,
