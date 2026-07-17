@@ -10,6 +10,7 @@ mod cfg;
 mod expand;
 mod hoist;
 mod lower;
+mod signature;
 #[cfg(test)]
 mod test_util;
 mod ty_infer;
