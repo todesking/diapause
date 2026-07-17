@@ -319,6 +319,10 @@ impl VisitMut for Hoister {
         *arm.body = if prefix.is_empty() {
             body
         } else {
+            // Drop the now-optional comma: rustfmt removes it after a
+            // block-bodied arm, so keeping it would make the printed
+            // output disagree with rustfmt-formatted test fixtures.
+            arm.comma = None;
             syn::parse_quote!({ #(#prefix)* #body })
         };
     }
