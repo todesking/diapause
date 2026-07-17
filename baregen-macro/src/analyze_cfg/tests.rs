@@ -755,6 +755,34 @@ fn arm_binding_consumed_before_the_yield_is_fine() {
 }
 
 #[test]
+fn opaque_jump_shadowing_a_state_field_is_rejected() {
+    // The `if let` statement contains no yield, so it stays opaque and
+    // its `break` becomes an opaque jump into the loop's exit variant,
+    // which stores the outer `sum`; the arm binding `sum` inside the
+    // statement would be captured instead of the stored one.
+    let block: syn::Block = parse_quote!({
+        let mut sum: u32 = 0;
+        loop {
+            yield_!(sum);
+            if let Some(sum) = helper(n) {
+                if sum > 3 {
+                    break;
+                }
+            }
+            sum += 1;
+        }
+        f(sum);
+    });
+    let (_, result) = lower_analyze(&[("n", "u32")], &block, &unit());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("`sum` is also stored in the coroutine state"),
+        "got: {msg}"
+    );
+    assert!(msg.contains("rename the inner binding"), "got: {msg}");
+}
+
+#[test]
 fn same_named_bindings_in_one_variant_are_an_error() {
     // The shadowed outer `x` survives as the borrow source while the
     // inner `x` is live too: both would need a field named `x`.
