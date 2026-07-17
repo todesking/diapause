@@ -1570,6 +1570,136 @@ fn multiple_errors_are_combined() {
     assert_eq!(err.into_iter().count(), 2);
 }
 
+#[test]
+fn yield_in_unsafe_block_in_value_position_is_rejected() {
+    // The let-initializer form routes through `lower_value_expr`,
+    // whose `Unsafe` arm is distinct from the statement-position one.
+    let block: syn::Block = parse_quote!({
+        let x: u32 = unsafe {
+            yield_!(1);
+            1
+        };
+    });
+    assert!(error_of(&block).to_string().contains("unsafe"));
+    // Same arm via the function's trailing expression.
+    let block: syn::Block = parse_quote!({
+        unsafe {
+            yield_!(1);
+            1
+        }
+    });
+    assert!(error_of(&block).to_string().contains("unsafe"));
+}
+
+#[test]
+fn unhoistable_arm_tail_in_store_context_is_rejected() {
+    // The arm's trailing expression contains a yield but is not a
+    // control-flow expression, so it cannot produce the `let` value.
+    let block: syn::Block = parse_quote!({
+        let x: u32 = if c { f(yield_!(1)) } else { 2 };
+    });
+    let msg = error_of(&block).to_string();
+    assert!(msg.contains("value position"), "got: {msg}");
+}
+
+#[test]
+fn foreign_macro_with_yield_in_tail_position_is_rejected() {
+    // The tail does not count as containing a yield (foreign macro
+    // tokens are opaque), so it is caught by the tail's no-yield scan.
+    let block: syn::Block = parse_quote!({ println!("{}", yield_!(1)) });
+    assert!(error_of(&block).to_string().contains("another macro"));
+}
+
+#[test]
+fn brace_form_trailing_yield_is_rejected() {
+    // A brace-delimited `yield_!` parses as `Stmt::Macro` without a
+    // semicolon, taking a different path than the paren form.
+    let block: syn::Block = parse_quote!({
+        yield_! { 1 }
+    });
+    assert!(error_of(&block).to_string().contains("add a semicolon"));
+}
+
+#[test]
+fn continue_outside_of_a_loop_is_rejected() {
+    let block: syn::Block = parse_quote!({
+        yield_!(1);
+        continue;
+    });
+    assert!(
+        error_of(&block)
+            .to_string()
+            .contains("`continue` outside of a loop")
+    );
+}
+
+#[test]
+fn continue_to_undeclared_label_is_rejected() {
+    let block: syn::Block = parse_quote!({
+        loop {
+            yield_!(1);
+            continue 'nowhere;
+        }
+    });
+    assert!(error_of(&block).to_string().contains("undeclared label"));
+}
+
+#[test]
+fn value_let_subpattern_binding_is_rejected() {
+    let block: syn::Block = parse_quote!({
+        let x @ _ = if c {
+            yield_!(1);
+            1
+        } else {
+            2
+        };
+    });
+    assert!(error_of(&block).to_string().contains("simple identifier"));
+}
+
+#[test]
+fn ref_resume_binding_is_rejected() {
+    let block: syn::Block = parse_quote!({
+        let ref r = yield_!(1);
+    });
+    assert!(error_of(&block).to_string().contains("simple identifier"));
+}
+
+#[test]
+fn break_value_containing_yield_is_rejected() {
+    // `break yield_!(..)` targeting a let-initializer loop: the value
+    // is checked when it is stored to the destination binding.
+    let block: syn::Block = parse_quote!({
+        let x: u32 = loop {
+            yield_!(0);
+            break yield_!(1);
+        };
+        f(x);
+    });
+    let msg = error_of(&block).to_string();
+    assert!(msg.contains("value position"), "got: {msg}");
+    // The same for a trailing-expression loop, whose `break` value
+    // completes the coroutine.
+    let block: syn::Block = parse_quote!({
+        loop {
+            yield_!(0);
+            break yield_!(1);
+        }
+    });
+    let msg = error_of(&block).to_string();
+    assert!(msg.contains("value position"), "got: {msg}");
+}
+
+#[test]
+fn yield_in_if_let_scrutinee_is_rejected() {
+    let block: syn::Block = parse_quote!({
+        if let Some(x) = yield_!(1) {
+            f(x);
+        }
+    });
+    assert!(error_of(&block).to_string().contains("scrutinee"));
+}
+
 // === yield_all! delegation ===
 
 #[test]
