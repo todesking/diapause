@@ -37,6 +37,7 @@ const YIELD_BOUND: u64 = 2_000;
 /// What later cases need to know about an earlier one to delegate to it.
 pub struct PriorCase {
     pub flavor: Flavor,
+    pub shape: ArgShape,
     pub bound: u64,
 }
 
@@ -75,6 +76,7 @@ struct Gen<'a> {
     rng: Rng,
     prior: &'a [PriorCase],
     flavor: Flavor,
+    shape: ArgShape,
     scope: Vec<Var>,
     loop_labels: Vec<LoopLabel>,
     next_var: usize,
@@ -95,26 +97,29 @@ impl<'a> Gen<'a> {
             1 => Flavor::ResultU32,
             _ => Flavor::U32,
         };
+        let shape = match rng.below(6) {
+            0 => ArgShape::Tuple,
+            1 => ArgShape::Mixed,
+            _ => ArgShape::Plain,
+        };
+        // The argument values always enter the pool as a0/a1(/a2); for
+        // the pattern shapes the renderer emits the `let aN: u32 = bN;`
+        // rebinds at the top of the body.
+        let scope = (0..shape.arity())
+            .map(|i| Var {
+                name: format!("a{i}"),
+                assignable: false,
+                opt: false,
+                res: false,
+                arr: false,
+            })
+            .collect();
         Gen {
             rng,
             prior,
             flavor,
-            scope: vec![
-                Var {
-                    name: "a0".into(),
-                    assignable: false,
-                    opt: false,
-                    res: false,
-                    arr: false,
-                },
-                Var {
-                    name: "a1".into(),
-                    assignable: false,
-                    opt: false,
-                    res: false,
-                    arr: false,
-                },
-            ],
+            shape,
+            scope,
             loop_labels: Vec::new(),
             next_var: 0,
             next_label: 0,
@@ -134,6 +139,7 @@ impl<'a> Gen<'a> {
         Case {
             body: Body { stmts, tail },
             flavor: self.flavor,
+            shape: self.shape,
             fingerprint,
             bound: self.bound,
         }
@@ -152,14 +158,13 @@ impl<'a> Gen<'a> {
                 .collect();
             if !candidates.is_empty() {
                 let sub_case = *self.rng.pick(&candidates);
+                let sub_shape = self.prior[sub_case].shape;
                 self.bound += self.prior[sub_case].bound;
-                let args = (
-                    Expr::Rem(Box::new(self.gen_expr(1)), 16),
-                    Expr::Rem(Box::new(self.gen_expr(1)), 16),
-                );
+                let args = self.gen_delegate_args(sub_shape);
                 let sub_var = self.fresh("s");
                 return Tail::Delegate {
                     sub_case,
+                    sub_shape,
                     sub_var,
                     args,
                 };
@@ -907,14 +912,9 @@ impl<'a> Gen<'a> {
             .collect();
         let sub_case = *self.rng.pick(&candidates);
         let sub_flavor = self.prior[sub_case].flavor;
+        let sub_shape = self.prior[sub_case].shape;
         self.bound += self.loop_mult * self.prior[sub_case].bound;
-        // Reduced mod 16 to keep sub-case arguments in the same domain
-        // as the proptest-generated ones: `for` loops bounded by an
-        // argument (`Upper::Var`) are only fuel-bounded on that domain.
-        let args = (
-            Expr::Rem(Box::new(self.gen_expr(1)), 16),
-            Expr::Rem(Box::new(self.gen_expr(1)), 16),
-        );
+        let args = self.gen_delegate_args(sub_shape);
         let sub_var = self.fresh("s");
         let bind = if self.rng.chance(1, 3) {
             DelegateBind::Discard
@@ -941,10 +941,21 @@ impl<'a> Gen<'a> {
         };
         Stmt::Delegate {
             sub_case,
+            sub_shape,
             sub_var,
             args,
             bind,
         }
+    }
+
+    /// One argument expression per u32 value of the sub-case's shape,
+    /// reduced mod 16 to keep sub-case arguments in the same domain as
+    /// the proptest-generated ones: `for` loops bounded by an argument
+    /// (`Upper::Var`) are only fuel-bounded on that domain.
+    fn gen_delegate_args(&mut self, shape: ArgShape) -> Vec<Expr> {
+        (0..shape.arity())
+            .map(|_| Expr::Rem(Box::new(self.gen_expr(1)), 16))
+            .collect()
     }
 
     fn gen_let_if_value(&mut self, budget: &mut i32) -> Stmt {

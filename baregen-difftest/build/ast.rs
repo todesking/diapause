@@ -15,10 +15,36 @@ pub enum Flavor {
     ResultU32,
 }
 
+/// Shape of the coroutine's argument list. Non-plain shapes bind
+/// values through a tuple pattern in the signature; the pattern names
+/// (`b0`, `b1`) are rebound to `a0`/`a1` at the top of the body,
+/// because pattern bindings carry no type annotation and so must not
+/// cross a yield.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ArgShape {
+    /// `(a0: u32, a1: u32)`
+    Plain,
+    /// `((b0, b1): (u32, u32))`
+    Tuple,
+    /// `((b0, b1): (u32, u32), a2: u32)`
+    Mixed,
+}
+
+impl ArgShape {
+    /// How many u32 values the argument list carries.
+    pub fn arity(self) -> usize {
+        match self {
+            ArgShape::Plain | ArgShape::Tuple => 2,
+            ArgShape::Mixed => 3,
+        }
+    }
+}
+
 /// A whole test case: one coroutine body plus its per-case knobs.
 pub struct Case {
     pub body: Body,
     pub flavor: Flavor,
+    pub shape: ArgShape,
     pub fingerprint: bool,
     /// Static worst-case yield count of one run, including delegated
     /// sub-cases; later cases use it to gate their own delegations.
@@ -308,8 +334,13 @@ pub enum Stmt {
     /// world).
     Delegate {
         sub_case: usize,
+        /// Argument-list shape of the sub-case, captured at generation
+        /// time so the renderer can format the call.
+        sub_shape: ArgShape,
         sub_var: String,
-        args: (Expr, Expr),
+        /// One expression per u32 value (`sub_shape.arity()` of them),
+        /// each reduced mod 16.
+        args: Vec<Expr>,
         bind: DelegateBind,
     },
 }
@@ -338,8 +369,9 @@ pub enum Tail {
     /// sub-case has the same flavor.
     Delegate {
         sub_case: usize,
+        sub_shape: ArgShape,
         sub_var: String,
-        args: (Expr, Expr),
+        args: Vec<Expr>,
     },
 }
 

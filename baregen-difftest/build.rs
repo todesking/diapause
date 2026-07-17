@@ -47,6 +47,7 @@ fn main() {
         out.push_str(&render::render_case(i, &case));
         prior.push(generator::PriorCase {
             flavor: case.flavor,
+            shape: case.shape,
             bound: case.bound,
         });
     }

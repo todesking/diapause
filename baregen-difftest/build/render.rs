@@ -30,10 +30,40 @@ pub fn render_case(idx: usize, case: &Case) -> String {
     } else {
         "#[baregen::coroutine(yield = u32, resume = u32)]"
     };
-    let co_body = render_body(&case.body, 2, World::Coroutine);
-    let ref_body = render_body(&case.body, 2, World::Reference);
+    let sig = match case.shape {
+        ArgShape::Plain => "a0: u32, a1: u32",
+        ArgShape::Tuple => "(b0, b1): (u32, u32)",
+        ArgShape::Mixed => "(b0, b1): (u32, u32), a2: u32",
+    };
+    // Pattern bindings have no type annotation, so they must not cross
+    // a yield; the body rebinds them to the annotated pool names first.
+    let rebind = |level: usize| match case.shape {
+        ArgShape::Plain => String::new(),
+        _ => format!(
+            "{i}let a0: u32 = b0;\n{i}let a1: u32 = b1;\n",
+            i = ind(level)
+        ),
+    };
+    // Proptest draws one u32 per argument value; the call re-groups
+    // them to match the signature's shape.
+    let (extra_param, args_list, call) = match case.shape {
+        ArgShape::Plain => ("", "a0, a1", "a0, a1"),
+        ArgShape::Tuple => ("", "a0, a1", "(a0, a1)"),
+        ArgShape::Mixed => ("\n        a2 in 0u32..16u32,", "a0, a1, a2", "(a0, a1), a2"),
+    };
+    let co_body = format!(
+        "{}{}",
+        rebind(2),
+        render_body(&case.body, 2, World::Coroutine)
+    );
+    let ref_body = format!(
+        "{}{}",
+        rebind(2),
+        render_body(&case.body, 2, World::Reference)
+    );
     let source = format!(
-        "{attr}\nfn co(a0: u32, a1: u32) -> {ret_ty} {{\n{}}}",
+        "{attr}\nfn co({sig}) -> {ret_ty} {{\n{}{}}}",
+        rebind(1),
         render_body(&case.body, 1, World::Coroutine)
     );
     format!(
@@ -58,10 +88,10 @@ mod {name} {{
 
     {attr}
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
-    pub fn co(a0: u32, a1: u32) -> {ret_ty} {{
+    pub fn co({sig}) -> {ret_ty} {{
 {co_body}    }}
 
-    pub fn reference(a0: u32, a1: u32) -> {ret_ty} {{
+    pub fn reference({sig}) -> {ret_ty} {{
 {ref_body}    }}
 }}
 
@@ -70,15 +100,15 @@ proptest::proptest! {{
     #[test]
     fn {name}(
         a0 in 0u32..16u32,
-        a1 in 0u32..16u32,
+        a1 in 0u32..16u32,{extra_param}
         resumes in proptest::collection::vec(0u32..16u32, 1..12),
     ) {{
         baregen_difftest::check_case(
             {name}::SOURCE,
-            &[a0, a1],
+            &[{args_list}],
             &resumes,
-            || {name}::reference(a0, a1),
-            {name}::co(a0, a1),
+            || {name}::reference({call}),
+            {name}::co({call}),
         );
     }}
 }}
@@ -129,20 +159,21 @@ fn render_body(body: &Body, level: usize, world: World) -> String {
         // reference function; either way the result is the tail value.
         Tail::Delegate {
             sub_case,
+            sub_shape,
             sub_var,
             args,
         } => {
-            let (e1, e2) = (expr(&args.0), expr(&args.1));
+            let call = call_args(*sub_shape, args);
             let sub_mod = format!("crate::case_{sub_case:03}");
             match world {
                 World::Coroutine => {
                     out.push_str(&format!(
-                        "{i}let {sub_var}: {sub_mod}::co::State = {sub_mod}::co({e1}, {e2});\n"
+                        "{i}let {sub_var}: {sub_mod}::co::State = {sub_mod}::co({call});\n"
                     ));
                     out.push_str(&format!("{i}yield_all!({sub_var})\n"));
                 }
                 World::Reference => {
-                    out.push_str(&format!("{i}{sub_mod}::reference({e1}, {e2})\n"));
+                    out.push_str(&format!("{i}{sub_mod}::reference({call})\n"));
                 }
             }
         }
@@ -456,11 +487,12 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
         }
         Stmt::Delegate {
             sub_case,
+            sub_shape,
             sub_var,
             args,
             bind,
         } => {
-            let (e1, e2) = (expr(&args.0), expr(&args.1));
+            let call = call_args(*sub_shape, args);
             // `crate::` rather than `super::`: the coroutine transformation
             // moves body code into a nested generated module, which would
             // change what `super` refers to.
@@ -468,7 +500,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
             match world {
                 World::Coroutine => {
                     out.push_str(&format!(
-                        "{i}let {sub_var}: {sub_mod}::co::State = {sub_mod}::co({e1}, {e2});\n"
+                        "{i}let {sub_var}: {sub_mod}::co::State = {sub_mod}::co({call});\n"
                     ));
                     match bind {
                         DelegateBind::Discard => {
@@ -490,7 +522,7 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                     }
                 }
                 World::Reference => {
-                    let call = format!("{sub_mod}::reference({e1}, {e2})");
+                    let call = format!("{sub_mod}::reference({call})");
                     match bind {
                         DelegateBind::Discard => {
                             out.push_str(&format!("{i}{call};\n"));
@@ -510,6 +542,17 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
                 }
             }
         }
+    }
+}
+
+/// Formats a delegation call's argument list to match the sub-case's
+/// signature shape.
+fn call_args(shape: ArgShape, args: &[Expr]) -> String {
+    let a: Vec<String> = args.iter().map(expr).collect();
+    match shape {
+        ArgShape::Plain => format!("{}, {}", a[0], a[1]),
+        ArgShape::Tuple => format!("({}, {})", a[0], a[1]),
+        ArgShape::Mixed => format!("({}, {}), {}", a[0], a[1], a[2]),
     }
 }
 
