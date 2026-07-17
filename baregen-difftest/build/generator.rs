@@ -16,6 +16,11 @@
 //!   jumps never escape a value expression;
 //! - all arithmetic is wrapping and `%` uses non-zero literals, so no
 //!   generated program can panic;
+//! - direct borrows exist only inside a `BorrowSpan` (borrow ->
+//!   unconditional yield -> closing use): while the span is open the
+//!   borrowee is frozen — non-assignable for `&`, out of the pool for
+//!   `&mut` — so no generated statement conflicts with the live borrow,
+//!   and one span at a time keeps the bookkeeping trivial;
 //! - `yield_all!` targets only earlier cases, and every case carries a
 //!   static worst-case yield bound; a delegation (even inside loops or
 //!   chained through other delegating cases) is generated only while
@@ -52,6 +57,19 @@ pub fn generate(seed: u64, index: usize, prior: &[PriorCase]) -> Case {
     Gen::new(Rng::new(case_seed), prior).gen_case()
 }
 
+/// How an open `BorrowSpan` restricts its borrowee while the borrow is
+/// live: a shared borrow forbids reassignment, a `&mut` borrow forbids
+/// every other use.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Freeze {
+    None,
+    /// Shared borrow live: reads stay legal, assignment does not.
+    NoAssign,
+    /// `&mut` borrow live: exclusive, so the variable leaves the
+    /// expression pool entirely.
+    Hidden,
+}
+
 struct Var {
     name: String,
     /// Only `let mut` u32 bindings may be assignment targets; loop
@@ -64,6 +82,8 @@ struct Var {
     res: bool,
     /// `[u32; 4]` variables are only used as `Expr::Index` bases.
     arr: bool,
+    /// Set while a `BorrowSpan` borrowing this variable is open.
+    frozen: Freeze,
 }
 
 struct LoopLabel {
@@ -96,6 +116,9 @@ struct Gen<'a> {
     /// Generate a body with no suspension point at all (the coroutine
     /// completes on `start()`), exercising the yield-free expansion.
     no_yields: bool,
+    /// A `BorrowSpan` is open: no further span may start (one live
+    /// borrow at a time keeps the freeze bookkeeping trivial).
+    in_borrow: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -123,6 +146,7 @@ impl<'a> Gen<'a> {
                 opt: false,
                 res: false,
                 arr: false,
+                frozen: Freeze::None,
             })
             .collect();
         Gen {
@@ -141,6 +165,7 @@ impl<'a> Gen<'a> {
             in_value: false,
             unit_yield,
             no_yields,
+            in_borrow: false,
         }
     }
 
@@ -341,7 +366,7 @@ impl<'a> Gen<'a> {
     fn gen_stmt(&mut self, budget: &mut i32) -> Stmt {
         *budget -= 1;
         let structural = self.depth < 4 && *budget > 0;
-        let has_assignable = self.scope.iter().any(|v| v.assignable && !v.opt);
+        let has_assignable = self.scope.iter().any(Self::assignable_now);
         let has_opt = self.has_opt_var();
         let has_res = self.has_res_var();
         // Delegation anywhere (loop bodies, value positions, chains
@@ -395,6 +420,11 @@ impl<'a> Gen<'a> {
                 kinds.push((2, 16));
             }
             kinds.push((1, 26));
+            // One live borrow at a time; a span needs a yield, so
+            // yield-free bodies never open one.
+            if !self.no_yields && !self.in_borrow {
+                kinds.push((3, 30));
+            }
         }
         if delegatable {
             kinds.push((2, 17));
@@ -544,6 +574,7 @@ impl<'a> Gen<'a> {
                 };
                 Stmt::ForeignMacro { out, arg }
             }
+            30 => self.gen_borrow_span(budget),
             29 => {
                 let name = self.fresh("g");
                 let mul = self.rng.below(16) as u32;
@@ -575,13 +606,140 @@ impl<'a> Gen<'a> {
         Stmt::LabeledBlock { label, body }
     }
 
+    /// A borrow living across at least one yield — the linear shape
+    /// `borrow -> yield -> use`, with optional extra statements between
+    /// (generated while the borrowee is frozen, so nothing reassigns a
+    /// shared-borrowed variable or touches a `&mut`-borrowed one) and,
+    /// for shared borrows, an optional second chain link. The closing
+    /// use always runs after the unconditional yield, so the borrow
+    /// crosses a suspension in every execution; after it, both the
+    /// borrow name (never pooled) and the borrowee are free again.
+    fn gen_borrow_span(&mut self, budget: &mut i32) -> Stmt {
+        let mutable = self.scope.iter().any(Self::assignable_now) && self.rng.chance(2, 5);
+        let source = if mutable {
+            self.pick_assignable()
+        } else {
+            self.pick_u32_var()
+        };
+        let src_idx = self
+            .scope
+            .iter()
+            .position(|v| v.name == source)
+            .expect("borrow source is in scope");
+        self.scope[src_idx].frozen = if mutable {
+            Freeze::Hidden
+        } else {
+            Freeze::NoAssign
+        };
+        self.in_borrow = true;
+
+        let borrow = self.fresh("w");
+        let mut stmts = vec![Stmt::LetBorrow {
+            name: borrow.clone(),
+            source: source.clone(),
+            mutable,
+            annot: self.rng.chance(2, 3),
+        }];
+        // Shared borrows sometimes grow a second chain link; reads then
+        // go through the chain, exercising the fixed-point substitution
+        // (`z -> y -> x`) and ordered reborrow rebuilding.
+        let chain = (!mutable && self.rng.chance(1, 3)).then(|| {
+            let name = self.fresh("z");
+            stmts.push(Stmt::LetBorrowChain {
+                name: name.clone(),
+                source: borrow.clone(),
+                annot: self.rng.chance(2, 3),
+            });
+            name
+        });
+        let read = |chain: &Option<String>, borrow: &str| match chain {
+            Some(c) => Expr::Deref {
+                name: c.clone(),
+                count: 2,
+            },
+            None => Expr::Deref {
+                name: borrow.to_string(),
+                count: 1,
+            },
+        };
+
+        // Optional statements before the mandatory yield (with the
+        // freeze active, any generated statement is borrow-safe).
+        while *budget > 0 && self.rng.chance(1, 3) {
+            stmts.push(self.gen_stmt(budget));
+        }
+        // The unconditional yield the borrow lives across. Yielding the
+        // dereferenced value keeps the original borrow `let` alive in
+        // its own region; a pool expression lets the macro drop it
+        // (the removed-statements path).
+        *budget -= 1;
+        self.count_yields(1);
+        let arg = if self.rng.chance(1, 2) {
+            read(&chain, &borrow)
+        } else {
+            self.gen_expr(1)
+        };
+        if self.rng.chance(1, 2) {
+            stmts.push(Stmt::Yield(arg));
+        } else {
+            let name = self.fresh("r");
+            self.push_var(&name, false, false);
+            stmts.push(Stmt::LetYield {
+                name,
+                arg,
+                annot: self.rng.chance(1, 3),
+            });
+        }
+        // A `&mut` borrow sometimes writes through between suspensions.
+        if mutable && self.rng.chance(1, 2) {
+            let expr = self.gen_expr(1);
+            stmts.push(Stmt::DerefWrite {
+                borrow: borrow.clone(),
+                expr,
+            });
+        }
+        // Optional statements after the yield, before the closing use;
+        // these may suspend again (more yields, loops, delegations).
+        while *budget > 0 && self.rng.chance(1, 3) {
+            stmts.push(self.gen_stmt(budget));
+        }
+        self.in_borrow = false;
+
+        // Closing use, then release the borrowee.
+        let out = self.fresh("v");
+        if mutable && self.rng.chance(2, 3) {
+            // Final write through the borrow (the expression still must
+            // not read the exclusively borrowed source), then observe
+            // the write by reading the source.
+            let expr = self.gen_expr(1);
+            stmts.push(Stmt::DerefWrite {
+                borrow: borrow.clone(),
+                expr,
+            });
+            self.scope[src_idx].frozen = Freeze::None;
+            stmts.push(Stmt::Let {
+                name: out.clone(),
+                expr: Expr::Var(source),
+            });
+        } else {
+            stmts.push(Stmt::Let {
+                name: out.clone(),
+                expr: read(&chain, &borrow),
+            });
+            self.scope[src_idx].frozen = Freeze::None;
+        }
+        self.push_var(&out, true, false);
+        Stmt::BorrowSpan(stmts)
+    }
+
     /// A u32 variable usable in plain expressions (arguments always
-    /// qualify, so the pool is never empty).
+    /// qualify, so the pool is never empty; a `&mut`-borrowed variable
+    /// is excluded while its borrow is live).
     fn pick_u32_var(&mut self) -> String {
         let names: Vec<&str> = self
             .scope
             .iter()
-            .filter(|v| !v.opt && !v.res && !v.arr)
+            .filter(|v| !v.opt && !v.res && !v.arr && v.frozen != Freeze::Hidden)
             .map(|v| v.name.as_str())
             .collect();
         (*self.rng.pick(&names)).to_string()
@@ -617,6 +775,7 @@ impl<'a> Gen<'a> {
             opt,
             res: false,
             arr: false,
+            frozen: Freeze::None,
         });
     }
 
@@ -627,6 +786,7 @@ impl<'a> Gen<'a> {
             opt: false,
             res: true,
             arr: false,
+            frozen: Freeze::None,
         });
     }
 
@@ -637,6 +797,7 @@ impl<'a> Gen<'a> {
             opt: false,
             res: false,
             arr: true,
+            frozen: Freeze::None,
         });
     }
 
@@ -650,11 +811,17 @@ impl<'a> Gen<'a> {
         (*self.rng.pick(&names)).to_string()
     }
 
+    /// Whether `v` may be an assignment target here: borrowed variables
+    /// are not assignable while their borrow is live.
+    fn assignable_now(v: &Var) -> bool {
+        v.assignable && !v.opt && v.frozen == Freeze::None
+    }
+
     fn pick_assignable(&mut self) -> String {
         let names: Vec<&str> = self
             .scope
             .iter()
-            .filter(|v| v.assignable && !v.opt)
+            .filter(|v| Self::assignable_now(v))
             .map(|v| v.name.as_str())
             .collect();
         (*self.rng.pick(&names)).to_string()

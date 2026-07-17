@@ -102,6 +102,13 @@ pub enum Expr {
         arr: String,
         idx: Box<Expr>,
     },
+    /// `(*name)` / `(**name)` — a read through a borrow (or borrow
+    /// chain) opened by a `BorrowSpan`; never produced by general
+    /// expression generation, so borrow names stay out of the pool.
+    Deref {
+        name: String,
+        count: u8,
+    },
 }
 
 pub enum Cond {
@@ -381,6 +388,39 @@ pub enum Stmt {
         out: String,
         arg: Expr,
     },
+    /// `let name: &u32 = &source;` / `let name: &mut u32 = &mut source;`
+    /// (annotation optional) — a direct borrow of a local or argument.
+    /// Only generated inside a `BorrowSpan`, where it lives across at
+    /// least one yield.
+    LetBorrow {
+        name: String,
+        source: String,
+        mutable: bool,
+        annot: bool,
+    },
+    /// `let name: &&u32 = &source;` (annotation optional) — the second
+    /// link of a borrow chain; `source` is a `LetBorrow` binding.
+    /// Shared borrows only.
+    LetBorrowChain {
+        name: String,
+        source: String,
+        annot: bool,
+    },
+    /// `*borrow = expr;` — a write through an active `&mut` borrow.
+    DerefWrite {
+        borrow: String,
+        expr: Expr,
+    },
+    /// A borrow living across at least one yield, rendered flat (no
+    /// braces, so the generator's lexical-scope model is preserved):
+    /// the `LetBorrow` (plus optional chain link), intervening
+    /// statements including one unconditional yield, and a closing use
+    /// (a deref read into a fresh variable, or for `&mut` a final
+    /// write-through followed by a read of the borrowee). While the
+    /// span is open the generator freezes the borrowee: shared borrows
+    /// make it non-assignable, `&mut` borrows hide it from the
+    /// expression pool entirely.
+    BorrowSpan(Vec<Stmt>),
     /// `yield_all!` delegation to an earlier generated case. This is
     /// the one construct rendered differently per world: the reference
     /// side calls the sub-case's reference function directly (the

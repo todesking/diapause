@@ -548,6 +548,34 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, ctx: Ctx) {
             }
             out.push_str(&format!("{i}}};\n"));
         }
+        Stmt::LetBorrow {
+            name,
+            source,
+            mutable,
+            annot,
+        } => {
+            let (ty, amp) = if *mutable {
+                (": &mut u32", "&mut ")
+            } else {
+                (": &u32", "&")
+            };
+            let ty = if *annot { ty } else { "" };
+            out.push_str(&format!("{i}let {name}{ty} = {amp}{source};\n"));
+        }
+        Stmt::LetBorrowChain {
+            name,
+            source,
+            annot,
+        } => {
+            let ty = if *annot { ": &&u32" } else { "" };
+            out.push_str(&format!("{i}let {name}{ty} = &{source};\n"));
+        }
+        Stmt::DerefWrite { borrow, expr: e } => {
+            out.push_str(&format!("{i}*{borrow} = {};\n", expr(e)));
+        }
+        Stmt::BorrowSpan(stmts) => {
+            render_block(out, stmts, l, ctx);
+        }
         Stmt::Delegate {
             sub_case,
             sub_shape,
@@ -642,6 +670,7 @@ fn expr(e: &Expr) -> String {
             )
         }
         Expr::Index { arr, idx } => format!("({arr}[((({}) % 4u32) as usize)])", expr(idx)),
+        Expr::Deref { name, count } => format!("({}{name})", "*".repeat(*count as usize)),
     }
 }
 
