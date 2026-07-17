@@ -216,6 +216,47 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, world: World) {
         Stmt::LetNegLit { name, val } => {
             out.push_str(&format!("{i}let {name} = -{val}i32;\n"));
         }
+        Stmt::Closure {
+            name,
+            add,
+            block_body,
+            out: o,
+            arg,
+        } => {
+            if *block_body {
+                out.push_str(&format!(
+                    "{i}let {name} = |v: u32| -> u32 {{ v.wrapping_add({add}u32) }};\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{i}let {name} = |v: u32| v.wrapping_add({add}u32);\n"
+                ));
+            }
+            out.push_str(&format!("{i}let mut {o}: u32 = {name}({});\n", expr(arg)));
+        }
+        Stmt::ForeignMacro { out: o, arg } => match o {
+            Some(o) => {
+                out.push_str(&format!(
+                    "{i}let mut {o}: u32 = (format!(\"x{{}}\", {}).len() as u32);\n",
+                    expr(arg)
+                ));
+            }
+            None => {
+                out.push_str(&format!("{i}format!(\"{{:?}}\", {});\n", expr(arg)));
+            }
+        },
+        Stmt::NestedFn {
+            name,
+            mul,
+            out: o,
+            arg,
+        } => {
+            out.push_str(&format!(
+                "{i}fn {name}(v: u32) -> u32 {{\n{}v.wrapping_mul({mul}u32)\n{i}}}\n",
+                ind(l + 1)
+            ));
+            out.push_str(&format!("{i}let mut {o}: u32 = {name}({});\n", expr(arg)));
+        }
         Stmt::LetYieldAdd { name, a, b } => {
             out.push_str(&format!(
                 "{i}let {name}: u32 = u32::wrapping_add(yield_!({}), yield_!({}));\n",

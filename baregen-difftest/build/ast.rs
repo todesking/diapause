@@ -327,6 +327,39 @@ pub enum Stmt {
         modulus: u32,
         arms: Vec<(Option<Cond>, Vec<Stmt>, Expr)>,
     },
+    /// A yield-free closure: `let name = |v: u32| v.wrapping_add(Ku32);`
+    /// immediately followed by `let mut out: u32 = name(arg);`. The
+    /// closure's type is not spellable, so it must never cross a yield;
+    /// defining and consuming it in adjacent statements guarantees
+    /// that. Exercises the nested-scope skip (the macro must not scan
+    /// the closure body for yields it would misattribute).
+    Closure {
+        name: String,
+        add: u32,
+        /// Render the closure with `-> u32 { .. }` instead of a bare
+        /// expression body.
+        block_body: bool,
+        out: String,
+        arg: Expr,
+    },
+    /// A yield-free foreign macro (`format!`). With `out`:
+    /// `let mut out: u32 = (format!("x{}", arg).len() as u32);`;
+    /// without: `format!("{:?}", arg);` (the String is discarded).
+    /// Exercises the success path of the foreign-macro token scan.
+    ForeignMacro {
+        out: Option<String>,
+        arg: Expr,
+    },
+    /// A nested `fn` item: `fn name(v: u32) -> u32 { v.wrapping_mul(Ku32) }`
+    /// followed by `let mut out: u32 = name(arg);`. Items are separate
+    /// scopes; the call stays adjacent so both land in one lowered
+    /// block (the item is not visible from other generated blocks).
+    NestedFn {
+        name: String,
+        mul: u32,
+        out: String,
+        arg: Expr,
+    },
     /// `yield_all!` delegation to an earlier generated case. This is
     /// the one construct rendered differently per world: the reference
     /// side calls the sub-case's reference function directly (the

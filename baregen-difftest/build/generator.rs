@@ -316,6 +316,9 @@ impl<'a> Gen<'a> {
         kinds.push((2, 21));
         kinds.push((1, 23));
         kinds.push((1, 25));
+        kinds.push((1, 27));
+        kinds.push((1, 28));
+        kinds.push((1, 29));
         if has_assignable {
             kinds.push((2, 4));
             kinds.push((1, 5));
@@ -466,6 +469,47 @@ impl<'a> Gen<'a> {
                 Stmt::LetNegLit {
                     name,
                     val: self.rng.below(16) as u32,
+                }
+            }
+            27 => {
+                // The closure name stays out of every variable pool:
+                // only the adjacent call statement refers to it.
+                let name = self.fresh("f");
+                let add = self.rng.below(16) as u32;
+                let block_body = self.rng.chance(1, 2);
+                let arg = self.gen_expr(1);
+                let out = self.fresh("v");
+                self.push_var(&out, true, false);
+                Stmt::Closure {
+                    name,
+                    add,
+                    block_body,
+                    out,
+                    arg,
+                }
+            }
+            28 => {
+                let arg = self.gen_expr(1);
+                let out = if self.rng.chance(2, 3) {
+                    let out = self.fresh("v");
+                    self.push_var(&out, true, false);
+                    Some(out)
+                } else {
+                    None
+                };
+                Stmt::ForeignMacro { out, arg }
+            }
+            29 => {
+                let name = self.fresh("g");
+                let mul = self.rng.below(16) as u32;
+                let arg = self.gen_expr(1);
+                let out = self.fresh("v");
+                self.push_var(&out, true, false);
+                Stmt::NestedFn {
+                    name,
+                    mul,
+                    out,
+                    arg,
                 }
             }
             _ => self.gen_labeled_block(budget),
