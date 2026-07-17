@@ -14,7 +14,9 @@ impl Lowerer {
                 syn::Expr::Lit(_) => self.infer_ty_source(&u.expr),
                 _ => TySource::Unknown,
             },
-            syn::Expr::Lit(lit) => infer_lit_ty(&lit.lit).map_or(TySource::Unknown, TySource::Known),
+            syn::Expr::Lit(lit) => {
+                infer_lit_ty(&lit.lit).map_or(TySource::Unknown, TySource::Known)
+            }
             // Move propagation: `let y = x;` follows x's type.
             syn::Expr::Path(p) if p.qself.is_none() => p
                 .path

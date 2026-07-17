@@ -35,8 +35,9 @@ impl Parse for MacroArgs {
         while !input.is_empty() {
             // `yield` is a reserved keyword, so accept any identifier here.
             let name = input.call(syn::Ident::parse_any)?;
-            let duplicate =
-                |name: &syn::Ident| syn::Error::new(name.span(), format!("duplicate `{name}` argument"));
+            let duplicate = |name: &syn::Ident| {
+                syn::Error::new(name.span(), format!("duplicate `{name}` argument"))
+            };
             if name == "fingerprint" {
                 let value = if input.peek(Token![=]) {
                     input.parse::<Token![=]>()?;

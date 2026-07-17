@@ -95,7 +95,9 @@ pub enum BorrowSource {
         mutable: bool,
     },
     /// A reference that cannot be reconstructed; the message explains why.
-    NonReconstructible { why: &'static str },
+    NonReconstructible {
+        why: &'static str,
+    },
 }
 
 /// A `break`/`continue` written inside an opaque statement but targeting
@@ -151,12 +153,15 @@ impl Cfg {
         self.blocks[b]
             .terminator
             .successors()
-            .chain(self.blocks[b].jumps.iter().filter_map(|&j| {
-                match self.opaque_jumps[j].kind {
-                    OpaqueJumpKind::Goto { target, .. } => Some(target),
-                    OpaqueJumpKind::Complete => None,
-                }
-            }))
+            .chain(
+                self.blocks[b]
+                    .jumps
+                    .iter()
+                    .filter_map(|&j| match self.opaque_jumps[j].kind {
+                        OpaqueJumpKind::Goto { target, .. } => Some(target),
+                        OpaqueJumpKind::Complete => None,
+                    }),
+            )
     }
 }
 

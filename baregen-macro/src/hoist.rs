@@ -438,9 +438,7 @@ mod tests {
     #[test]
     fn trailing_yield_becomes_a_bound_tail() {
         assert_hoists(
-            parse_quote!({
-                yield_!(1)
-            }),
+            parse_quote!({ yield_!(1) }),
             parse_quote!({
                 let __tmp0 = yield_!(1);
                 __tmp0
@@ -451,9 +449,7 @@ mod tests {
     #[test]
     fn trailing_expression_with_a_yield_prefix() {
         assert_hoists(
-            parse_quote!({
-                f(yield_!(1))
-            }),
+            parse_quote!({ f(yield_!(1)) }),
             parse_quote!({
                 let __tmp0 = yield_!(1);
                 f(__tmp0)
@@ -601,7 +597,7 @@ mod tests {
                     0 => {
                         let __tmp0 = yield_!(1);
                         f(__tmp0)
-                    },
+                    }
                     _ => {}
                 }
             }),
@@ -768,7 +764,12 @@ mod tests {
     #[test]
     fn nested_control_flow_in_an_expression_never_hoists() {
         assert_unchanged(parse_quote!({
-            let x = 1 + if c { yield_!(1); 1 } else { 2 };
+            let x = 1 + if c {
+                yield_!(1);
+                1
+            } else {
+                2
+            };
         }));
     }
 
