@@ -16,6 +16,7 @@ mod signature;
 #[cfg(test)]
 mod test_util;
 mod ty_infer;
+mod validate;
 
 /// Transforms a function into a coroutine state machine.
 ///

@@ -58,6 +58,22 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     let arg_infos: Vec<ArgInfo> = args.iter().map(ArgInfo::from).collect();
     let analysis = analyze_cfg::analyze(&cfg, &arg_infos, &macro_args.resume_ty)?;
 
+    // Self-check in the spirit of rustc's MIR validation: re-derive the
+    // invariants the codegen below relies on and abort loudly on any
+    // violation. Only debug builds of the macro itself run it (tests,
+    // difftest); a release build of user code skips it entirely. A
+    // failure is a baregen-macro bug, never a user error, hence the
+    // panic instead of a compile error.
+    if cfg!(debug_assertions)
+        && let Err(msg) = crate::validate::validate(&cfg, &analysis, arg_infos.len())
+    {
+        panic!(
+            "internal IR validation failed for coroutine `{}` (this is a bug in \
+             baregen-macro):\n{msg}",
+            item.sig.ident
+        );
+    }
+
     // `#[derive(...)]` written below the coroutine attribute applies to
     // the generated State enum; everything else (doc comments, allow,
     // etc.) stays on the starter fn.
