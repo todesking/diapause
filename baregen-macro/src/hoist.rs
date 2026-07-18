@@ -117,6 +117,10 @@ impl Hoister {
     /// whole.
     fn head(&mut self, e: &mut syn::Expr) {
         match e {
+            // Parenthesized (or macro-expansion-grouped) control flow
+            // exposes the same head position as the bare form.
+            syn::Expr::Paren(p) => self.head(&mut p.expr),
+            syn::Expr::Group(g) => self.head(&mut g.expr),
             syn::Expr::If(ei) => match &mut *ei.cond {
                 // Let chains are rejected wholesale by lowering.
                 c if is_let_chain(c) => {}
@@ -496,6 +500,20 @@ mod tests {
                 if f(__tmp0) {
                     g();
                 }
+            }),
+        );
+    }
+
+    #[test]
+    fn parenthesized_if_condition() {
+        // Parentheses around control flow expose the same head position.
+        assert_hoists(
+            parse_quote!({
+                let x = (if f(yield_!(1)) { a } else { b });
+            }),
+            parse_quote!({
+                let __tmp0 = yield_!(1);
+                let x = (if f(__tmp0) { a } else { b });
             }),
         );
     }

@@ -512,9 +512,10 @@ impl Lowerer {
     /// Lowers a yield-containing expression whose value is needed (a
     /// `let` initializer or the function's trailing expression):
     /// control-flow expressions distribute the destination into their
-    /// arms; anything else cannot suspend and is an error.
+    /// arms; anything else cannot suspend and is an error. Parentheses
+    /// around the expression are transparent.
     fn lower_value_expr(&mut self, e: &syn::Expr, ctx: TailCtx) {
-        match e {
+        match strip_parens(e) {
             syn::Expr::If(ei) => self.lower_if(ei, ctx),
             syn::Expr::Match(em) => self.lower_match(em, ctx),
             syn::Expr::Loop(el) => self.lower_loop(el, ctx),
@@ -687,7 +688,7 @@ impl Lowerer {
             .as_ref()
             .expect("BUG: a yield is inside the initializer");
         let expr = strip_parens(&init.expr);
-        if !matches!(
+        let supported = matches!(
             expr,
             syn::Expr::If(_)
                 | syn::Expr::Match(_)
@@ -696,7 +697,8 @@ impl Lowerer {
                 | syn::Expr::ForLoop(_)
                 | syn::Expr::Block(_)
                 | syn::Expr::Unsafe(_)
-        ) {
+        ) || matches!(expr, syn::Expr::Macro(m) if is_yield_all_macro(&m.mac));
+        if !supported {
             return self.err(syn::Error::new_spanned(local, ERR_VALUE_POSITION));
         }
         self.lower_value_let(local, |lw, ctx| lw.lower_value_expr(expr, ctx));
@@ -1222,13 +1224,18 @@ fn stmt_from_discarded_expr(expr: syn::Expr) -> syn::Stmt {
 
 impl Lowerer {
     fn lower_control_expr(&mut self, e: &syn::Expr) {
-        match e {
+        match strip_parens(e) {
             syn::Expr::If(ei) => self.lower_if(ei, TailCtx::Discard),
             syn::Expr::Match(em) => self.lower_match(em, TailCtx::Discard),
             syn::Expr::Loop(el) => self.lower_loop(el, TailCtx::Discard),
             syn::Expr::While(ew) => self.lower_while(ew),
             syn::Expr::ForLoop(ef) => self.lower_for(ef),
             syn::Expr::Block(eb) => self.lower_block_stmt(eb, TailCtx::Discard),
+            // Reached only parenthesized: a bare `yield_all!(..);`
+            // statement is routed by `lower_stmt` before it gets here.
+            syn::Expr::Macro(em) if is_yield_all_macro(&em.mac) => {
+                self.lower_yield_all(&em.mac, TailCtx::Discard);
+            }
             syn::Expr::Unsafe(eu) => {
                 self.err(syn::Error::new_spanned(eu.unsafe_token, ERR_UNSAFE));
             }

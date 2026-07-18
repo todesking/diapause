@@ -85,6 +85,33 @@ fn brace_delimited_tail_delegation_returns_the_completion_value() {
     assert_eq!(c.resume(2), CoroutineState::Complete(103));
 }
 
+/// Parens around `yield_all!` are transparent in every supported
+/// position: statement, `let` initializer, and trailing expression.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn paren_delegation(start: u32) -> u32 {
+    let g: inner_sum::State = inner_sum(start);
+    (yield_all!(g));
+    let g2: inner_sum::State = inner_sum(start + 1);
+    let sub: u32 = (yield_all!(g2));
+    let g3: inner_sum::State = inner_sum(sub);
+    (yield_all!(g3))
+}
+
+#[test]
+fn parenthesized_delegation_in_every_position() {
+    let mut c = paren_delegation(1);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(2), CoroutineState::Yielded(3));
+    // The first delegation completes with 1+2+4=7, discarded.
+    assert_eq!(c.resume(4), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(3), CoroutineState::Yielded(5));
+    // The second completes with 2+3+5=10, bound to `sub`.
+    assert_eq!(c.resume(5), CoroutineState::Yielded(10));
+    assert_eq!(c.resume(1), CoroutineState::Yielded(11));
+    // The third completes with 10+1+2=13, the function's tail value.
+    assert_eq!(c.resume(2), CoroutineState::Complete(13));
+}
+
 #[baregen::coroutine(yield = u32)]
 fn completes_immediately() -> u32 {
     7

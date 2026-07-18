@@ -278,6 +278,134 @@ fn fn_tail_loop_break_value_completes() {
     assert_eq!(c.resume(0), CoroutineState::Complete(4));
 }
 
+// === Parenthesized value positions ===
+//
+// Parens around a yield-containing expression are transparent: the
+// parenthesized forms behave exactly like the bare ones.
+
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn paren_tail_if(c: bool) -> u32 {
+    (if c {
+        let r = yield_!(1);
+        r + 1
+    } else {
+        yield_!(2);
+        20
+    })
+}
+
+#[test]
+fn paren_fn_tail_if_matches_the_bare_form() {
+    let mut c = paren_tail_if(true);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(5), CoroutineState::Complete(6));
+
+    let mut c = paren_tail_if(false);
+    assert_eq!(c.start(), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(0), CoroutineState::Complete(20));
+}
+
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn paren_tail_match(k: u32) -> u32 {
+    (match k {
+        0 => {
+            yield_!(0);
+            1
+        }
+        n => n * 2,
+    })
+}
+
+#[test]
+fn paren_fn_tail_match_matches_the_bare_form() {
+    let mut c = paren_tail_match(0);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(0), CoroutineState::Complete(1));
+
+    let mut c = paren_tail_match(21);
+    assert_eq!(c.start(), CoroutineState::Complete(42));
+}
+
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn paren_tail_block(n: u32) -> u32 {
+    ({
+        let r = yield_!(n);
+        r + n
+    })
+}
+
+#[test]
+fn paren_fn_tail_block() {
+    let mut c = paren_tail_block(3);
+    assert_eq!(c.start(), CoroutineState::Yielded(3));
+    assert_eq!(c.resume(4), CoroutineState::Complete(7));
+}
+
+/// The condition of a parenthesized tail `if` hoists like the bare form.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn paren_tail_if_cond(x: u32) -> u32 {
+    (if yield_!(x) == 0 {
+        yield_!(1);
+        10
+    } else {
+        20
+    })
+}
+
+#[test]
+fn paren_tail_if_condition_hoists() {
+    let mut c = paren_tail_if_cond(5);
+    assert_eq!(c.start(), CoroutineState::Yielded(5));
+    assert_eq!(c.resume(0), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(9), CoroutineState::Complete(10));
+
+    let mut c = paren_tail_if_cond(5);
+    assert_eq!(c.start(), CoroutineState::Yielded(5));
+    assert_eq!(c.resume(3), CoroutineState::Complete(20));
+}
+
+/// A parenthesized yield-containing tail inside a value block.
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn paren_block_tail(c: bool) -> u32 {
+    let x: u32 = {
+        (if c {
+            let r = yield_!(1);
+            r
+        } else {
+            2
+        })
+    };
+    x * 10
+}
+
+#[test]
+fn paren_tail_of_a_value_block() {
+    let mut c = paren_block_tail(true);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(7), CoroutineState::Complete(70));
+
+    let mut c = paren_block_tail(false);
+    assert_eq!(c.start(), CoroutineState::Complete(20));
+}
+
+/// Statement-position parenthesized control flow containing yield.
+#[baregen::coroutine(yield = u32)]
+fn paren_stmt_if(c: bool) -> u32 {
+    (if c {
+        yield_!(1);
+    });
+    7
+}
+
+#[test]
+fn paren_statement_if() {
+    let mut c = paren_stmt_if(true);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(7));
+    let mut c = paren_stmt_if(false);
+    assert_eq!(c.start(), CoroutineState::Complete(7));
+}
+
 // === Annotation not required when the binding never enters a state ===
 
 /// Every arm diverges via `break`, so the binding is only ever defined
