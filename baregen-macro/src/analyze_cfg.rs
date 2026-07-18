@@ -9,13 +9,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use quote::format_ident;
+use quote::{ToTokens, format_ident};
 use syn::visit::Visit;
 
 use crate::cfg::{
     BindingId, BindingKind, BlockId, BorrowSource, Cfg, OpaqueJumpKind, Terminator, TySource,
 };
-use crate::lower::{ErrorSink, UseCollector};
+use crate::lower::{ErrorSink, UseCollector, collect_markers};
 
 /// Signature-level information about one function argument, parallel to
 /// `BindingId(0)..BindingId(args.len())`. Built from `expand::ArgVar` (via
@@ -127,8 +127,10 @@ impl<'a> Context<'a> {
         let (uses, rebuilds) = self.substitute_borrows();
         let live_in = self.liveness(&uses);
         let removed_stmts = self.removed_statements(&rebuilds);
-        let variants = self.build_variants(&live_in, &rebuilds);
+        let mut collisions: BTreeSet<(BindingId, BindingId)> = BTreeSet::new();
+        let variants = self.build_variants(&live_in, &rebuilds, &mut collisions);
         self.check_jump_shadowing(&variants);
+        self.check_transfer_shadowing(&live_in, &removed_stmts, &mut collisions);
         self.errors.into_result(Analysis {
             variants,
             removed_stmts,
@@ -290,27 +292,25 @@ impl Context<'_> {
 impl Context<'_> {
     /// Builds the `Variant` list: one entry per non-inline block, in
     /// ascending `BlockId` order, combining its fields, its reborrows, and
-    /// the name assigned by `variant_idents`.
+    /// the name assigned by `variant_idents`. Name-collision pairs are
+    /// accumulated into `collisions`, shared with the transfer-shadowing
+    /// check so one conflicting pair is only reported once.
     fn build_variants(
         &mut self,
         live_in: &[BTreeSet<BindingId>],
         rebuilds: &[BTreeSet<BindingId>],
+        collisions: &mut BTreeSet<(BindingId, BindingId)>,
     ) -> Vec<Variant> {
         let forced_mut = self.compute_forced_mut(rebuilds);
         let mut reported: BTreeSet<BindingId> = BTreeSet::new();
-        let mut collisions: BTreeSet<(BindingId, BindingId)> = BTreeSet::new();
         let idents = variant_idents(self.cfg);
         let mut variants = Vec::new();
         for b in 0..self.cfg.blocks.len() {
             if self.cfg.blocks[b].inline {
                 continue;
             }
-            let fields = self.build_fields_for_block(
-                &live_in[b],
-                &forced_mut,
-                &mut reported,
-                &mut collisions,
-            );
+            let fields =
+                self.build_fields_for_block(&live_in[b], &forced_mut, &mut reported, collisions);
             let reborrows = self.build_reborrows_for(&rebuilds[b]);
             let ident = idents
                 .get(&b)
@@ -522,6 +522,187 @@ impl Context<'_> {
         }
     }
 
+    /// Rejects a binding that a by-name state transfer would capture in
+    /// place of the (different, same-named) live binding it moves. A
+    /// transfer — a terminator edge into a non-inline block, or an
+    /// opaque jump — moves the target's live-in bindings by name from
+    /// the transfer site, where every earlier definition of the emitted
+    /// inline chain is still in scope; a live binding shadowed there
+    /// (it survives its shadow as the source of a reconstructed borrow,
+    /// or because its use sits past the shadow's original scope, which
+    /// lowering flattens away) would be transferred with the shadowing
+    /// binding's value — a silent wrong-value miscompile. Definitions
+    /// that never reach the emitted arm (jump-store `let`s scoped inside
+    /// their marker's braces, removed borrow `let`s) shadow nothing.
+    /// Stricter than `validate::check_transition_shadowing`, which keeps
+    /// backstopping codegen in debug builds.
+    fn check_transfer_shadowing(
+        &mut self,
+        live_in: &[BTreeSet<BindingId>],
+        removed_stmts: &[BTreeSet<usize>],
+        reported: &mut BTreeSet<(BindingId, BindingId)>,
+    ) {
+        let cfg = self.cfg;
+        let n = cfg.blocks.len();
+        // Unique terminator predecessor, for walking inline chains
+        // (inline blocks have exactly one, and it is a terminator edge).
+        let mut term_pred = vec![usize::MAX; n];
+        for b in 0..n {
+            for s in cfg.blocks[b].terminator.successors() {
+                term_pred[s] = b;
+            }
+        }
+        let iter_heads = iter_body_heads(cfg);
+        for c in 0..n {
+            // The inline chain whose emitted arm ends with c's
+            // transfers, root first (= textual order of the arm).
+            let mut chain = vec![c];
+            while cfg.blocks[*chain.last().unwrap()].inline && chain.len() <= n {
+                let p = term_pred[*chain.last().unwrap()];
+                if p == usize::MAX {
+                    break;
+                }
+                chain.push(p);
+            }
+            chain.reverse();
+            // Every definition the emitted arm places in scope, with its
+            // textual position.
+            let mut defs: Vec<(usize, DefPos, BindingId)> = Vec::new();
+            for (ci, &b) in chain.iter().enumerate() {
+                let stores = self.jump_store_bindings(b);
+                for &id in &cfg.blocks[b].defs {
+                    let removed = cfg.bindings[id.0]
+                        .def_stmt
+                        .is_some_and(|i| removed_stmts[b].contains(&i));
+                    if !stores.contains(&id) && !removed {
+                        defs.push((ci, self.def_pos(id, b, &iter_heads), id));
+                    }
+                }
+            }
+            for t in cfg.blocks[c].terminator.successors() {
+                if !cfg.blocks[t].inline {
+                    self.check_transfer_edge(t, &defs, None, None, live_in, reported);
+                }
+            }
+            if !cfg.blocks[c].jumps.is_empty() {
+                let markers = marker_stmt_indices(&cfg.blocks[c].stmts);
+                let c_idx = chain.len() - 1;
+                for &k in &cfg.blocks[c].jumps {
+                    let OpaqueJumpKind::Goto { target, store } = cfg.opaque_jumps[k].kind else {
+                        continue;
+                    };
+                    // A missing marker cannot happen (codegen would drop
+                    // the jump); statement 0 errs toward acceptance.
+                    let m = markers.get(&k).copied().unwrap_or(0);
+                    self.check_transfer_edge(
+                        target,
+                        &defs,
+                        Some((c_idx, m)),
+                        store,
+                        live_in,
+                        reported,
+                    );
+                }
+            }
+        }
+    }
+
+    /// One transfer edge into non-inline `t`. `limit` is `Some((chain
+    /// index of the jump's block, marker statement index))` for an
+    /// opaque jump, which fires mid-chain: definitions at or after the
+    /// marker statement are not yet in scope there. `store` is the
+    /// jump's own destination binding, provided by a fresh `let`
+    /// synthesized at the jump site that no user binding can shadow.
+    fn check_transfer_edge(
+        &mut self,
+        t: BlockId,
+        defs: &[(usize, DefPos, BindingId)],
+        limit: Option<(usize, usize)>,
+        store: Option<BindingId>,
+        live_in: &[BTreeSet<BindingId>],
+        reported: &mut BTreeSet<(BindingId, BindingId)>,
+    ) {
+        let cfg = self.cfg;
+        let in_scope = |ci: usize, pos: DefPos| match limit {
+            None => true,
+            Some((li, m)) => {
+                ci < li
+                    || match pos {
+                        DefPos::Head => true,
+                        DefPos::Stmt(i) => i < m,
+                        DefPos::Unknown => false,
+                    }
+            }
+        };
+        for &id in &live_in[t] {
+            let name = &cfg.bindings[id.0].ident;
+            if store.is_some_and(|s| cfg.bindings[s.0].ident == *name) {
+                continue;
+            }
+            let own = defs
+                .iter()
+                .find(|&&(_, _, d)| d == id)
+                .map(|&(ci, pos, _)| (ci, pos));
+            for &(ci, pos, other) in defs {
+                if other == id || cfg.bindings[other.0].ident != *name || !in_scope(ci, pos) {
+                    continue;
+                }
+                // A binding the chain does not define is unpacked from a
+                // state field at the arm head, so any same-named chain
+                // definition shadows it; one the chain does define is
+                // shadowed only by a definition provably after its own.
+                let captured = own.is_none_or(|o| definitely_after((ci, pos), o));
+                if captured && reported.insert((id.min(other), id.max(other))) {
+                    self.err(
+                        cfg.bindings[other.0].ident.span(),
+                        format!(
+                            "this `{name}` shadows an earlier binding `{name}` that is \
+                             still in use across a suspension point (possibly as the \
+                             source of a reconstructed borrow); the coroutine state \
+                             would capture this shadowing `{name}` in place of the \
+                             earlier one; rename one of them"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Destination bindings of the opaque jumps owned by `b`: their
+    /// synthesized `let`s are scoped inside the jump markers' braces and
+    /// never shadow anything outside.
+    fn jump_store_bindings(&self, b: BlockId) -> BTreeSet<BindingId> {
+        self.cfg.blocks[b]
+            .jumps
+            .iter()
+            .filter_map(|&k| match self.cfg.opaque_jumps[k].kind {
+                OpaqueJumpKind::Goto { store: Some(s), .. } => Some(s),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The textual position of `id`'s definition within `block`.
+    /// `iter_heads` marks the simple `for` loop variables, which are
+    /// `BindingKind::Local` without a `def_stmt` (bound by the
+    /// `IterNext` pattern, not a `let`) yet sit at the block head; the
+    /// remaining such locals are `push_store`-synthesized `let`s whose
+    /// statement index is not tracked.
+    fn def_pos(
+        &self,
+        id: BindingId,
+        block: BlockId,
+        iter_heads: &BTreeMap<BlockId, String>,
+    ) -> DefPos {
+        let b = &self.cfg.bindings[id.0];
+        match b.def_stmt {
+            Some(i) => DefPos::Stmt(i),
+            None if b.kind != BindingKind::Local => DefPos::Head,
+            None if iter_heads.get(&block).is_some_and(|n| b.ident == n) => DefPos::Head,
+            None => DefPos::Unknown,
+        }
+    }
+
     /// The type of a binding: signature type for arguments, the resume
     /// type for unannotated resume bindings, otherwise the recursively
     /// resolved syntactic type source. Move dependencies always point at
@@ -576,6 +757,64 @@ impl Context<'_> {
             }
         }
     }
+}
+
+/// Textual position of a definition within its block, for ordering
+/// same-named definitions along an inline chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefPos {
+    /// Bound at the block head: resume bindings, match/`for` patterns.
+    Head,
+    /// A `let` at this statement index.
+    Stmt(usize),
+    /// A `push_store`-synthesized `let`: no statement index is tracked
+    /// (and block merging can leave it anywhere in the block).
+    Unknown,
+}
+
+/// Whether the definition at `a` is provably later in the emitted arm
+/// than the one at `b`, each position being (index into the chain,
+/// position within the block). Different blocks are ordered by chain
+/// depth; within one block, `Head` precedes every statement and
+/// `Unknown` cannot be ordered (erring toward acceptance — the
+/// validation pass still backstops codegen).
+fn definitely_after(a: (usize, DefPos), b: (usize, DefPos)) -> bool {
+    if a.0 != b.0 {
+        return a.0 > b.0;
+    }
+    match (a.1, b.1) {
+        (DefPos::Stmt(i), DefPos::Stmt(j)) => i > j,
+        (DefPos::Stmt(_), DefPos::Head) => true,
+        _ => false,
+    }
+}
+
+/// The simple loop-variable name bound at the head of each `IterNext`
+/// body block (see `Context::def_pos`).
+fn iter_body_heads(cfg: &Cfg) -> BTreeMap<BlockId, String> {
+    let mut out = BTreeMap::new();
+    for blk in &cfg.blocks {
+        if let Terminator::IterNext { pat, body, .. } = &blk.terminator
+            && let syn::Pat::Ident(pi) = &**pat
+        {
+            out.insert(*body, pi.ident.to_string());
+        }
+    }
+    out
+}
+
+/// Statement index of each `__baregen_jump!(k, ..)` marker embedded in
+/// `stmts`, keyed by `k`.
+fn marker_stmt_indices(stmts: &[syn::Stmt]) -> BTreeMap<usize, usize> {
+    let mut out = BTreeMap::new();
+    for (i, stmt) in stmts.iter().enumerate() {
+        let mut ks = Vec::new();
+        collect_markers(stmt.to_token_stream(), &mut ks);
+        for k in ks {
+            out.entry(k).or_insert(i);
+        }
+    }
+    out
 }
 
 /// Extracts `T` from a `RangeInclusive<T>`-shaped type.

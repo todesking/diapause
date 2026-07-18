@@ -815,6 +815,124 @@ fn same_named_bindings_in_one_variant_are_an_error() {
     );
 }
 
+// === Transfer shadowing ===
+
+#[test]
+fn borrow_source_shadowed_after_yield_is_rejected() {
+    // The original silent-miscompile repro (2026-07-17): the shadowing
+    // `x` is dead at every variant entry, but it is in scope at S1's
+    // transition, which moves the borrow source `x` by name into S2.
+    let block: syn::Block = parse_quote!({
+        let x: u32 = 1;
+        let y = &x;
+        yield_!(0);
+        let x: u32 = 99;
+        let _ = x;
+        yield_!(0);
+        f(*y);
+    });
+    let msg = error_of(&block).to_string();
+    assert!(msg.contains("shadows an earlier binding `x`"), "got: {msg}");
+    assert!(msg.contains("rename one of them"), "got: {msg}");
+}
+
+#[test]
+fn borrow_source_shadowed_before_yield_is_rejected() {
+    // Within-chain variant: source and shadow sit in the same block, so
+    // the transition into S1 already captures the shadowing `x` (the
+    // borrow `let` is dropped and `y` rebuilt from the stored `x`).
+    // Confirmed as a silent wrong-value miscompile by a runtime probe
+    // on 2026-07-18.
+    let block: syn::Block = parse_quote!({
+        let x: u32 = 1;
+        let y = &x;
+        let x: u32 = 99;
+        let _ = x;
+        yield_!(0);
+        f(*y);
+    });
+    let msg = error_of(&block).to_string();
+    assert!(msg.contains("shadows an earlier binding `x`"), "got: {msg}");
+}
+
+#[test]
+fn shadowing_before_an_opaque_jump_is_rejected() {
+    // The shadowing `let` precedes the statement carrying the `break`,
+    // so it is in scope at the jump, which moves the borrow source `x`
+    // into the loop's exit state.
+    let block: syn::Block = parse_quote!({
+        let x: u32 = 1;
+        let y = &x;
+        yield_!(0);
+        loop {
+            let x: u32 = 99;
+            let _ = x;
+            if c {
+                break;
+            }
+            yield_!(0);
+        }
+        f(*y);
+    });
+    let (_, result) = lower_analyze(&[("c", "bool")], &block, &unit());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("shadows an earlier binding `x`"), "got: {msg}");
+}
+
+#[test]
+fn sequential_shadowing_after_borrow_dies_is_fine() {
+    // The borrow's last use precedes the shadowing `let`, so only the
+    // new `x` crosses the second yield and the transfer resolves to it.
+    let block: syn::Block = parse_quote!({
+        let x: u32 = 1;
+        let y = &x;
+        yield_!(0);
+        f(*y);
+        let x: u32 = 99;
+        yield_!(0);
+        f(x);
+    });
+    let (_, result) = lower_analyze(&[], &block, &unit());
+    assert!(result.is_ok(), "got: {:?}", result.err());
+}
+
+#[test]
+fn shadowing_inside_an_opaque_scope_is_fine() {
+    // The braced block stays an opaque statement, so its inner `x` is
+    // scoped by the emitted braces and shadows nothing at the transfer.
+    let block: syn::Block = parse_quote!({
+        let x: u32 = 1;
+        let y = &x;
+        yield_!(0);
+        {
+            let x: u32 = 99;
+            let _ = x;
+        }
+        yield_!(0);
+        f(*y);
+    });
+    let (_, result) = lower_analyze(&[], &block, &unit());
+    assert!(result.is_ok(), "got: {:?}", result.err());
+}
+
+#[test]
+fn removed_borrow_shadow_is_fine() {
+    // The shadowing binding is itself a borrow whose `let` is removed
+    // from the emitted arm (rebuilt in the next region), so the outer
+    // `y` is transferred untouched.
+    let block: syn::Block = parse_quote!({
+        let y: u32 = 1;
+        let p = &y;
+        yield_!(0);
+        let x: u32 = 2;
+        let y = &x;
+        yield_!(0);
+        f(*p + *y);
+    });
+    let (_, result) = lower_analyze(&[], &block, &unit());
+    assert!(result.is_ok(), "got: {:?}", result.err());
+}
+
 // === yield_all! delegation ===
 
 #[test]

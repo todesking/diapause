@@ -35,11 +35,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
 
 use crate::analyze_cfg::Analysis;
 use crate::cfg::{BindingId, BlockId, BorrowSource, Cfg, OpaqueJumpKind, Terminator};
+use crate::lower::collect_markers;
 
 /// Validates a lowered CFG against its analysis. `n_args` is the number
 /// of function arguments (`BindingId(0)..BindingId(n_args)`), which are
@@ -613,19 +613,6 @@ impl Validator<'_> {
             }
             v
         };
-        // Bindings introduced by the braces-scoped `let` synthesized for
-        // a valued opaque break: they never shadow anything outside the
-        // marker's own braces.
-        let jump_stores = |b: BlockId| -> BTreeSet<BindingId> {
-            self.cfg.blocks[b]
-                .jumps
-                .iter()
-                .filter_map(|&k| match self.cfg.opaque_jumps[k].kind {
-                    OpaqueJumpKind::Goto { store: Some(s), .. } => Some(s),
-                    _ => None,
-                })
-                .collect()
-        };
         for c in 0..n {
             let chain_blocks = chain(c);
             let all_defs: BTreeSet<BindingId> = chain_blocks
@@ -636,15 +623,7 @@ impl Validator<'_> {
             // precedes the transition at the end of `c`.
             let shadow: BTreeSet<BindingId> = chain_blocks
                 .iter()
-                .flat_map(|&d| {
-                    let stores = jump_stores(d);
-                    self.cfg.blocks[d]
-                        .defs
-                        .iter()
-                        .copied()
-                        .filter(move |id| !stores.contains(id))
-                        .collect::<Vec<_>>()
-                })
+                .flat_map(|&d| self.shadowing_defs(d))
                 .collect();
             for t in self.cfg.blocks[c].terminator.successors() {
                 if !self.cfg.blocks[t].inline {
@@ -658,23 +637,11 @@ impl Validator<'_> {
                     continue;
                 };
                 let marker_stmt = marker_pos.get(&k).map(|&(_, i)| i);
-                let stores = jump_stores(c);
                 let mut shadow: BTreeSet<BindingId> = chain_blocks[1..]
                     .iter()
-                    .flat_map(|&d| {
-                        let stores = jump_stores(d);
-                        self.cfg.blocks[d]
-                            .defs
-                            .iter()
-                            .copied()
-                            .filter(move |id| !stores.contains(id))
-                            .collect::<Vec<_>>()
-                    })
+                    .flat_map(|&d| self.shadowing_defs(d))
                     .collect();
-                for &id in &self.cfg.blocks[c].defs {
-                    if stores.contains(&id) {
-                        continue;
-                    }
+                for id in self.shadowing_defs(c) {
                     // A definition at a known statement index after the
                     // marker is not in scope at the jump; anything with
                     // an unknown position is counted conservatively.
@@ -689,6 +656,33 @@ impl Validator<'_> {
                 self.check_shadowed_transfer(c, target, &all_defs, &shadow, "opaque jump");
             }
         }
+    }
+
+    /// The definitions of `d` that shadow names in its emitted arm.
+    /// Excluded: bindings introduced by the braces-scoped `let`
+    /// synthesized for a valued opaque break (never in scope outside the
+    /// marker's own braces), and bindings whose original borrow `let`
+    /// the analysis removed from codegen (not emitted at all).
+    fn shadowing_defs(&self, d: BlockId) -> Vec<BindingId> {
+        let stores: BTreeSet<BindingId> = self.cfg.blocks[d]
+            .jumps
+            .iter()
+            .filter_map(|&k| match self.cfg.opaque_jumps[k].kind {
+                OpaqueJumpKind::Goto { store: Some(s), .. } => Some(s),
+                _ => None,
+            })
+            .collect();
+        self.cfg.blocks[d]
+            .defs
+            .iter()
+            .copied()
+            .filter(|id| !stores.contains(id))
+            .filter(|id| {
+                !self.cfg.bindings[id.0]
+                    .def_stmt
+                    .is_some_and(|i| self.analysis.removed_stmts[d].contains(&i))
+            })
+            .collect()
     }
 
     /// One transfer edge into non-inline `t`: flags a live binding of
@@ -721,36 +715,6 @@ impl Validator<'_> {
                     ));
                 }
             }
-        }
-    }
-}
-
-/// Collects the `k` arguments of every `__baregen_jump!(k [, value])`
-/// marker in a token stream, including markers nested inside another
-/// marker's value.
-fn collect_markers(tokens: TokenStream, out: &mut Vec<usize>) {
-    let mut iter = tokens.into_iter().peekable();
-    while let Some(tt) = iter.next() {
-        match tt {
-            TokenTree::Ident(id) if id == "__baregen_jump" => {
-                if !matches!(iter.peek(), Some(TokenTree::Punct(p)) if p.as_char() == '!') {
-                    continue;
-                }
-                iter.next(); // the `!`
-                if let Some(TokenTree::Group(g)) = iter.next() {
-                    let mut inner = g.stream().into_iter();
-                    if let Some(TokenTree::Literal(l)) = inner.next()
-                        && let Ok(k) = l.to_string().parse::<usize>()
-                    {
-                        out.push(k);
-                    }
-                    // A completion marker's value may contain further
-                    // (already rewritten) markers.
-                    collect_markers(inner.collect(), out);
-                }
-            }
-            TokenTree::Group(g) => collect_markers(g.stream(), out),
-            _ => {}
         }
     }
 }

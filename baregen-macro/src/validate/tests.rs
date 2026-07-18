@@ -355,16 +355,14 @@ fn jump_marker_desync_is_reported() {
 }
 
 #[test]
-fn borrow_source_shadowing_miscompile_is_caught() {
-    // KNOWN BUG (real, uncorrupted input): shadowing a borrow source
-    // whose borrow is used across a later yield. The analysis accepts
-    // this body, but the transition `*self = State::S2 { x }` at the
-    // end of S1's arm captures the shadowing inner `x` (99) instead of
-    // the stored borrow source (1) — a silent wrong-value miscompile
-    // at HEAD, confirmed by a runtime probe on 2026-07-17. The
-    // validation pass turns it into a loud failure; the proper fix is
-    // an analysis-side error rejecting the shadowing (rename), at
-    // which point this test should assert that error instead.
+fn borrow_source_shadowing_is_rejected_before_validation() {
+    // Shadowing a borrow source whose borrow is used across a later
+    // yield was a silent wrong-value miscompile this pass first caught
+    // (2026-07-17): the transition at the end of S1's arm captured the
+    // shadowing inner `x` (99) instead of the stored borrow source (1).
+    // The analysis now rejects the body with a user-facing error (see
+    // `analyze_cfg::tests`), so validation never sees it; the check
+    // itself stays covered by `shadowing_capture_at_a_transition_is_reported`.
     let unit: syn::Type = parse_quote!(());
     let block: syn::Block = parse_quote!({
         let x: u32 = 1;
@@ -376,8 +374,25 @@ fn borrow_source_shadowing_miscompile_is_caught() {
         f(*y);
     });
     let cfg = lower_args(&[], &block);
-    let analysis = analyze(&cfg, &[], &unit).expect("the analysis accepts this body today");
-    let msg = err_of(&cfg, &analysis, 0);
-    assert!(msg.contains("would be captured"), "got: {msg}");
-    assert!(msg.contains("`x`"), "got: {msg}");
+    let err = analyze(&cfg, &[], &unit).expect_err("the analysis must reject this body");
+    assert!(err.to_string().contains("shadows"), "got: {err}");
+}
+
+#[test]
+fn removed_borrow_let_does_not_count_as_shadowing() {
+    // The shadowing `let y = &x;` is dropped from S1's emitted arm (the
+    // borrow is rebuilt in S2's region), so the transfer of the outer
+    // `y` captures nothing wrong; the pass must accept it.
+    assert_valid(
+        &[],
+        &parse_quote!({
+            let y: u32 = 1;
+            let p = &y;
+            yield_!(0);
+            let x: u32 = 2;
+            let y = &x;
+            yield_!(0);
+            f(*p + *y);
+        }),
+    );
 }

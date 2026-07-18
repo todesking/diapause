@@ -21,7 +21,7 @@ mod tests;
 mod visitors;
 
 pub(crate) use visitors::{
-    PatBindingCollector, UseCollector, collect_token_idents, skip_nested_scopes,
+    PatBindingCollector, UseCollector, collect_markers, collect_token_idents, skip_nested_scopes,
 };
 use visitors::{YieldBan, contains_yield_expr, contains_yield_stmt};
 pub use visitors::{is_jump_marker, is_yield_all_macro, is_yield_macro};

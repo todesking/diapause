@@ -1,0 +1,5 @@
+error: this `x` shadows an earlier binding `x` that is still in use across a suspension point (possibly as the source of a reconstructed borrow); the coroutine state would capture this shadowing `x` in place of the earlier one; rename one of them
+ --> tests/compile_fail/borrow_source_shadowed.rs:6:9
+  |
+6 |     let x: u32 = 99;
+  |         ^

@@ -32,6 +32,39 @@ pub fn is_jump_marker(mac: &syn::Macro) -> bool {
     mac.path.is_ident("__baregen_jump")
 }
 
+/// Collects the `k` arguments of every `__baregen_jump!(k [, value])`
+/// marker in a token stream, including markers nested inside another
+/// marker's value.
+pub(crate) fn collect_markers(tokens: proc_macro2::TokenStream, out: &mut Vec<usize>) {
+    let mut iter = tokens.into_iter().peekable();
+    while let Some(tt) = iter.next() {
+        match tt {
+            proc_macro2::TokenTree::Ident(id) if id == "__baregen_jump" => {
+                if !matches!(
+                    iter.peek(),
+                    Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '!'
+                ) {
+                    continue;
+                }
+                iter.next(); // the `!`
+                if let Some(proc_macro2::TokenTree::Group(g)) = iter.next() {
+                    let mut inner = g.stream().into_iter();
+                    if let Some(proc_macro2::TokenTree::Literal(l)) = inner.next()
+                        && let Ok(k) = l.to_string().parse::<usize>()
+                    {
+                        out.push(k);
+                    }
+                    // A completion marker's value may contain further
+                    // (already rewritten) markers.
+                    collect_markers(inner.collect(), out);
+                }
+            }
+            proc_macro2::TokenTree::Group(g) => collect_markers(g.stream(), out),
+            _ => {}
+        }
+    }
+}
+
 /// Textually scans a foreign macro's tokens for `yield_ !` / `yield_all !`.
 pub(super) fn tokens_contain_yield(tokens: proc_macro2::TokenStream) -> bool {
     let mut iter = tokens.into_iter().peekable();

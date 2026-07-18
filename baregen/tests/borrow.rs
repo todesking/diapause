@@ -99,3 +99,48 @@ fn statement_before_a_dropped_borrow_survives_block_merging() {
     assert_eq!(c.resume(()), CoroutineState::Yielded(2));
     assert_eq!(c.resume(()), CoroutineState::Complete(12));
 }
+
+// Shadowing a former borrow source is fine once the borrow is dead:
+// only the new `x` crosses the second yield. (Shadowing it while the
+// borrow is still live is a compile error; see
+// tests/compile_fail/borrow_source_shadowed.rs.)
+#[baregen::coroutine(yield = u32)]
+fn sequential_shadowing_after_borrow_dies() -> u32 {
+    let x: u32 = 1;
+    let y = &x;
+    yield_!(*y);
+    let kept: u32 = *y + 1;
+    let x: u32 = 40;
+    yield_!(x);
+    x + kept
+}
+
+#[test]
+fn shadowing_a_dead_borrow_source_uses_the_new_binding() {
+    let mut c = sequential_shadowing_after_borrow_dies();
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Yielded(40));
+    assert_eq!(c.resume(()), CoroutineState::Complete(42));
+}
+
+// The shadowing binding is itself a borrow whose `let` is dropped from
+// the emitted arm (it is rebuilt in the next region), so the outer `y`
+// is transferred untouched.
+#[baregen::coroutine(yield = u32)]
+fn shadowing_borrow_let_is_dropped() -> u32 {
+    let y: u32 = 1;
+    let p = &y;
+    yield_!(0);
+    let x: u32 = 2;
+    let y = &x;
+    yield_!(0);
+    *p + *y
+}
+
+#[test]
+fn dropped_shadowing_borrow_reads_both_sources() {
+    let mut c = shadowing_borrow_let_is_dropped();
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(()), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(()), CoroutineState::Complete(3));
+}
