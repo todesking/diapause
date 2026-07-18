@@ -29,8 +29,9 @@
 //!   the entry; at the function entry only arguments may be live.
 //! - **Variable transfer**: a variant's fields are exactly the storable
 //!   live-in bindings (no omissions, no duplicates, no leftover direct
-//!   borrows), and reborrows are rebuilt from names available in the
-//!   arm.
+//!   borrows), reborrows are rebuilt from names available in the arm,
+//!   and no transition (terminator edge or opaque jump) would capture a
+//!   same-named shadowing binding instead of the live one it moves.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -61,11 +62,12 @@ pub fn validate(cfg: &Cfg, analysis: &Analysis, n_args: usize) -> Result<(), Str
     v.check_reachability();
     v.check_inlining(&preds);
     v.check_resume_points(&preds);
-    v.check_jump_markers();
+    let marker_pos = v.check_jump_markers();
     v.check_variant_list();
     v.check_liveness_equations();
     v.check_definedness(&preds);
     v.check_variant_fields();
+    v.check_transition_shadowing(&marker_pos);
     v.finish()
 }
 
@@ -310,9 +312,12 @@ impl Validator<'_> {
 
     /// The `__baregen_jump!(k, ..)` markers embedded in a block's
     /// statement tokens must match its `jumps` list exactly, and each
-    /// jump entry must be owned by exactly one block.
-    fn check_jump_markers(&mut self) {
+    /// jump entry must be owned by exactly one block. Returns each
+    /// marker's position (block, statement index) for the shadowing
+    /// check.
+    fn check_jump_markers(&mut self) -> HashMap<usize, (BlockId, usize)> {
         let mut owner: HashMap<usize, BlockId> = HashMap::new();
+        let mut positions: HashMap<usize, (BlockId, usize)> = HashMap::new();
         for (b, blk) in self.cfg.blocks.iter().enumerate() {
             for &k in &blk.jumps {
                 if let Some(prev) = owner.insert(k, b) {
@@ -322,8 +327,13 @@ impl Validator<'_> {
                 }
             }
             let mut found: Vec<usize> = Vec::new();
-            for stmt in &blk.stmts {
-                collect_markers(stmt.to_token_stream(), &mut found);
+            for (i, stmt) in blk.stmts.iter().enumerate() {
+                let mut ks = Vec::new();
+                collect_markers(stmt.to_token_stream(), &mut ks);
+                for k in ks {
+                    positions.entry(k).or_insert((b, i));
+                    found.push(k);
+                }
             }
             let mut listed: Vec<usize> = blk.jumps.clone();
             found.sort_unstable();
@@ -335,6 +345,7 @@ impl Validator<'_> {
                 ));
             }
         }
+        positions
     }
 
     // === Dispatch totality ===
@@ -570,6 +581,145 @@ impl Validator<'_> {
                     ));
                 }
                 available.insert(rb.target.to_string());
+            }
+        }
+    }
+
+    /// Transitions move a target's fields by name from the transition
+    /// site. A binding defined between the arm's variant unpack and the
+    /// transition that shares its name with a (different) live binding
+    /// being moved would be captured instead — a silent wrong-value
+    /// miscompile. Terminator transitions sit at the end of the inline
+    /// chain; opaque jumps fire inside a statement, so only definitions
+    /// ordered before that statement count (where the order is known).
+    fn check_transition_shadowing(&mut self, marker_pos: &HashMap<usize, (BlockId, usize)>) {
+        let n = self.cfg.blocks.len();
+        // Unique terminator predecessor, for walking inline chains.
+        let mut term_pred = vec![usize::MAX; n];
+        for b in 0..n {
+            for s in self.cfg.blocks[b].terminator.successors() {
+                term_pred[s] = b;
+            }
+        }
+        // The inline chain ending at `c`: c itself, then its unique
+        // predecessors while they are inline, ending at the region root
+        // whose arm textually contains all of them.
+        let chain = |c: BlockId| -> Vec<BlockId> {
+            let mut v = vec![c];
+            let mut cur = c;
+            while self.cfg.blocks[cur].inline && term_pred[cur] != usize::MAX && v.len() <= n {
+                cur = term_pred[cur];
+                v.push(cur);
+            }
+            v
+        };
+        // Bindings introduced by the braces-scoped `let` synthesized for
+        // a valued opaque break: they never shadow anything outside the
+        // marker's own braces.
+        let jump_stores = |b: BlockId| -> BTreeSet<BindingId> {
+            self.cfg.blocks[b]
+                .jumps
+                .iter()
+                .filter_map(|&k| match self.cfg.opaque_jumps[k].kind {
+                    OpaqueJumpKind::Goto { store: Some(s), .. } => Some(s),
+                    _ => None,
+                })
+                .collect()
+        };
+        for c in 0..n {
+            let chain_blocks = chain(c);
+            let all_defs: BTreeSet<BindingId> = chain_blocks
+                .iter()
+                .flat_map(|&d| self.cfg.blocks[d].defs.iter().copied())
+                .collect();
+            // Terminator edges: every definition in the chain textually
+            // precedes the transition at the end of `c`.
+            let shadow: BTreeSet<BindingId> = chain_blocks
+                .iter()
+                .flat_map(|&d| {
+                    let stores = jump_stores(d);
+                    self.cfg.blocks[d]
+                        .defs
+                        .iter()
+                        .copied()
+                        .filter(move |id| !stores.contains(id))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            for t in self.cfg.blocks[c].terminator.successors() {
+                if !self.cfg.blocks[t].inline {
+                    self.check_shadowed_transfer(c, t, &all_defs, &shadow, "transition");
+                }
+            }
+            // Opaque jumps: definitions in `c` after the jump-carrying
+            // statement do not shadow the jump site.
+            for &k in &self.cfg.blocks[c].jumps {
+                let OpaqueJumpKind::Goto { target, .. } = self.cfg.opaque_jumps[k].kind else {
+                    continue;
+                };
+                let marker_stmt = marker_pos.get(&k).map(|&(_, i)| i);
+                let stores = jump_stores(c);
+                let mut shadow: BTreeSet<BindingId> = chain_blocks[1..]
+                    .iter()
+                    .flat_map(|&d| {
+                        let stores = jump_stores(d);
+                        self.cfg.blocks[d]
+                            .defs
+                            .iter()
+                            .copied()
+                            .filter(move |id| !stores.contains(id))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                for &id in &self.cfg.blocks[c].defs {
+                    if stores.contains(&id) {
+                        continue;
+                    }
+                    // A definition at a known statement index after the
+                    // marker is not in scope at the jump; anything with
+                    // an unknown position is counted conservatively.
+                    let before = match (self.cfg.bindings[id.0].def_stmt, marker_stmt) {
+                        (Some(d), Some(m)) => d < m,
+                        _ => true,
+                    };
+                    if before {
+                        shadow.insert(id);
+                    }
+                }
+                self.check_shadowed_transfer(c, target, &all_defs, &shadow, "opaque jump");
+            }
+        }
+    }
+
+    /// One transfer edge into non-inline `t`: flags a live binding of
+    /// `t` that is not defined anywhere in the chain (it comes from the
+    /// arm's variant unpack) while a different same-named binding is.
+    fn check_shadowed_transfer(
+        &mut self,
+        c: BlockId,
+        t: BlockId,
+        chain_defs: &BTreeSet<BindingId>,
+        shadow: &BTreeSet<BindingId>,
+        kind: &str,
+    ) {
+        for &id in &self.analysis.live_in[t] {
+            if chain_defs.contains(&id) {
+                continue;
+            }
+            let ident = &self.cfg.bindings[id.0].ident;
+            for &other in shadow {
+                if other != id && self.cfg.bindings[other.0].ident == *ident {
+                    self.report(format!(
+                        "the {kind} from {} to {} moves `{ident}` by name, but a \
+                         different binding also named `{ident}` (binding {}) is in \
+                         scope at the transition and would be captured instead of \
+                         {}",
+                        self.block_desc(c),
+                        self.block_desc(t),
+                        other.0,
+                        self.binding_desc(id)
+                    ));
+                }
             }
         }
     }

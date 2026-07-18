@@ -4,7 +4,9 @@ use syn::parse_quote;
 
 use super::validate;
 use crate::analyze_cfg::{Analysis, ArgInfo, StateField, analyze};
-use crate::cfg::{BindingId, Block, BlockId, Cfg, Terminator};
+use crate::cfg::{
+    Binding, BindingId, BindingKind, Block, BlockId, BorrowSource, Cfg, Terminator, TySource,
+};
 use crate::test_util::lower_args;
 
 fn analyzed(args: &[(&str, &str)], resume_ty: &syn::Type, block: &syn::Block) -> (Cfg, Analysis) {
@@ -295,6 +297,38 @@ fn spurious_state_field_is_reported() {
 }
 
 #[test]
+fn shadowing_capture_at_a_transition_is_reported() {
+    // A second binding named `x` defined in S1 while the outer `x`
+    // (still live at S2) is transferred through: the by-name move
+    // `State::S2 { x }` would capture the wrong one.
+    let unit: syn::Type = parse_quote!(());
+    let (mut cfg, analysis) = analyzed(
+        &[],
+        &unit,
+        &parse_quote!({
+            let x: u32 = 1;
+            yield_!(0);
+            yield_!(0);
+            f(x);
+        }),
+    );
+    cfg.bindings.push(Binding {
+        ident: syn::Ident::new("x", proc_macro2::Span::call_site()),
+        mutability: None,
+        kind: BindingKind::Local,
+        ty: TySource::Unknown,
+        borrow: BorrowSource::NotABorrow,
+        def_stmt: None,
+    });
+    let shadow = BindingId(cfg.bindings.len() - 1);
+    let s1 = resume_ids(&cfg)[0];
+    cfg.blocks[s1].defs.insert(shadow);
+    let msg = err_of(&cfg, &analysis, 0);
+    assert!(msg.contains("would be captured"), "got: {msg}");
+    assert!(msg.contains("`x`"), "got: {msg}");
+}
+
+#[test]
 fn jump_marker_desync_is_reported() {
     let unit: syn::Type = parse_quote!(());
     let (mut cfg, analysis) = analyzed(
@@ -318,4 +352,32 @@ fn jump_marker_desync_is_reported() {
     cfg.blocks[owner].jumps.clear();
     let msg = err_of(&cfg, &analysis, 0);
     assert!(msg.contains("jump markers"), "got: {msg}");
+}
+
+#[test]
+fn borrow_source_shadowing_miscompile_is_caught() {
+    // KNOWN BUG (real, uncorrupted input): shadowing a borrow source
+    // whose borrow is used across a later yield. The analysis accepts
+    // this body, but the transition `*self = State::S2 { x }` at the
+    // end of S1's arm captures the shadowing inner `x` (99) instead of
+    // the stored borrow source (1) — a silent wrong-value miscompile
+    // at HEAD, confirmed by a runtime probe on 2026-07-17. The
+    // validation pass turns it into a loud failure; the proper fix is
+    // an analysis-side error rejecting the shadowing (rename), at
+    // which point this test should assert that error instead.
+    let unit: syn::Type = parse_quote!(());
+    let block: syn::Block = parse_quote!({
+        let x: u32 = 1;
+        let y = &x;
+        yield_!(0);
+        let x: u32 = 99;
+        let _ = x;
+        yield_!(0);
+        f(*y);
+    });
+    let cfg = lower_args(&[], &block);
+    let analysis = analyze(&cfg, &[], &unit).expect("the analysis accepts this body today");
+    let msg = err_of(&cfg, &analysis, 0);
+    assert!(msg.contains("would be captured"), "got: {msg}");
+    assert!(msg.contains("`x`"), "got: {msg}");
 }
