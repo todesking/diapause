@@ -535,6 +535,21 @@ fn range_types_are_inferred_from_either_endpoint() {
 }
 
 #[test]
+fn inclusive_for_iterator_resolves_to_the_wrapper_type() {
+    let block: syn::Block = parse_quote!({
+        let r = 0u32..=n;
+        for i in r {
+            yield_!(i);
+        }
+        0u32
+    });
+    let (cfg, a) = run_args(&[("n", "u32")], &block, &unit());
+    let s1 = resume_ids(&cfg)[0];
+    let wrapper: syn::Type = parse_quote!(__RangeInclusiveIter<u32>);
+    assert_eq!(field(&a, s1, "__iter0").ty, wrapper);
+}
+
+#[test]
 fn range_with_unknown_endpoints_is_an_error() {
     let block: syn::Block = parse_quote!({
         let r = lo()..hi();

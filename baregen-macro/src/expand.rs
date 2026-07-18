@@ -10,7 +10,7 @@ use syn::visit_mut::VisitMut;
 
 use crate::analyze_cfg::{self, Analysis, ArgInfo, Variant};
 use crate::args::{Fingerprint, MacroArgs};
-use crate::cfg::{BlockId, Cfg, OpaqueJumpKind, ResumeBinding, Terminator};
+use crate::cfg::{BlockId, Cfg, OpaqueJumpKind, ResumeBinding, Terminator, TySource};
 use crate::lower::{self, skip_nested_scopes};
 use crate::signature::{
     augment_generics, check_return_type, check_signature, parse_args, phantom_for_unused_params,
@@ -134,6 +134,11 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
         tokens: state_enum_tokens,
         phantom_init,
     } = build_state_enum(&cx, &derive_attrs, &suspension.poisoned_variant);
+    let range_iter_def = cfg
+        .bindings
+        .iter()
+        .any(|b| matches!(b.ty, TySource::RangeInclusiveIter(_)))
+        .then(|| range_inclusive_iter_def(&derive_attrs));
     let resume_body = build_resume_dispatch(&cx, &suspension);
     let drive_fn = build_drive_fn(&cx, &suspension.placeholder);
     let fp_check_fn = fp_enabled.then(|| build_check_fingerprint(&cx));
@@ -151,6 +156,8 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
             use super::*;
 
             #state_enum_tokens
+
+            #range_iter_def
 
             impl #impl_generics ::baregen::Coroutine<#resume_ty> for State #ty_generics
             #where_clause
@@ -325,6 +332,61 @@ fn build_state_enum(
     StateEnum {
         tokens,
         phantom_init,
+    }
+}
+
+/// Builds the iterator stored for `for _ in a..=b` loops (emitted only
+/// when the body has one). `RangeInclusive` itself cannot be stored:
+/// its serde impl serializes only `start`/`end` and drops the internal
+/// exhaustion flag, so a state persisted right after the final element
+/// was yielded would re-yield that element forever after a round trip.
+/// The explicit `done` field round-trips exactly, and iteration
+/// delegates to `RangeInclusive` so the stepping semantics stay std's.
+/// Generated into the coroutine module so the user's derives (serde,
+/// Clone, ...) apply to it exactly as to the state enum.
+fn range_inclusive_iter_def(derive_attrs: &[&syn::Attribute]) -> TokenStream {
+    quote! {
+        #(#derive_attrs)*
+        #[allow(dead_code)]
+        pub struct __RangeInclusiveIter<T> {
+            pub start: T,
+            pub end: T,
+            pub done: bool,
+        }
+
+        #[allow(dead_code)]
+        impl<T: ::core::cmp::PartialOrd> __RangeInclusiveIter<T> {
+            fn new(range: ::core::ops::RangeInclusive<T>) -> Self {
+                // `is_empty` sees the exhaustion flag, so converting an
+                // already-exhausted range stays faithful.
+                let done = range.is_empty();
+                let (start, end) = range.into_inner();
+                __RangeInclusiveIter { start, end, done }
+            }
+        }
+
+        impl<T> ::core::iter::Iterator for __RangeInclusiveIter<T>
+        where
+            T: ::core::clone::Clone + ::core::cmp::PartialOrd,
+            ::core::ops::RangeInclusive<T>: ::core::iter::Iterator<Item = T>,
+        {
+            type Item = T;
+
+            fn next(&mut self) -> ::core::option::Option<T> {
+                if self.done {
+                    return ::core::option::Option::None;
+                }
+                let mut range = self.start.clone()..=self.end.clone();
+                let item = ::core::iter::Iterator::next(&mut range);
+                if item.is_none() || range.is_empty() {
+                    self.done = true;
+                }
+                // `next` advanced the range's start; carry it over so
+                // the next call resumes where std's iterator would.
+                (self.start, _) = range.into_inner();
+                item
+            }
+        }
     }
 }
 

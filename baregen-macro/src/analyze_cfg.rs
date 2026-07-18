@@ -561,11 +561,36 @@ impl Context<'_> {
                 let t = self.resolve_ty_source(inner)?;
                 Some(syn::parse_quote!(<#t as ::core::iter::IntoIterator>::IntoIter))
             }
+            TySource::RangeInclusiveIter(inner) => {
+                // Lowering only wraps heads it typed as `RangeInclusive`
+                // itself, so the resolved inner type always has the
+                // `RangeInclusive<T>` shape to project the endpoint
+                // type from.
+                let t = self.resolve_ty_source(inner)?;
+                let item = range_inclusive_item(&t)?;
+                Some(syn::parse_quote!(__RangeInclusiveIter<#item>))
+            }
             TySource::IterItem(iter) => {
                 let t = self.resolve_binding_ty(*iter)?;
                 Some(syn::parse_quote!(<#t as ::core::iter::Iterator>::Item))
             }
         }
+    }
+}
+
+/// Extracts `T` from a `RangeInclusive<T>`-shaped type.
+fn range_inclusive_item(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(p) = ty else { return None };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "RangeInclusive" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    match args.args.first() {
+        Some(syn::GenericArgument::Type(t)) if args.args.len() == 1 => Some(t),
+        _ => None,
     }
 }
 

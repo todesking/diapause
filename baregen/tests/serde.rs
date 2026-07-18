@@ -231,6 +231,57 @@ fn suspended_delegation_round_trips_through_json() {
     }
 }
 
+// `a..=b` iterators are stored as the generated `__RangeInclusiveIter`
+// (start/end/done): serde's `RangeInclusive` impl serializes only
+// `start`/`end` and drops the internal exhaustion flag, so storing the
+// std type would make a state saved after the final element re-yield
+// that element forever after a round trip.
+
+#[baregen::coroutine(yield = u32)]
+#[derive(Serialize, Deserialize)]
+fn inclusive_sum(n: u32) -> u32 {
+    let mut sum: u32 = 0;
+    for i in 0u32..=n {
+        yield_!(i);
+        sum += i;
+    }
+    sum
+}
+
+#[test]
+fn inclusive_range_round_trips_at_every_suspension() {
+    // Continue on the round-tripped copy after every yield; the state
+    // suspended after the final element (exhausted iterator) must
+    // complete instead of re-yielding it.
+    let mut c = inclusive_sum(2);
+    let mut step = c.start();
+    let mut yields = Vec::new();
+    while let CoroutineState::Yielded(v) = step {
+        yields.push(v);
+        let json = serde_json::to_string(&c).unwrap();
+        c = serde_json::from_str(&json).unwrap();
+        step = c.resume(());
+    }
+    assert_eq!(yields, [0, 1, 2]);
+    assert_eq!(step, CoroutineState::Complete(3));
+}
+
+#[test]
+fn serialized_inclusive_iterator_exposes_exhaustion() {
+    let mut c = inclusive_sum(1);
+    c.start();
+    assert_eq!(c.resume(()), CoroutineState::Yielded(1));
+
+    // Suspended after the final element: the wrapper records the
+    // exhaustion explicitly instead of relying on `RangeInclusive`'s
+    // unserialized internal flag.
+    let value: serde_json::Value = serde_json::to_value(&c).unwrap();
+    let it = &value["S1"]["__iter0"];
+    assert_eq!(it["start"], 1);
+    assert_eq!(it["end"], 1);
+    assert_eq!(it["done"], true);
+}
+
 #[test]
 fn serialized_state_exposes_the_iterator_cursor() {
     let mut c = running_sum(3);

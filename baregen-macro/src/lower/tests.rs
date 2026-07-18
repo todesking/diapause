@@ -596,6 +596,47 @@ fn for_loop_matches_design_shape() {
 }
 
 #[test]
+fn inclusive_for_head_uses_the_exhaustion_preserving_wrapper() {
+    let block: syn::Block = parse_quote!({
+        for i in 0u32..=n {
+            yield_!(i);
+        }
+    });
+    let cfg = lower_args(&["n"], &block);
+    let it = binding(&cfg, "__iter0");
+    assert!(matches!(
+        &cfg.bindings[it.0].ty,
+        TySource::RangeInclusiveIter(inner)
+            if matches!(**inner, TySource::Range { inclusive: true, .. })
+    ));
+    let expected: syn::Stmt = parse_quote! {
+        let mut __iter0 = __RangeInclusiveIter::new(0u32..=n);
+    };
+    assert_eq!(cfg.blocks[0].stmts[0], expected);
+}
+
+#[test]
+fn moved_inclusive_range_head_is_wrapped_too() {
+    let block: syn::Block = parse_quote!({
+        let r = 0u32..=n;
+        let s = r;
+        for i in s {
+            yield_!(i);
+        }
+    });
+    let cfg = lower_args(&["n"], &block);
+    let it = binding(&cfg, "__iter0");
+    assert!(matches!(
+        &cfg.bindings[it.0].ty,
+        TySource::RangeInclusiveIter(inner) if matches!(**inner, TySource::Moved(_))
+    ));
+    let expected: syn::Stmt = parse_quote! {
+        let mut __iter0 = __RangeInclusiveIter::new(s);
+    };
+    assert_eq!(cfg.blocks[0].stmts[2], expected);
+}
+
+#[test]
 fn for_break_and_continue_target_exit_and_header() {
     let block: syn::Block = parse_quote!({
         for i in 0u32..3 {

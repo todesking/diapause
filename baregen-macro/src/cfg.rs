@@ -77,6 +77,13 @@ pub enum TySource {
     /// A `for` loop's iterator: `<T as IntoIterator>::IntoIter` where
     /// the inner source is the type of the iterated expression.
     IntoIter(Box<TySource>),
+    /// An inclusive-range `for` loop's iterator: the generated
+    /// `__RangeInclusiveIter<T>` wrapper, where the inner source
+    /// resolves to `RangeInclusive<T>`. `RangeInclusive` itself is not
+    /// stored because its serde impl drops the internal exhaustion
+    /// flag, which breaks round-tripping a state suspended after the
+    /// final element (see `expand::range_inclusive_iter_def`).
+    RangeInclusiveIter(Box<TySource>),
     /// A `for` loop's variable: `<I as Iterator>::Item` where `I` is
     /// the type of the loop's `__iter{k}` binding.
     IterItem(BindingId),

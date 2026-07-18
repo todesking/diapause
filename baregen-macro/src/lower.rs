@@ -1472,7 +1472,10 @@ impl Lowerer {
     /// `IterNext` terminator. The iterator is stored in the state with
     /// the concrete type `<T as IntoIterator>::IntoIter`, so `T` (the
     /// type of EXPR) must be syntactically known when the loop crosses
-    /// a suspension point.
+    /// a suspension point. Exception: an `a..=b` head is stored as the
+    /// generated `__RangeInclusiveIter` wrapper instead of
+    /// `RangeInclusive`, whose serde impl drops the internal exhaustion
+    /// flag (see `expand::range_inclusive_iter_def`).
     fn lower_for(&mut self, ef: &syn::ExprForLoop) {
         self.check_no_yield(&ef.expr, ERR_FOR_HEAD);
         self.check_for_local_borrow(&ef.expr);
@@ -1480,15 +1483,26 @@ impl Lowerer {
         let iter_ident = syn::Ident::new(&format!("__iter{}", self.for_count), ef.expr.span());
         self.for_count += 1;
         let head = &*ef.expr;
-        let stmt: syn::Stmt = syn::parse_quote! {
-            let mut #iter_ident = ::core::iter::IntoIterator::into_iter(#head);
+        let head_ty = self.infer_ty_source(head);
+        let inclusive = self.is_inclusive_range(&head_ty);
+        let stmt: syn::Stmt = if inclusive {
+            syn::parse_quote! {
+                let mut #iter_ident = __RangeInclusiveIter::new(#head);
+            }
+        } else {
+            syn::parse_quote! {
+                let mut #iter_ident = ::core::iter::IntoIterator::into_iter(#head);
+            }
         };
         self.blocks[self.current].stmts.push(stmt);
-        let head_ty = self.infer_ty_source(head);
         let iter_id = self.define(&iter_ident, self.current, BindingKind::ForIter, None);
         let b = &mut self.bindings[iter_id.0];
         b.mutability = Some(syn::Token![mut](ef.expr.span()));
-        b.ty = TySource::IntoIter(Box::new(head_ty));
+        b.ty = if inclusive {
+            TySource::RangeInclusiveIter(Box::new(head_ty))
+        } else {
+            TySource::IntoIter(Box::new(head_ty))
+        };
 
         self.with_loop_frame(
             &ef.label,
@@ -1525,6 +1539,19 @@ impl Lowerer {
                 other => lw.define_pat_bindings(other, body, BindingKind::ForPat, None),
             },
         );
+    }
+
+    /// Whether the source is an `a..=b` range expression the macro
+    /// itself typed as `RangeInclusive`, followed through `let y = x;`
+    /// moves. Only these heads are wrapped: a user-annotated
+    /// `RangeInclusive` type is taken at face value, like any other
+    /// annotation.
+    fn is_inclusive_range(&self, src: &TySource) -> bool {
+        match src {
+            TySource::Range { inclusive, .. } => *inclusive,
+            TySource::Moved(id) => self.is_inclusive_range(&self.bindings[id.0].ty),
+            _ => false,
+        }
     }
 
     /// Rejects `for x in &local` / `for x in &mut local` where `local`

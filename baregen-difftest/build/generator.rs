@@ -988,13 +988,7 @@ impl<'a> Gen<'a> {
                 } else {
                     Upper::Lit(1 + self.rng.below(4) as u32)
                 };
-                // KNOWN BUG, generation disabled: serde round-trip of a
-                // state suspended after an inclusive range's last
-                // element re-yields that element forever (serde's
-                // RangeInclusive impl drops the internal `exhausted`
-                // flag, and the state stores the iterator directly).
-                // Re-enable (`self.rng.chance(1, 4)`) once fixed.
-                let inclusive = false;
+                let inclusive = self.rng.chance(1, 4);
                 // Arguments are proptest-drawn from 0..16 and delegation
                 // arguments are reduced mod 16, so an argument-bounded
                 // range runs at most 15 times (16 inclusively).
