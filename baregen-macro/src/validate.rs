@@ -22,23 +22,32 @@
 //! - **Jump bookkeeping**: the `__baregen_jump!` markers embedded in a
 //!   block's statements correspond one-to-one to its `jumps` list, and
 //!   every jump entry is owned by exactly one block.
+//! - **Liveness consistency**: the analysis' `live_in` sets are an exact
+//!   fixed point of the backward dataflow equations over the final CFG.
+//! - **Def-use consistency**: every binding live at a block entry (in
+//!   particular, every variant field) is initialized on all paths from
+//!   the entry; at the function entry only arguments may be live.
+//! - **Variable transfer**: a variant's fields are exactly the storable
+//!   live-in bindings (no omissions, no duplicates, no leftover direct
+//!   borrows), and reborrows are rebuilt from names available in the
+//!   arm.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use proc_macro2::{TokenStream, TokenTree};
 use quote::ToTokens;
 
 use crate::analyze_cfg::Analysis;
-use crate::cfg::{BlockId, Cfg, OpaqueJumpKind, Terminator};
+use crate::cfg::{BindingId, BlockId, BorrowSource, Cfg, OpaqueJumpKind, Terminator};
 
 /// Validates a lowered CFG against its analysis. `n_args` is the number
 /// of function arguments (`BindingId(0)..BindingId(n_args)`), which are
-/// the only bindings defined at the function entry (reserved for the
-/// definite-initialization checks).
-pub fn validate(cfg: &Cfg, analysis: &Analysis, _n_args: usize) -> Result<(), String> {
+/// the only bindings defined at the function entry.
+pub fn validate(cfg: &Cfg, analysis: &Analysis, n_args: usize) -> Result<(), String> {
     let mut v = Validator {
         cfg,
         analysis,
+        n_args,
         violations: Vec::new(),
     };
     // Index validity and analysis shape first: the remaining checks
@@ -54,12 +63,16 @@ pub fn validate(cfg: &Cfg, analysis: &Analysis, _n_args: usize) -> Result<(), St
     v.check_resume_points(&preds);
     v.check_jump_markers();
     v.check_variant_list();
+    v.check_liveness_equations();
+    v.check_definedness(&preds);
+    v.check_variant_fields();
     v.finish()
 }
 
 struct Validator<'a> {
     cfg: &'a Cfg,
     analysis: &'a Analysis,
+    n_args: usize,
     violations: Vec<String>,
 }
 
@@ -88,6 +101,15 @@ impl Validator<'_> {
             Some(v) => format!("block {b} (state `{}`)", v.ident),
             None => format!("block {b}"),
         }
+    }
+
+    fn binding_desc(&self, id: BindingId) -> String {
+        format!("`{}` (binding {})", self.cfg.bindings[id.0].ident, id.0)
+    }
+
+    fn names(&self, ids: impl IntoIterator<Item = BindingId>) -> String {
+        let v: Vec<String> = ids.into_iter().map(|id| self.binding_desc(id)).collect();
+        v.join(", ")
     }
 
     // === CFG well-formedness ===
@@ -130,6 +152,7 @@ impl Validator<'_> {
         let n = self.cfg.blocks.len();
         for (name, len) in [
             ("live_in", self.analysis.live_in.len()),
+            ("uses", self.analysis.uses.len()),
             ("removed_stmts", self.analysis.removed_stmts.len()),
         ] {
             if len != n {
@@ -156,7 +179,13 @@ impl Validator<'_> {
                 }
             }
         }
-        for id in self.analysis.live_in.iter().flatten() {
+        for id in self
+            .analysis
+            .live_in
+            .iter()
+            .chain(self.analysis.uses.iter())
+            .flatten()
+        {
             if id.0 >= self.cfg.bindings.len() {
                 self.report(format!(
                     "analysis mentions nonexistent binding {} ({} bindings)",
@@ -362,6 +391,186 @@ impl Validator<'_> {
                 "the entry block's variant is named `{}` instead of `Start`",
                 v.ident
             ));
+        }
+    }
+
+    // === Liveness and def-use consistency ===
+
+    /// `live_in` must be an exact fixed point of
+    /// `live_in(B) = use(B) ∪ (⋃ live_in(succ) ∖ def(B))`
+    /// over the final CFG (opaque-jump edges included).
+    fn check_liveness_equations(&mut self) {
+        for b in 0..self.cfg.blocks.len() {
+            let mut expected = BTreeSet::new();
+            for s in self.cfg.successors(b) {
+                expected.extend(self.analysis.live_in[s].iter().copied());
+            }
+            for d in &self.cfg.blocks[b].defs {
+                expected.remove(d);
+            }
+            expected.extend(self.analysis.uses[b].iter().copied());
+            let actual = &self.analysis.live_in[b];
+            if expected != *actual {
+                let missing: Vec<BindingId> = expected.difference(actual).copied().collect();
+                let extra: Vec<BindingId> = actual.difference(&expected).copied().collect();
+                let mut parts = Vec::new();
+                if !missing.is_empty() {
+                    parts.push(format!("missing {}", self.names(missing)));
+                }
+                if !extra.is_empty() {
+                    parts.push(format!("spurious {}", self.names(extra)));
+                }
+                self.report(format!(
+                    "liveness equation violated at {}: live-in should be \
+                     use ∪ (successors' live-in ∖ def) but is {}",
+                    self.block_desc(b),
+                    parts.join("; ")
+                ));
+            }
+        }
+    }
+
+    /// Forward must-initialization: every binding live at a block entry
+    /// (in particular, every variant field) is defined on all paths from
+    /// the entry, where only the arguments are defined.
+    fn check_definedness(&mut self, preds: &[Vec<BlockId>]) {
+        let n = self.cfg.blocks.len();
+        let universe: BTreeSet<BindingId> = (0..self.cfg.bindings.len()).map(BindingId).collect();
+        let args: BTreeSet<BindingId> = (0..self.n_args).map(BindingId).collect();
+        let mut defined: Vec<BTreeSet<BindingId>> = vec![universe; n];
+        defined[self.cfg.entry] = args;
+        loop {
+            let mut changed = false;
+            for b in 0..n {
+                if b == self.cfg.entry {
+                    continue;
+                }
+                let mut inter: Option<BTreeSet<BindingId>> = None;
+                for &p in &preds[b] {
+                    let mut out = defined[p].clone();
+                    out.extend(self.cfg.blocks[p].defs.iter().copied());
+                    inter = Some(match inter {
+                        None => out,
+                        Some(cur) => cur.intersection(&out).copied().collect(),
+                    });
+                }
+                let new = inter.unwrap_or_else(|| defined[b].clone());
+                if new != defined[b] {
+                    defined[b] = new;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (b, defined) in defined.iter().enumerate() {
+            let uninit: Vec<BindingId> = self.analysis.live_in[b]
+                .difference(defined)
+                .copied()
+                .collect();
+            if !uninit.is_empty() {
+                self.report(format!(
+                    "{} live at the entry of {} but not initialized on every path \
+                     from the function entry",
+                    self.names(uninit),
+                    self.block_desc(b)
+                ));
+            }
+        }
+    }
+
+    // === Variable transfer ===
+
+    /// A variant's fields are exactly the storable live-in bindings of
+    /// its block: one field per binding, named after it, no duplicates,
+    /// and direct borrows (substituted by their sources) never appear.
+    /// Reborrows must be rebuildable from names available in the arm.
+    fn check_variant_fields(&mut self) {
+        let mut def_anywhere = vec![false; self.cfg.bindings.len()];
+        for blk in &self.cfg.blocks {
+            for d in &blk.defs {
+                def_anywhere[d.0] = true;
+            }
+        }
+        for v in &self.analysis.variants {
+            let b = v.block;
+            let mut expected: BTreeMap<String, usize> = BTreeMap::new();
+            for id in &self.analysis.live_in[b] {
+                let binding = &self.cfg.bindings[id.0];
+                if matches!(binding.borrow, BorrowSource::Direct { .. }) {
+                    if def_anywhere[id.0] {
+                        self.report(format!(
+                            "direct borrow {} is live at the entry of {}; it should \
+                             have been substituted by its source",
+                            self.binding_desc(*id),
+                            self.block_desc(b)
+                        ));
+                    }
+                    continue;
+                }
+                *expected.entry(binding.ident.to_string()).or_insert(0) += 1;
+            }
+            for (name, count) in &expected {
+                if *count > 1 {
+                    self.report(format!(
+                        "{count} distinct live bindings named `{name}` at the entry \
+                         of {} would collide in one state",
+                        self.block_desc(b)
+                    ));
+                }
+            }
+            let mut actual: BTreeMap<String, usize> = BTreeMap::new();
+            for f in &v.fields {
+                *actual.entry(f.ident.to_string()).or_insert(0) += 1;
+            }
+            for (name, count) in &actual {
+                if *count > 1 {
+                    self.report(format!(
+                        "state `{}` has {count} fields named `{name}`",
+                        v.ident
+                    ));
+                }
+            }
+            for name in expected.keys() {
+                if !actual.contains_key(name) {
+                    self.report(format!(
+                        "state `{}` stores no field for the live binding `{name}` \
+                         (the value would be lost at the transition)",
+                        v.ident
+                    ));
+                }
+            }
+            for name in actual.keys() {
+                if !expected.contains_key(name) {
+                    self.report(format!(
+                        "state `{}` has a field `{name}` with no live binding of \
+                         that name at its entry",
+                        v.ident
+                    ));
+                }
+            }
+            // Reborrows: each source must be available at the arm head —
+            // a field of this variant, an earlier reborrow target, or
+            // (in the entry arm, which unpacks every argument) an
+            // argument name.
+            let mut available: BTreeSet<String> = actual.keys().cloned().collect();
+            if b == self.cfg.entry {
+                available.extend((0..self.n_args).map(|i| self.cfg.bindings[i].ident.to_string()));
+            }
+            for rb in &v.reborrows {
+                if !available.contains(&rb.source.to_string()) {
+                    self.report(format!(
+                        "the reborrow `{} = &{}` at the head of {} has no source: \
+                         `{}` is neither a field nor an earlier reborrow",
+                        rb.target,
+                        rb.source,
+                        self.block_desc(b),
+                        rb.source
+                    ));
+                }
+                available.insert(rb.target.to_string());
+            }
         }
     }
 }

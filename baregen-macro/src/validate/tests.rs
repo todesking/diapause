@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use syn::parse_quote;
 
 use super::validate;
-use crate::analyze_cfg::{Analysis, ArgInfo, analyze};
-use crate::cfg::{Block, BlockId, Cfg, Terminator};
+use crate::analyze_cfg::{Analysis, ArgInfo, StateField, analyze};
+use crate::cfg::{BindingId, Block, BlockId, Cfg, Terminator};
 use crate::test_util::lower_args;
 
 fn analyzed(args: &[(&str, &str)], resume_ty: &syn::Type, block: &syn::Block) -> (Cfg, Analysis) {
@@ -34,6 +34,19 @@ fn resume_ids(cfg: &Cfg) -> Vec<BlockId> {
     (0..cfg.blocks.len())
         .filter(|b| cfg.blocks[*b].resume_point)
         .collect()
+}
+
+/// The BindingId of the (unique) binding with this name.
+fn binding(cfg: &Cfg, name: &str) -> BindingId {
+    let matches: Vec<BindingId> = cfg
+        .bindings
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.ident == name)
+        .map(|(i, _)| BindingId(i))
+        .collect();
+    assert_eq!(matches.len(), 1, "binding `{name}` not unique: {matches:?}");
+    matches[0]
 }
 
 // === The pass accepts real lowered coroutines ===
@@ -172,6 +185,7 @@ fn unreachable_block_is_reported() {
         inline: false,
     });
     analysis.live_in.push(BTreeSet::new());
+    analysis.uses.push(BTreeSet::new());
     analysis.removed_stmts.push(BTreeSet::new());
     let msg = err_of(&cfg, &analysis, 0);
     assert!(msg.contains("unreachable"), "got: {msg}");
@@ -204,6 +218,80 @@ fn missing_dispatch_variant_is_reported() {
     let msg = err_of(&cfg, &analysis, 0);
     assert!(msg.contains("no state variant"), "got: {msg}");
     assert!(msg.contains("dispatch"), "got: {msg}");
+}
+
+// === Broken liveness and def-use facts are reported ===
+
+#[test]
+fn stale_live_in_breaks_the_dataflow_equation() {
+    let (cfg, mut analysis) = simple();
+    let s1 = resume_ids(&cfg)[0];
+    analysis.live_in[s1].clear();
+    let msg = err_of(&cfg, &analysis, 0);
+    assert!(msg.contains("liveness equation"), "got: {msg}");
+    assert!(msg.contains("`a`"), "got: {msg}");
+}
+
+#[test]
+fn binding_live_without_a_defining_path_is_reported() {
+    // `a` is defined only in the `then` arm; forcing it live at the
+    // function entry (with `uses` kept consistent so the dataflow
+    // equations still hold) must trip the must-initialization check.
+    let unit: syn::Type = parse_quote!(());
+    let (cfg, mut analysis) = analyzed(
+        &[("c", "bool")],
+        &unit,
+        &parse_quote!({
+            if c {
+                let a: u32 = 1;
+                yield_!(1);
+                f(a);
+            }
+            g();
+        }),
+    );
+    let a = binding(&cfg, "a");
+    analysis.uses[cfg.entry].insert(a);
+    analysis.live_in[cfg.entry].insert(a);
+    let msg = err_of(&cfg, &analysis, 1);
+    assert!(msg.contains("not initialized on every path"), "got: {msg}");
+    assert!(msg.contains("`a`"), "got: {msg}");
+}
+
+// === Broken variable transfer is reported ===
+
+#[test]
+fn omitted_state_field_is_reported() {
+    let (cfg, mut analysis) = simple();
+    let s1 = resume_ids(&cfg)[0];
+    let i = analysis
+        .variants
+        .iter()
+        .position(|v| v.block == s1)
+        .unwrap();
+    analysis.variants[i].fields.clear();
+    let msg = err_of(&cfg, &analysis, 0);
+    assert!(msg.contains("stores no field"), "got: {msg}");
+    assert!(msg.contains("`a`"), "got: {msg}");
+}
+
+#[test]
+fn spurious_state_field_is_reported() {
+    let (cfg, mut analysis) = simple();
+    let s1 = resume_ids(&cfg)[0];
+    let i = analysis
+        .variants
+        .iter()
+        .position(|v| v.block == s1)
+        .unwrap();
+    analysis.variants[i].fields.push(StateField {
+        ident: syn::Ident::new("q", proc_macro2::Span::call_site()),
+        mutability: None,
+        ty: parse_quote!(u32),
+    });
+    let msg = err_of(&cfg, &analysis, 0);
+    assert!(msg.contains("field `q`"), "got: {msg}");
+    assert!(msg.contains("no live binding"), "got: {msg}");
 }
 
 #[test]

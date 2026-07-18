@@ -67,9 +67,12 @@ pub struct Analysis {
     pub removed_stmts: Vec<BTreeSet<usize>>,
     /// Indexed by `BlockId`: bindings live at block entry, after borrow
     /// substitution.
-    // Consumed by the unit tests; codegen uses `variants`.
-    #[allow(dead_code)]
+    // Consumed by the unit tests and `validate`; codegen uses `variants`.
     pub live_in: Vec<BTreeSet<BindingId>>,
+    /// Indexed by `BlockId`: upward-exposed uses after borrow
+    /// substitution — the `use` sets the liveness fixed point ran on.
+    // Consumed by `validate`, which re-checks the dataflow equations.
+    pub uses: Vec<BTreeSet<BindingId>>,
 }
 
 impl Analysis {
@@ -130,6 +133,7 @@ impl<'a> Context<'a> {
             variants,
             removed_stmts,
             live_in,
+            uses,
         })
     }
 }
