@@ -66,8 +66,10 @@ impl Hoister {
             // A brace-delimited `yield_! { .. }` without a semicolon
             // parses as `Stmt::Macro` (syn 2 parses trailing paren and
             // bracket macros as `Stmt::Expr(Expr::Macro, None)`, handled
-            // below). Bare, it produces the resume value: bind it and
-            // make the binding the tail expression.
+            // below). Only a tail reaches here bare — `visit_block_mut`
+            // gives mid-block occurrences their semicolon first — and it
+            // produces the resume value: bind it and make the binding
+            // the tail expression.
             syn::Stmt::Macro(sm) if is_yield_macro(&sm.mac) && sm.semi_token.is_none() => {
                 let mut e = syn::Expr::Macro(syn::ExprMacro {
                     attrs: std::mem::take(&mut sm.attrs),
@@ -298,8 +300,20 @@ impl Hoister {
 
 impl VisitMut for Hoister {
     fn visit_block_mut(&mut self, block: &mut syn::Block) {
-        let mut out = Vec::with_capacity(block.stmts.len());
-        for mut stmt in std::mem::take(&mut block.stmts) {
+        let n = block.stmts.len();
+        let mut out = Vec::with_capacity(n);
+        for (i, mut stmt) in std::mem::take(&mut block.stmts).into_iter().enumerate() {
+            // A brace-form `yield_! { .. }` parses without a semicolon
+            // even mid-block, where it is an expression statement
+            // discarding the resume value: give it its semicolon so
+            // only a true tail is bound by `hoist_stmt`.
+            if i + 1 < n
+                && let syn::Stmt::Macro(sm) = &mut stmt
+                && is_yield_macro(&sm.mac)
+                && sm.semi_token.is_none()
+            {
+                sm.semi_token = Some(syn::Token![;](sm.mac.span()));
+            }
             let prefix = self.hoist_stmt(&mut stmt);
             out.extend(prefix);
             // Recurse after hoisting: nested blocks (branch bodies,
@@ -472,6 +486,23 @@ mod tests {
             parse_quote!({
                 let __tmp0 = yield_! { 1 };
                 __tmp0
+            }),
+        );
+    }
+
+    #[test]
+    fn mid_block_brace_yield_becomes_a_statement() {
+        // Mid-block, the semicolon-less brace form is an expression
+        // statement, not a tail: it gets a semicolon instead of a
+        // binding (which would leave `__tmp0` mid-block without one).
+        assert_hoists(
+            parse_quote!({
+                yield_! { 1 }
+                let z: u32 = 0u32;
+            }),
+            parse_quote!({
+                yield_! { 1 };
+                let z: u32 = 0u32;
             }),
         );
     }

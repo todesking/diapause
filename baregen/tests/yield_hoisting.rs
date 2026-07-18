@@ -275,3 +275,24 @@ fn bare_yield_arm_in_a_discarding_match() {
     assert_eq!(c.start(), CoroutineState::Yielded(20));
     assert_eq!(c.resume(5), CoroutineState::Complete(3));
 }
+
+// === Mid-block brace-form yield ===
+
+/// A brace-form `yield_!` without a semicolon in mid-block position
+/// parses as a semicolon-less `Stmt::Macro`; it is an expression
+/// statement discarding the resume value, not a bound tail (which
+/// would leave a semicolon-less `__tmpN` statement mid-block).
+#[baregen::coroutine(yield = u32, resume = u32)]
+fn mid_block_brace(a: u32) -> u32 {
+    yield_! { a }
+    let z: u32 = yield_!(a + 1);
+    z
+}
+
+#[test]
+fn mid_block_brace_yield_discards_the_resume_value() {
+    let mut c = mid_block_brace(3);
+    assert_eq!(c.start(), CoroutineState::Yielded(3));
+    assert_eq!(c.resume(100), CoroutineState::Yielded(4));
+    assert_eq!(c.resume(9), CoroutineState::Complete(9));
+}
