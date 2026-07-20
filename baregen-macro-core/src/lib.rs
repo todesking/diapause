@@ -6,9 +6,12 @@
 //! crate is a thin proc-macro shim over [`expand`]; users should depend
 //! on `baregen`, which re-exports the attribute.
 
-mod analyze_cfg;
+// `cfg` and `analyze_cfg` are public so that debugging front ends (the
+// playground) can inspect the intermediate artifacts `expand_debug`
+// returns; `expand` alone is enough for macro expansion itself.
+pub mod analyze_cfg;
 mod args;
-mod cfg;
+pub mod cfg;
 #[cfg(test)]
 mod coverage_corpus;
 mod expand;
@@ -20,4 +23,4 @@ mod test_util;
 mod ty_infer;
 mod validate;
 
-pub use expand::expand;
+pub use expand::{DebugExpansion, expand, expand_debug};

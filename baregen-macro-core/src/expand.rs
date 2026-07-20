@@ -41,6 +41,76 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     Ok(prepared.codegen(&cfg, &analysis))
 }
 
+/// Intermediate artifacts of one expansion, produced by [`expand_debug`]
+/// for debugging and visualization tooling (the playground). Each field
+/// is the output of one pipeline stage; when a stage fails, the fields
+/// of that stage and everything after it are `None` and `result` carries
+/// the stage's error.
+#[derive(Debug)]
+pub struct DebugExpansion {
+    /// The CFG exactly as lowered, before the simplification pass
+    /// (goto-chain merging, unreachable-block removal, inlining).
+    pub cfg_unsimplified: Option<Cfg>,
+    /// The simplified CFG that analysis and codegen consume.
+    pub cfg: Option<Cfg>,
+    /// State-variant layout, liveness, and borrow reconstruction info.
+    pub analysis: Option<Analysis>,
+    /// The generated code, or the first failing stage's error.
+    pub result: syn::Result<TokenStream>,
+}
+
+/// Runs the same pipeline as [`expand`] but returns the intermediate
+/// artifacts of every stage alongside the result (see [`DebugExpansion`]).
+///
+/// Two deliberate differences from `expand`: a stage failure still
+/// returns the artifacts of the stages before it, and an IR validation
+/// failure is reported as an error in `result` (with the offending CFG
+/// and analysis attached) instead of a panic.
+pub fn expand_debug(attr: TokenStream, item: syn::ItemFn) -> DebugExpansion {
+    let mut cfg_unsimplified = None;
+    let mut cfg = None;
+    let mut analysis = None;
+    let result = expand_debug_stages(attr, item, &mut cfg_unsimplified, &mut cfg, &mut analysis);
+    DebugExpansion {
+        cfg_unsimplified,
+        cfg,
+        analysis,
+        result,
+    }
+}
+
+/// [`expand_debug`]'s pipeline: stores each stage's output through the
+/// out-parameters as soon as it exists, so an early `?` return leaves
+/// everything already produced in place.
+fn expand_debug_stages(
+    attr: TokenStream,
+    item: syn::ItemFn,
+    cfg_unsimplified: &mut Option<Cfg>,
+    cfg_out: &mut Option<Cfg>,
+    analysis_out: &mut Option<Analysis>,
+) -> syn::Result<TokenStream> {
+    let prepared = Prepared::parse(attr, item)?;
+    let mut cfg = prepared.lower_unsimplified()?;
+    *cfg_unsimplified = Some(cfg.clone());
+    crate::cfg::simplify(&mut cfg);
+    let cfg = &*cfg_out.insert(cfg);
+    let analysis = &*analysis_out.insert(prepared.analyze(cfg)?);
+    // Unlike `expand`, run the validator unconditionally and surface a
+    // failure as an error: a debugging front end wants to display the
+    // invalid IR rather than crash.
+    if let Err(msg) = crate::validate::validate(cfg, analysis, prepared.args.len()) {
+        return Err(syn::Error::new(
+            prepared.item.sig.ident.span(),
+            format!(
+                "internal IR validation failed for coroutine `{}` (this is a bug in \
+                 baregen-macro):\n{msg}",
+                prepared.item.sig.ident
+            ),
+        ));
+    }
+    Ok(prepared.codegen(cfg, analysis))
+}
+
 /// Output of the pre-CFG stages of the pipeline: the parsed and checked
 /// item plus its rewritten body, ready to be lowered. Splitting this out
 /// of [`expand`] lets `expand_debug` run the same stages one at a time
@@ -105,13 +175,27 @@ impl Prepared {
 
     /// Lowers the rewritten body to the simplified CFG.
     fn lower(&self) -> syn::Result<Cfg> {
-        let arg_idents: Vec<syn::Ident> = self.args.iter().map(|a| a.ident.clone()).collect();
-        let arg_pats: Vec<(syn::Pat, syn::Ident)> = self
+        let (arg_idents, arg_pats) = self.lower_inputs();
+        lower::lower(&arg_idents, &arg_pats, &self.body)
+    }
+
+    /// Like [`Self::lower`], but stops before the simplification pass;
+    /// `expand_debug` snapshots this stage and simplifies afterwards.
+    fn lower_unsimplified(&self) -> syn::Result<Cfg> {
+        let (arg_idents, arg_pats) = self.lower_inputs();
+        lower::lower_unsimplified(&arg_idents, &arg_pats, &self.body)
+    }
+
+    /// The argument names and destructuring patterns lowering starts from.
+    #[allow(clippy::type_complexity)]
+    fn lower_inputs(&self) -> (Vec<syn::Ident>, Vec<(syn::Pat, syn::Ident)>) {
+        let arg_idents = self.args.iter().map(|a| a.ident.clone()).collect();
+        let arg_pats = self
             .args
             .iter()
             .filter_map(|a| a.pattern.clone().map(|p| (p, a.ident.clone())))
             .collect();
-        lower::lower(&arg_idents, &arg_pats, &self.body)
+        (arg_idents, arg_pats)
     }
 
     fn analyze(&self, cfg: &Cfg) -> syn::Result<Analysis> {
@@ -1045,6 +1129,84 @@ mod tests {
         );
         assert_ne!(base, edited_attr);
         assert_ne!(base, edited_body);
+    }
+
+    #[test]
+    fn expand_debug_success_returns_every_stage() {
+        let item: syn::ItemFn = parse_quote! {
+            fn c(n: u32) -> u32 {
+                let mut i = 0u32;
+                while i < n {
+                    yield_!(i);
+                    i += 1;
+                }
+                i
+            }
+        };
+        let dbg = expand_debug(quote!(yield = u32), item.clone());
+        let tokens = dbg.result.expect("expansion should succeed");
+        assert_eq!(
+            tokens.to_string(),
+            expand(quote!(yield = u32), item).unwrap().to_string(),
+            "expand_debug must generate exactly what expand does"
+        );
+        let pre = dbg.cfg_unsimplified.expect("pre-simplification CFG");
+        let post = dbg.cfg.expect("simplified CFG");
+        // Simplification only merges and removes blocks (never adds),
+        // and inlining is decided by it, so the snapshot has none.
+        assert!(pre.blocks.len() >= post.blocks.len());
+        assert!(pre.blocks.iter().all(|b| !b.inline));
+        let analysis = dbg.analysis.expect("analysis");
+        assert!(analysis.variants.iter().any(|v| v.ident == "S1"));
+    }
+
+    #[test]
+    fn expand_debug_parse_error_has_no_artifacts() {
+        let dbg = expand_debug(
+            quote!(banana = i32),
+            parse_quote!(
+                fn c() {}
+            ),
+        );
+        assert!(dbg.result.is_err());
+        assert!(dbg.cfg_unsimplified.is_none());
+        assert!(dbg.cfg.is_none());
+        assert!(dbg.analysis.is_none());
+    }
+
+    #[test]
+    fn expand_debug_lower_error_has_no_cfg() {
+        // `yield_!` in a `while` condition is rejected by lowering.
+        let item: syn::ItemFn = parse_quote! {
+            fn c() {
+                while yield_!(1u32) {
+                    f();
+                }
+            }
+        };
+        let dbg = expand_debug(quote!(yield = u32, resume = bool), item);
+        assert!(dbg.result.is_err());
+        assert!(dbg.cfg_unsimplified.is_none());
+        assert!(dbg.cfg.is_none());
+        assert!(dbg.analysis.is_none());
+    }
+
+    #[test]
+    fn expand_debug_analyze_error_keeps_both_cfgs() {
+        // `v` has no syntactic type and crosses a yield: lowering
+        // succeeds, the analysis rejects it.
+        let item: syn::ItemFn = parse_quote! {
+            fn c() {
+                let v = compute();
+                yield_!(());
+                drop(v);
+            }
+        };
+        let dbg = expand_debug(quote!(), item);
+        assert!(dbg.result.is_err());
+        assert!(dbg.cfg_unsimplified.is_some());
+        assert!(dbg.cfg.is_some());
+        assert!(dbg.analysis.is_none());
     }
 
     #[test]
