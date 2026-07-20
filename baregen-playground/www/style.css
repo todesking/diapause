@@ -1,0 +1,197 @@
+:root {
+  --border: #d0d4da;
+  --accent: #7a4bd6;
+  --error-bg: rgba(230, 60, 60, 0.22);
+  --error-fg: #b3261e;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+header {
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  margin: 0;
+  font-size: 1.2rem;
+  display: inline-block;
+  margin-right: 1rem;
+}
+
+header p { display: inline; margin: 0; color: #444; }
+
+#status {
+  margin: 0;
+  padding: 0.4rem 1rem;
+  background: #fff6d8;
+  border-bottom: 1px solid var(--border);
+}
+
+main {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; grid-auto-rows: minmax(300px, 1fr); }
+  body { height: auto; }
+}
+
+.pane {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+#input-pane { border-right: 1px solid var(--border); }
+
+.pane h2 {
+  margin: 0;
+  padding: 0.45rem 1rem;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #666;
+  border-bottom: 1px solid var(--border);
+}
+
+/* --- Editor with an error-highlight layer behind the textarea --- */
+
+#editor {
+  position: relative;
+  flex: 1;
+  min-height: 8rem;
+}
+
+#editor pre,
+#editor textarea {
+  /* Both layers must have identical text metrics and box so the
+     highlight lines up with the typed text. */
+  margin: 0;
+  border: 0;
+  padding: 0.6rem 0.8rem;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre;
+  overflow-wrap: normal;
+  tab-size: 4;
+}
+
+#highlight-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  color: transparent;
+  pointer-events: none;
+}
+
+#highlight-layer mark {
+  color: transparent;
+  background: var(--error-bg);
+  border-radius: 2px;
+}
+
+#source {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  resize: none;
+  background: transparent;
+  color: #222;
+  outline: none;
+}
+
+#source:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+
+/* --- Error list --- */
+
+#errors {
+  margin: 0;
+  padding: 0.4rem 0;
+  list-style: none;
+  max-height: 30%;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+  background: #fff5f5;
+}
+
+#errors li {
+  padding: 0.15rem 1rem;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--error-fg);
+  cursor: pointer;
+}
+
+#errors li:hover { text-decoration: underline; }
+
+#errors li .pos { font-weight: 600; }
+
+/* --- Output tabs --- */
+
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.3rem 0.6rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.tabs button {
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  background: #f2f3f5;
+  padding: 0.35rem 0.8rem;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.tabs button[aria-selected="true"] {
+  background: #fff;
+  font-weight: 600;
+  color: var(--accent);
+  position: relative;
+  top: 1px;
+}
+
+.view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0.6rem 0.8rem;
+}
+
+.view .placeholder { color: #888; font-size: 0.9rem; }
+
+.view svg { max-width: none; }
+
+#expanded {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.render-error {
+  color: var(--error-fg);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
