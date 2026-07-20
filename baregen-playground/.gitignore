@@ -1,0 +1,3 @@
+# wasm-pack intermediate output and the assembled static site.
+/pkg/
+/dist/
