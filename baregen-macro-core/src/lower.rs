@@ -96,6 +96,19 @@ pub fn lower(
     arg_pats: &[(syn::Pat, syn::Ident)],
     body: &syn::Block,
 ) -> syn::Result<Cfg> {
+    let mut cfg = lower_unsimplified(args, arg_pats, body)?;
+    simplify(&mut cfg);
+    Ok(cfg)
+}
+
+/// Same as [`lower`] but without the simplification pass: every block is
+/// as the lowering built it (no goto-chain merging, no inlining). Used
+/// by `expand_debug` to snapshot the pre-simplification CFG.
+pub fn lower_unsimplified(
+    args: &[syn::Ident],
+    arg_pats: &[(syn::Pat, syn::Ident)],
+    body: &syn::Block,
+) -> syn::Result<Cfg> {
     let mut lw = Lowerer::new(args);
     for (pat, source) in arg_pats {
         lw.push_arg_pat_let(pat, source);
@@ -240,14 +253,12 @@ impl Lowerer {
                 inline: false,
             })
             .collect();
-        let mut cfg = Cfg {
+        Ok(Cfg {
             blocks,
             entry: 0,
             bindings: self.bindings,
             opaque_jumps: self.opaque_jumps,
-        };
-        simplify(&mut cfg);
-        Ok(cfg)
+        })
     }
 
     fn err(&mut self, e: syn::Error) {

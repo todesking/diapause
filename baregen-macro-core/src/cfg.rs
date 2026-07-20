@@ -11,7 +11,7 @@ pub type BlockId = usize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BindingId(pub usize);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Binding {
     pub ident: syn::Ident,
     pub mutability: Option<syn::Token![mut]>,
@@ -60,7 +60,7 @@ pub enum BindingKind {
 // One instance per binding; keeping the syn type inline is simpler than
 // boxing it (same trade-off as Terminator).
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum TySource {
     Unknown,
     /// Explicit annotation, literal suffix, or unambiguous literal kind.
@@ -90,7 +90,7 @@ pub enum TySource {
 }
 
 /// Classification of a binding's initializer as a borrow.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BorrowSource {
     NotABorrow,
     /// `let y = &x;` / `let y = &mut x;` with a plain identifier source.
@@ -113,7 +113,7 @@ pub enum BorrowSource {
 /// marker (`k` indexes `Cfg::opaque_jumps`) and codegen replaces the
 /// marker with the real transition; the indirection keeps the statement
 /// tokens valid while simplification renumbers blocks.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OpaqueJump {
     pub kind: OpaqueJumpKind,
     /// Identifiers bound by patterns inside the statement containing the
@@ -140,7 +140,7 @@ pub enum OpaqueJumpKind {
     Complete,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Cfg {
     pub blocks: Vec<Block>,
     pub entry: BlockId,
@@ -172,7 +172,7 @@ impl Cfg {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Block {
     /// Opaque statements: anything that does not contain `yield_!`.
     pub stmts: Vec<syn::Stmt>,
@@ -196,7 +196,7 @@ pub struct Block {
 // A CFG holds a handful of terminators per coroutine; keeping the syn
 // expressions inline is simpler than boxing them.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Terminator {
     /// Unconditional transfer (join points, loop back edges).
     Goto(BlockId),
@@ -231,14 +231,14 @@ pub enum Terminator {
     Return(syn::Expr),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pat: syn::Pat,
     pub guard: Option<syn::Expr>,
     pub body: BlockId,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResumeBinding {
     pub binding: BindingId,
     pub mutability: Option<syn::Token![mut]>,
