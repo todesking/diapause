@@ -7,6 +7,6 @@ edition.workspace = true
 proc-macro = true
 
 [dependencies]
-syn = { version = "2", features = ["full", "visit", "visit-mut", "extra-traits"] }
-quote = "1"
+baregen-macro-core = { path = "../baregen-macro-core" }
+syn = { version = "2", features = ["full"] }
 proc-macro2 = "1"

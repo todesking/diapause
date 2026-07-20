@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["baregen", "baregen-difftest", "baregen-macro"]
+members = ["baregen", "baregen-difftest", "baregen-macro", "baregen-macro-core"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,22 +1,10 @@
-//! Procedural macro implementation for the `baregen` crate.
+//! Procedural macro shim for the `baregen` crate.
 //!
-//! Users should depend on `baregen`, which re-exports the attribute.
+//! The transformation itself lives in `baregen-macro-core`; this crate
+//! only adapts it to the proc-macro interface. Users should depend on
+//! `baregen`, which re-exports the attribute.
 
 use proc_macro::TokenStream;
-
-mod analyze_cfg;
-mod args;
-mod cfg;
-#[cfg(test)]
-mod coverage_corpus;
-mod expand;
-mod hoist;
-mod lower;
-mod signature;
-#[cfg(test)]
-mod test_util;
-mod ty_infer;
-mod validate;
 
 /// Transforms a function into a coroutine state machine.
 ///
@@ -183,7 +171,7 @@ mod validate;
 #[proc_macro_attribute]
 pub fn coroutine(attr: TokenStream, item: TokenStream) -> TokenStream {
     let item = syn::parse_macro_input!(item as syn::ItemFn);
-    expand::expand(attr.into(), item)
+    baregen_macro_core::expand(attr.into(), item)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
