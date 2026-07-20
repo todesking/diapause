@@ -12,6 +12,7 @@
 pub mod analyze_cfg;
 mod args;
 pub mod cfg;
+pub mod cfg_dot;
 #[cfg(test)]
 mod coverage_corpus;
 mod expand;
@@ -23,4 +24,5 @@ mod test_util;
 mod ty_infer;
 mod validate;
 
+pub use cfg_dot::cfg_to_dot;
 pub use expand::{DebugExpansion, expand, expand_debug};
