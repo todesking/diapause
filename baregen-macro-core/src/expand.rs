@@ -13,50 +13,14 @@ use crate::args::{Fingerprint, MacroArgs};
 use crate::cfg::{BlockId, Cfg, OpaqueJumpKind, ResumeBinding, Terminator, TySource};
 use crate::lower::{self, skip_nested_scopes};
 use crate::signature::{
-    augment_generics, check_return_type, check_signature, parse_args, phantom_for_unused_params,
+    ArgVar, augment_generics, check_return_type, check_signature, parse_args,
+    phantom_for_unused_params,
 };
 
 pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> {
-    // Hashed before the body is rewritten, from the exact source tokens.
-    let fingerprint = source_fingerprint(&attr, &item.sig, &item.block);
-    let macro_args: MacroArgs = syn::parse2(attr)?;
-    // A manual `fingerprint = "tag"` replaces the source hash: states
-    // persisted under equal tags are declared compatible by the user.
-    let fingerprint = match &macro_args.fingerprint {
-        Fingerprint::Manual(tag) => fnv1a(FNV_OFFSET_BASIS, tag.value().as_bytes()),
-        _ => fingerprint,
-    };
-    let fp_enabled = macro_args.fingerprint.enabled();
-
-    check_signature(&item.sig)?;
-    let mut args = parse_args(&item.sig)?;
-    let generics = augment_generics(&item.sig, &mut args)?;
-
-    let ret_ty: syn::Type = match &item.sig.output {
-        syn::ReturnType::Default => syn::parse_quote!(()),
-        syn::ReturnType::Type(_, ty) => (**ty).clone(),
-    };
-    check_return_type(&ret_ty)?;
-
-    // Expression-position yields with a pure evaluation prefix become
-    // `let __tmpN = yield_!(..);` statements, so lowering only sees the
-    // native statement forms. Runs first: `?` must still be visible as
-    // `Expr::Try` (an effect ending the prefix).
-    let mut body = (*item.block).clone();
-    crate::hoist::hoist_yields(&mut body);
-    // Early `return e` and `e?` become completion transitions everywhere
-    // in the body, including inside opaque statements; the rewritten form
-    // only makes sense inside `__drive`, where `self` and `State` resolve.
-    rewrite_early_exits(&mut body, &ret_ty);
-
-    let arg_idents: Vec<syn::Ident> = args.iter().map(|a| a.ident.clone()).collect();
-    let arg_pats: Vec<(syn::Pat, syn::Ident)> = args
-        .iter()
-        .filter_map(|a| a.pattern.clone().map(|p| (p, a.ident.clone())))
-        .collect();
-    let cfg = lower::lower(&arg_idents, &arg_pats, &body)?;
-    let arg_infos: Vec<ArgInfo> = args.iter().map(ArgInfo::from).collect();
-    let analysis = analyze_cfg::analyze(&cfg, &arg_infos, &macro_args.resume_ty)?;
+    let prepared = Prepared::parse(attr, item)?;
+    let cfg = prepared.lower()?;
+    let analysis = prepared.analyze(&cfg)?;
 
     // Self-check in the spirit of rustc's MIR validation: re-derive the
     // invariants the codegen below relies on and abort loudly on any
@@ -65,85 +29,181 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
     // failure is a baregen-macro bug, never a user error, hence the
     // panic instead of a compile error.
     if cfg!(debug_assertions)
-        && let Err(msg) = crate::validate::validate(&cfg, &analysis, arg_infos.len())
+        && let Err(msg) = crate::validate::validate(&cfg, &analysis, prepared.args.len())
     {
         panic!(
             "internal IR validation failed for coroutine `{}` (this is a bug in \
              baregen-macro):\n{msg}",
-            item.sig.ident
+            prepared.item.sig.ident
         );
     }
 
-    // `#[derive(...)]` written below the coroutine attribute applies to
-    // the generated State enum; everything else (doc comments, allow,
-    // etc.) stays on the starter fn.
-    let (derive_attrs, fn_attrs): (Vec<&syn::Attribute>, Vec<&syn::Attribute>) =
-        item.attrs.iter().partition(|a| a.path().is_ident("derive"));
-    let vis = &item.vis;
-    let name = &item.sig.ident;
-    let yield_ty = &macro_args.yield_ty;
-    let resume_ty = &macro_args.resume_ty;
+    Ok(prepared.codegen(&cfg, &analysis))
+}
 
-    let arg_ident: Vec<&syn::Ident> = args.iter().map(|a| &a.ident).collect();
-    let arg_ty: Vec<&syn::Type> = args.iter().map(|a| &a.ty).collect();
-    let arg_pat: Vec<TokenStream> = args
-        .iter()
-        .map(|a| bind_pat(&a.mutability, &a.ident))
-        .collect();
+/// Output of the pre-CFG stages of the pipeline: the parsed and checked
+/// item plus its rewritten body, ready to be lowered. Splitting this out
+/// of [`expand`] lets `expand_debug` run the same stages one at a time
+/// and capture the intermediate artifacts.
+struct Prepared {
+    item: syn::ItemFn,
+    /// The body after yield hoisting and early-exit rewriting; this is
+    /// what lowering consumes (the original stays in `item`).
+    body: syn::Block,
+    macro_args: MacroArgs,
+    fingerprint: u64,
+    args: Vec<ArgVar>,
+    generics: syn::Generics,
+    ret_ty: syn::Type,
+}
 
-    // Without yields the body is a single transition, so no panic can
-    // occur between a state write and the return: Done doubles as the
-    // placeholder, Poisoned is omitted, and every resume is
-    // unconditionally an error. `Suspension::new` is the only place that
-    // branches on that condition; everything downstream only sees the
-    // consequences.
-    let n_yields = cfg.blocks.iter().filter(|b| b.resume_point).count();
-    let suspension = Suspension::new(n_yields);
+impl Prepared {
+    /// Parses the attribute arguments, checks the signature, and rewrites
+    /// the body (yield hoisting, early-exit rewriting).
+    fn parse(attr: TokenStream, item: syn::ItemFn) -> syn::Result<Self> {
+        // Hashed before the body is rewritten, from the exact source tokens.
+        let fingerprint = source_fingerprint(&attr, &item.sig, &item.block);
+        let macro_args: MacroArgs = syn::parse2(attr)?;
+        // A manual `fingerprint = "tag"` replaces the source hash: states
+        // persisted under equal tags are declared compatible by the user.
+        let fingerprint = match &macro_args.fingerprint {
+            Fingerprint::Manual(tag) => fnv1a(FNV_OFFSET_BASIS, tag.value().as_bytes()),
+            _ => fingerprint,
+        };
 
-    // The `fingerprint` flag threads a plain `__fp: u64` field through
-    // every data-carrying variant: initialized to FINGERPRINT at
-    // construction and on every transition, checked on entry to
-    // `start`/`resume` (the guard runs with `__fp` bound by the match).
-    let fp_guard = fp_enabled.then(|| {
-        let msg = format!("this state was created by a different version of `{name}`");
-        quote! {
-            if *__fp != Self::FINGERPRINT {
-                ::core::panic!(#msg);
+        check_signature(&item.sig)?;
+        let mut args = parse_args(&item.sig)?;
+        let generics = augment_generics(&item.sig, &mut args)?;
+
+        let ret_ty: syn::Type = match &item.sig.output {
+            syn::ReturnType::Default => syn::parse_quote!(()),
+            syn::ReturnType::Type(_, ty) => (**ty).clone(),
+        };
+        check_return_type(&ret_ty)?;
+
+        // Expression-position yields with a pure evaluation prefix become
+        // `let __tmpN = yield_!(..);` statements, so lowering only sees the
+        // native statement forms. Runs first: `?` must still be visible as
+        // `Expr::Try` (an effect ending the prefix).
+        let mut body = (*item.block).clone();
+        crate::hoist::hoist_yields(&mut body);
+        // Early `return e` and `e?` become completion transitions everywhere
+        // in the body, including inside opaque statements; the rewritten form
+        // only makes sense inside `__drive`, where `self` and `State` resolve.
+        rewrite_early_exits(&mut body, &ret_ty);
+
+        Ok(Prepared {
+            item,
+            body,
+            macro_args,
+            fingerprint,
+            args,
+            generics,
+            ret_ty,
+        })
+    }
+
+    /// Lowers the rewritten body to the simplified CFG.
+    fn lower(&self) -> syn::Result<Cfg> {
+        let arg_idents: Vec<syn::Ident> = self.args.iter().map(|a| a.ident.clone()).collect();
+        let arg_pats: Vec<(syn::Pat, syn::Ident)> = self
+            .args
+            .iter()
+            .filter_map(|a| a.pattern.clone().map(|p| (p, a.ident.clone())))
+            .collect();
+        lower::lower(&arg_idents, &arg_pats, &self.body)
+    }
+
+    fn analyze(&self, cfg: &Cfg) -> syn::Result<Analysis> {
+        let arg_infos: Vec<ArgInfo> = self.args.iter().map(ArgInfo::from).collect();
+        analyze_cfg::analyze(cfg, &arg_infos, &self.macro_args.resume_ty)
+    }
+
+    /// Turns the CFG and its analysis into the generated item tokens.
+    /// Infallible: every user error is diagnosed by the stages above.
+    fn codegen(&self, cfg: &Cfg, analysis: &Analysis) -> TokenStream {
+        let Prepared {
+            item,
+            macro_args,
+            fingerprint,
+            args,
+            generics,
+            ret_ty,
+            ..
+        } = self;
+        let fingerprint = *fingerprint;
+        let fp_enabled = macro_args.fingerprint.enabled();
+
+        // `#[derive(...)]` written below the coroutine attribute applies to
+        // the generated State enum; everything else (doc comments, allow,
+        // etc.) stays on the starter fn.
+        let (derive_attrs, fn_attrs): (Vec<&syn::Attribute>, Vec<&syn::Attribute>) =
+            item.attrs.iter().partition(|a| a.path().is_ident("derive"));
+        let vis = &item.vis;
+        let name = &item.sig.ident;
+        let yield_ty = &macro_args.yield_ty;
+        let resume_ty = &macro_args.resume_ty;
+
+        let arg_ident: Vec<&syn::Ident> = args.iter().map(|a| &a.ident).collect();
+        let arg_ty: Vec<&syn::Type> = args.iter().map(|a| &a.ty).collect();
+        let arg_pat: Vec<TokenStream> = args
+            .iter()
+            .map(|a| bind_pat(&a.mutability, &a.ident))
+            .collect();
+
+        // Without yields the body is a single transition, so no panic can
+        // occur between a state write and the return: Done doubles as the
+        // placeholder, Poisoned is omitted, and every resume is
+        // unconditionally an error. `Suspension::new` is the only place that
+        // branches on that condition; everything downstream only sees the
+        // consequences.
+        let n_yields = cfg.blocks.iter().filter(|b| b.resume_point).count();
+        let suspension = Suspension::new(n_yields);
+
+        // The `fingerprint` flag threads a plain `__fp: u64` field through
+        // every data-carrying variant: initialized to FINGERPRINT at
+        // construction and on every transition, checked on entry to
+        // `start`/`resume` (the guard runs with `__fp` bound by the match).
+        let fp_guard = fp_enabled.then(|| {
+            let msg = format!("this state was created by a different version of `{name}`");
+            quote! {
+                if *__fp != Self::FINGERPRINT {
+                    ::core::panic!(#msg);
+                }
             }
-        }
-    });
-    let fp_bind = fp_enabled.then(|| quote!(__fp,));
-    let fp_init = fp_enabled.then(|| quote!(__fp: #fingerprint,));
+        });
+        let fp_bind = fp_enabled.then(|| quote!(__fp,));
+        let fp_init = fp_enabled.then(|| quote!(__fp: #fingerprint,));
 
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-    let cx = ExpandCtx {
-        generics: &generics,
-        where_clause,
-        cfg: &cfg,
-        analysis: &analysis,
-        arg_ident: &arg_ident,
-        arg_ty: &arg_ty,
-        arg_pat: &arg_pat,
-        yield_ty,
-        ret_ty: &ret_ty,
-        resume_ty,
-        fp_guard: fp_guard.as_ref(),
-    };
+        let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+        let cx = ExpandCtx {
+            generics,
+            where_clause,
+            cfg,
+            analysis,
+            arg_ident: &arg_ident,
+            arg_ty: &arg_ty,
+            arg_pat: &arg_pat,
+            yield_ty,
+            ret_ty,
+            resume_ty,
+            fp_guard: fp_guard.as_ref(),
+        };
 
-    let StateEnum {
-        tokens: state_enum_tokens,
-        phantom_init,
-    } = build_state_enum(&cx, &derive_attrs, &suspension.poisoned_variant);
-    let range_iter_def = cfg
-        .bindings
-        .iter()
-        .any(|b| matches!(b.ty, TySource::RangeInclusiveIter(_)))
-        .then(|| range_inclusive_iter_def(&derive_attrs));
-    let resume_body = build_resume_dispatch(&cx, &suspension);
-    let drive_fn = build_drive_fn(&cx, &suspension.placeholder);
-    let fp_check_fn = fp_enabled.then(|| build_check_fingerprint(&cx));
+        let StateEnum {
+            tokens: state_enum_tokens,
+            phantom_init,
+        } = build_state_enum(&cx, &derive_attrs, &suspension.poisoned_variant);
+        let range_iter_def = cfg
+            .bindings
+            .iter()
+            .any(|b| matches!(b.ty, TySource::RangeInclusiveIter(_)))
+            .then(|| range_inclusive_iter_def(&derive_attrs));
+        let resume_body = build_resume_dispatch(&cx, &suspension);
+        let drive_fn = build_drive_fn(&cx, &suspension.placeholder);
+        let fp_check_fn = fp_enabled.then(|| build_check_fingerprint(&cx));
 
-    Ok(quote! {
+        quote! {
         #(#fn_attrs)*
         #vis fn #name #impl_generics (#(#arg_ident: #arg_ty),*) -> #name::State #ty_generics
         #where_clause
@@ -193,7 +253,8 @@ pub fn expand(attr: TokenStream, item: syn::ItemFn) -> syn::Result<TokenStream> 
                 #drive_fn
             }
         }
-    })
+        }
+    }
 }
 
 // === Codegen assembly ===
