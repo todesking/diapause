@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the playground as a self-contained static site in dist/.
 #
-# Usage: ./build.sh
+# Usage: ./build.sh [extra wasm-pack build args...]
+#   e.g. ./build.sh --no-opt   # skip wasm-opt when binaryen is unavailable
 #
 # Prerequisites:
 #   rustup target add wasm32-unknown-unknown
@@ -25,7 +26,7 @@ fi
 # wasm-pack output is an intermediate artifact; dist/ is the site.
 # --no-typescript / --no-pack: the site loads the ESM glue directly, so
 # .d.ts files and package.json would be dead weight.
-wasm-pack build --target web --release --no-typescript --no-pack --out-dir pkg
+wasm-pack build --target web --release --no-typescript --no-pack --out-dir pkg "$@"
 
 rm -rf dist
 mkdir -p dist/pkg

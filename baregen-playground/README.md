@@ -20,6 +20,14 @@ bundle, so no CDN or network access is needed at runtime.
 ./build.sh
 ```
 
+Extra arguments are forwarded to `wasm-pack build`. Notably, wasm-pack
+downloads `wasm-opt` (binaryen) from GitHub releases on first use; on a
+network where that download fails, skip the optimization pass with:
+
+```sh
+./build.sh --no-opt
+```
+
 This compiles the crate to wasm and assembles the complete site in
 `dist/`:
 
