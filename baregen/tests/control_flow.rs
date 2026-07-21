@@ -1,6 +1,10 @@
 //! Yields inside control flow (the v2 CFG pipeline): branches, loops,
 //! break/continue, nesting, and early return.
 
+// `let ... else` with a yield in the diverging block is a shape under
+// test; the macro-expanded state machine trips the lint on it.
+#![allow(clippy::diverging_sub_expression)]
+
 use baregen::{Coroutine, CoroutineState};
 
 #[baregen::coroutine(yield = u32, resume = u32)]
