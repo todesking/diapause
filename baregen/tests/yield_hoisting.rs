@@ -4,9 +4,8 @@
 //! statement, with the expression reading `__tmpN` instead.
 
 // `x = f(yield_!(..)) + x` deliberately exercises a plain assignment
-// with a yield in its RHS (assign_op_pattern), and `let ... else` with
-// a yielding scrutinee trips diverging_sub_expression once expanded.
-#![allow(clippy::assign_op_pattern, clippy::diverging_sub_expression)]
+// with a yield in its RHS (assign_op_pattern).
+#![allow(clippy::assign_op_pattern)]
 
 use baregen::{Coroutine, CoroutineState};
 

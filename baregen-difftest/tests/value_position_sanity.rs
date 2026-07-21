@@ -6,7 +6,6 @@
 // Bodies must stay identical between the coroutine and reference
 // worlds, so lint-driven rewrites are not applied here.
 #![allow(clippy::manual_is_multiple_of)]
-#![allow(clippy::diverging_sub_expression)]
 #![allow(clippy::large_enum_variant)]
 
 use baregen_difftest::{check_case, yield_};
