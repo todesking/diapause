@@ -980,7 +980,12 @@ fn yield_all_of_an_unknown_typed_variable_is_a_dedicated_error() {
 /// is destructured by `pat` at the entry block.
 fn analyze_pair_arg(pat: syn::Pat, block: &syn::Block) -> (Cfg, syn::Result<Analysis>) {
     let source = syn::Ident::new("__arg0", proc_macro2::Span::call_site());
-    let cfg = crate::lower::lower(&[source.clone()], &[(pat, source)], block).unwrap();
+    let cfg = crate::lower::lower(
+        std::slice::from_ref(&source),
+        &[(pat, source.clone())],
+        block,
+    )
+    .unwrap();
     let infos = [ArgInfo {
         mutability: None,
         ty: parse_quote!((u32, u32)),

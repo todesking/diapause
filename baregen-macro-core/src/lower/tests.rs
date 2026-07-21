@@ -1873,7 +1873,12 @@ fn arg_patterns_destructure_at_entry() {
     });
     let source = syn::Ident::new("__arg0", proc_macro2::Span::call_site());
     let pat: syn::Pat = parse_quote!((a, mut b));
-    let cfg = lower(&[source.clone()], &[(pat, source)], &block).unwrap();
+    let cfg = lower(
+        std::slice::from_ref(&source),
+        &[(pat, source.clone())],
+        &block,
+    )
+    .unwrap();
     let expected: syn::Stmt = parse_quote!(let (a, mut b) = __arg0;);
     assert_eq!(cfg.blocks[cfg.entry].stmts[0], expected);
     let a = binding(&cfg, "a");
