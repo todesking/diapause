@@ -38,8 +38,9 @@ struct ResumeBindingSpec {
 enum ResumeTarget {
     /// `yield_!(expr);` — the resume value is dropped.
     Discard,
-    /// `let x = yield_!(expr);` — a fresh binding.
-    Bind(ResumeBindingSpec),
+    /// `let x = yield_!(expr);` — a fresh binding. Boxed to keep the
+    /// enum small (`ResumeBindingSpec` embeds a `syn::Type`).
+    Bind(Box<ResumeBindingSpec>),
     /// `yield_all!`'s internal loop: the resume value re-defines the
     /// existing `__rv{k}` binding so it can be carried around the
     /// delegation loop's back edge without a reassignment (which the
@@ -672,11 +673,11 @@ impl Lowerer {
         };
         let binding = match pat {
             syn::Pat::Ident(pi) if pi.by_ref.is_none() && pi.subpat.is_none() => {
-                ResumeBindingSpec {
+                Box::new(ResumeBindingSpec {
                     ident: pi.ident.clone(),
                     mutability: pi.mutability,
                     ty,
-                }
+                })
             }
             other => {
                 return self.err(syn::Error::new_spanned(other, ERR_SIMPLE_BINDING));
