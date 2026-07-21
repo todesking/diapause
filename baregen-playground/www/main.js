@@ -113,6 +113,7 @@ const DEFAULT_EXAMPLE = 1; // For loop + resume values
 
 const el = {
   status: document.getElementById("status"),
+  editor: document.getElementById("editor"),
   source: document.getElementById("source"),
   examples: document.getElementById("examples"),
   highlightLayer: document.getElementById("highlight-layer"),
@@ -224,6 +225,18 @@ function rustHtml(code) {
 function renderSyntax(source) {
   // The trailing newline keeps the layer as tall as the textarea.
   el.syntaxContent.innerHTML = rustHtml(source) + "\n";
+  // Let the stacked (narrow) layout grow the editor with its content;
+  // reserve room for the textarea's horizontal scrollbar when lines
+  // overflow. The wide layout ignores this and fills the viewport.
+  // scrollHeight never reports less than the current height, so drop
+  // the height to the minimum first or the editor would never shrink.
+  el.editor.style.setProperty("--editor-content-height", "0px");
+  const scrollbar =
+    el.syntaxLayer.scrollWidth > el.syntaxLayer.clientWidth ? 20 : 0;
+  el.editor.style.setProperty(
+    "--editor-content-height",
+    `${el.syntaxLayer.scrollHeight + scrollbar}px`,
+  );
   syncHighlightScroll();
 }
 
