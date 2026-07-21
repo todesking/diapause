@@ -46,8 +46,12 @@ main {
 }
 
 @media (max-width: 900px) {
-  main { grid-template-columns: 1fr; grid-auto-rows: minmax(300px, 1fr); }
+  /* Stacked panes size independently: the output grows with its
+     content, the input keeps a fixed viewport share and scrolls. */
+  main { grid-template-columns: 1fr; grid-auto-rows: auto; }
   body { height: auto; }
+  #editor { height: 40vh; }
+  #input-pane { border-right: none; border-bottom: 1px solid var(--border); }
 }
 
 .pane {
