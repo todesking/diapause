@@ -1,0 +1,14 @@
+error[E0277]: the trait bound `String: From<()>` is not satisfied
+ --> tests/compile_fail/option_try_in_result_coroutine.rs:3:19
+  |
+3 |     let v: u32 = x?;
+  |                   ^ the trait `From<()>` is not implemented for `String`
+  |
+  = help: `String` implements trait `From<T>`:
+            From<&String>
+            From<&mut str>
+            From<&str>
+            From<Box<str>>
+            From<Cow<'_, str>>
+            From<char>
+  = note: required for `Result<u32, String>` to implement `diapause::FromResidual<()>`

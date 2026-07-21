@@ -1,8 +1,0 @@
-error[E0308]: mismatched types
-  --> tests/compile_fail/yield_all_yield_type_mismatch.rs:10:29
-   |
- 7 | #[baregen::coroutine(yield = u32)]
-   |                              --- expected due to this
-...
-10 |     let v: u32 = yield_all!(g);
-   |                             ^ expected `u32`, found `String`

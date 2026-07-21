@@ -1,17 +1,17 @@
-# baregen
+# diapause
 
 Coroutines/generators for stable Rust via code transformation — no
 `async`, no `Pin`, no allocation, no unsafe code.
 
-The `#[baregen::coroutine]` attribute rewrites a function into a state
+The `#[diapause::coroutine]` attribute rewrites a function into a state
 machine enum: the body is analyzed as a control-flow graph and each
 `yield_!` suspension point becomes an enum variant holding the live
 variables.
 
 ```rust
-use baregen::{Coroutine, CoroutineState};
+use diapause::{Coroutine, CoroutineState};
 
-#[baregen::coroutine(yield = u32, resume = u32)]
+#[diapause::coroutine(yield = u32, resume = u32)]
 fn running_total(n: u32) -> u32 {
     let mut sum: u32 = 0;
     for i in 0u32..n {
@@ -99,17 +99,17 @@ machinery: a coroutine suspended inside a delegation is still a plain
 enum value, holding the inner coroutine's state in place.
 
 ```rust
-use baregen::{Coroutine, CoroutineState};
+use diapause::{Coroutine, CoroutineState};
 use serde::{Deserialize, Serialize};
 
-#[baregen::coroutine(yield = u32, resume = u32)]
+#[diapause::coroutine(yield = u32, resume = u32)]
 #[derive(Serialize, Deserialize)]
 fn chunk(start: u32) -> u32 {
     let a = yield_!(start);
     start + a
 }
 
-#[baregen::coroutine(yield = u32, resume = u32)]
+#[diapause::coroutine(yield = u32, resume = u32)]
 #[derive(Serialize, Deserialize)]
 fn totals(n: u32) -> u32 {
     let sub: chunk::State = chunk(n); // bind with a type annotation
@@ -135,10 +135,10 @@ fn main() {
 ## Persisting a suspended coroutine
 
 ```rust
-use baregen::{Coroutine, CoroutineState};
+use diapause::{Coroutine, CoroutineState};
 use serde::{Deserialize, Serialize};
 
-#[baregen::coroutine(yield = u32)]
+#[diapause::coroutine(yield = u32)]
 #[derive(Serialize, Deserialize)]
 fn countdown(n: u32) -> u32 {
     let mut sum: u32 = 0;
@@ -186,10 +186,10 @@ Adding `fingerprint` to the attribute stamps every state with a hash of
 the coroutine's source and validates it before resuming:
 
 ```rust
-use baregen::{Coroutine, CoroutineState};
+use diapause::{Coroutine, CoroutineState};
 use serde::{Deserialize, Serialize};
 
-#[baregen::coroutine(yield = u32, fingerprint)]
+#[diapause::coroutine(yield = u32, fingerprint)]
 #[derive(Serialize, Deserialize)]
 fn countdown(n: u32) -> u32 {
     let mut sum: u32 = 0;
@@ -206,7 +206,7 @@ fn main() {
     let json = serde_json::to_string(&c).unwrap();
 
     let mut restored: countdown::State = serde_json::from_str(&json).unwrap();
-    // Err(baregen::FingerprintMismatch { .. }) if the state was
+    // Err(diapause::FingerprintMismatch { .. }) if the state was
     // persisted by a different version of `countdown`.
     restored.check_fingerprint().unwrap();
     assert_eq!(restored.resume(()), CoroutineState::Yielded(1));
@@ -221,7 +221,7 @@ fn main() {
   as a plain `__fp: u64` field — any derive (serde, `Clone`, ...)
   handles it as ordinary data — makes `start()`/`resume()` panic on a
   mismatch as a last line of defense, and generates
-  `fn check_fingerprint(&self) -> Result<(), baregen::FingerprintMismatch>`
+  `fn check_fingerprint(&self) -> Result<(), diapause::FingerprintMismatch>`
   for graceful validation right after deserializing.
 - Enabling the flag is itself a breaking change for previously
   persisted states: they lack the `__fp` field and fail to deserialize.
@@ -304,7 +304,7 @@ produces a dedicated compile error with the workaround in the message.
   state by name, so a binding declared in that same statement that
   shadows one of them is rejected — rename the inner binding.
 - **`?` is supported on `Result` and `Option` only.** It desugars to
-  calls on the internal `BareTry` / `BareFromResidual` traits (visible
+  calls on the internal `Try` / `FromResidual` traits (visible
   in error messages when `?` is used on other types); implementing them
   for custom types is not supported.
 - **A body whose every reachable path ends in an explicit `return`** —
@@ -321,7 +321,7 @@ produces a dedicated compile error with the workaround in the message.
 
 Crates such as [genawaiter](https://crates.io/crates/genawaiter)
 implement generators on stable Rust by driving an `async` block and
-smuggling values through a shared cell. baregen generates the state
+smuggling values through a shared cell. diapause generates the state
 machine itself instead:
 
 - no `Pin`: the generated states are plain enums and always `Unpin`;

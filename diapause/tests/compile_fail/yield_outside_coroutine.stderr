@@ -1,0 +1,7 @@
+error: yield_! may only be used inside a #[diapause::coroutine] function
+ --> tests/compile_fail/yield_outside_coroutine.rs:4:5
+  |
+4 |     yield_!(1);
+  |     ^^^^^^^^^^
+  |
+  = note: this error originates in the macro `yield_` (in Nightly builds, run with -Z macro-backtrace for more info)

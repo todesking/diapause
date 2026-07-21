@@ -9,59 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "baregen"
-version = "0.1.0"
-dependencies = [
- "baregen-macro",
- "serde",
- "serde_json",
- "trybuild",
-]
-
-[[package]]
-name = "baregen-difftest"
-version = "0.1.0"
-dependencies = [
- "baregen",
- "proptest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "baregen-macro"
-version = "0.1.0"
-dependencies = [
- "baregen-macro-core",
- "proc-macro2",
- "syn",
-]
-
-[[package]]
-name = "baregen-macro-core"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "baregen-playground"
-version = "0.1.0"
-dependencies = [
- "baregen-macro-core",
- "js-sys",
- "prettyplease",
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "syn",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -93,6 +40,59 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "diapause"
+version = "0.1.0"
+dependencies = [
+ "diapause-macro",
+ "serde",
+ "serde_json",
+ "trybuild",
+]
+
+[[package]]
+name = "diapause-difftest"
+version = "0.1.0"
+dependencies = [
+ "diapause",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "diapause-macro"
+version = "0.1.0"
+dependencies = [
+ "diapause-macro-core",
+ "proc-macro2",
+ "syn",
+]
+
+[[package]]
+name = "diapause-macro-core"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "diapause-playground"
+version = "0.1.0"
+dependencies = [
+ "diapause-macro-core",
+ "js-sys",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "serde_json",
+ "syn",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "equivalent"

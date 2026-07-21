@@ -1,0 +1,12 @@
+[package]
+name = "diapause-macro"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+diapause-macro-core = { path = "../diapause-macro-core" }
+syn = { version = "2", features = ["full"] }
+proc-macro2 = "1"

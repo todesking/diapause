@@ -1,11 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
-    "baregen",
-    "baregen-difftest",
-    "baregen-macro",
-    "baregen-macro-core",
-    "baregen-playground",
+    "diapause",
+    "diapause-difftest",
+    "diapause-macro",
+    "diapause-macro-core",
+    "diapause-playground",
 ]
 
 [workspace.package]
