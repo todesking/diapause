@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>baregen playground</title>
+  <link rel="stylesheet" href="vendor/highlight/github.min.css">
   <link rel="stylesheet" href="style.css">
   <script type="module" src="main.js"></script>
 </head>
@@ -22,11 +23,18 @@
 
   <main>
     <section class="pane" id="input-pane" aria-label="Input">
-      <h2>Input</h2>
+      <div class="pane-header">
+        <h2>Input</h2>
+        <label for="examples">Example</label>
+        <select id="examples" aria-label="Load an example"></select>
+      </div>
       <div id="editor">
-        <!-- Mirrors the textarea text so error ranges can be painted
-             behind it; its own text is transparent. -->
+        <!-- Two mirrors of the textarea text stacked under it: the
+             error layer paints range backgrounds, the syntax layer
+             paints colored tokens. The textarea's own text is
+             transparent; only its caret and selection show. -->
         <pre id="highlight-layer" aria-hidden="true"><code id="highlight-content"></code></pre>
+        <pre id="syntax-layer" aria-hidden="true"><code id="syntax-content"></code></pre>
         <textarea id="source" spellcheck="false" autocomplete="off"
                   autocapitalize="off" wrap="off"
                   aria-label="Source code"></textarea>

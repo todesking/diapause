@@ -6,10 +6,30 @@
 //   vendor/  self-contained @viz-js/viz ESM bundle
 
 import { instance as vizInstance } from "./vendor/viz.js";
+import hljs from "./vendor/highlight/core.min.js";
+import rust from "./vendor/highlight/rust.min.js";
+
+hljs.registerLanguage("rust", rust);
 
 const DEBOUNCE_MS = 250;
 
-const SAMPLE = `#[baregen::coroutine(yield = u32, resume = u32)]
+// Selectable inputs, ordered simplest first. All are lifted from the
+// baregen test suite, so they are known-good transforms; helpers they
+// call (parse, combine, inner_sum, ...) are irrelevant to the macro,
+// which never resolves names outside the function.
+const EXAMPLES = [
+  {
+    name: "Basic yields",
+    code: `#[baregen::coroutine(yield = u32)]
+fn counter() {
+    yield_!(1);
+    yield_!(2);
+}
+`,
+  },
+  {
+    name: "For loop + resume values",
+    code: `#[baregen::coroutine(yield = u32, resume = u32)]
 fn running_total(n: u32) -> u32 {
     let mut sum: u32 = 0;
     for i in 0u32..n {
@@ -18,13 +38,87 @@ fn running_total(n: u32) -> u32 {
     }
     sum
 }
-`;
+`,
+  },
+  {
+    name: "Match arms",
+    code: `#[baregen::coroutine(yield = u32, resume = u32)]
+fn match_yield(x: u32) -> u32 {
+    let mut out: u32 = 0;
+    match x {
+        0 => {
+            let r = yield_!(10);
+            out += r;
+        }
+        _ => {
+            let r = yield_!(20);
+            out += r * 2;
+        }
+    }
+    out
+}
+`,
+  },
+  {
+    name: "Loop with break",
+    code: `#[baregen::coroutine(yield = u32, resume = bool)]
+fn until_stop() -> u32 {
+    let mut count: u32 = 0;
+    loop {
+        let stop = yield_!(count);
+        if stop {
+            yield_!(999);
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+`,
+  },
+  {
+    name: "? operator",
+    code: `#[baregen::coroutine(yield = u32)]
+fn sum_two(a: &'static str, b: &'static str) -> Result<u32, ParseError> {
+    let x: u32 = parse(a)?;
+    yield_!(x);
+    let y: u32 = parse(b)?;
+    Ok(x + y)
+}
+`,
+  },
+  {
+    name: "yield_all! delegation",
+    code: `#[baregen::coroutine(yield = u32, resume = u32)]
+fn outer(n: u32) -> u32 {
+    let before = yield_!(n);
+    let g: inner_sum::State = inner_sum(before);
+    let sub: u32 = yield_all!(g);
+    yield_!(sub);
+    sub + n
+}
+`,
+  },
+  {
+    name: "Expression-position yields",
+    code: `#[baregen::coroutine(yield = u32, resume = u32)]
+fn call_args(a: u32) -> u32 {
+    combine(yield_!(a), yield_!(a + 1), seven(), a)
+}
+`,
+  },
+];
+
+const DEFAULT_EXAMPLE = 1; // For loop + resume values
 
 const el = {
   status: document.getElementById("status"),
   source: document.getElementById("source"),
+  examples: document.getElementById("examples"),
   highlightLayer: document.getElementById("highlight-layer"),
   highlightContent: document.getElementById("highlight-content"),
+  syntaxLayer: document.getElementById("syntax-layer"),
+  syntaxContent: document.getElementById("syntax-content"),
   errors: document.getElementById("errors"),
   expanded: document.getElementById("expanded"),
   cfgSimplified: document.getElementById("view-cfg-simplified"),
@@ -107,8 +201,30 @@ function renderHighlights(source, errors) {
 }
 
 function syncHighlightScroll() {
-  el.highlightLayer.scrollTop = el.source.scrollTop;
-  el.highlightLayer.scrollLeft = el.source.scrollLeft;
+  for (const layer of [el.highlightLayer, el.syntaxLayer]) {
+    layer.scrollTop = el.source.scrollTop;
+    layer.scrollLeft = el.source.scrollLeft;
+  }
+}
+
+// --- Syntax highlighting ------------------------------------------------
+
+/** Highlighted `code` as HTML; falls back to escaped plain text. */
+function rustHtml(code) {
+  try {
+    return hljs.highlight(code, { language: "rust" }).value;
+  } catch (err) {
+    console.error(err);
+    const div = document.createElement("div");
+    div.textContent = code;
+    return div.innerHTML;
+  }
+}
+
+function renderSyntax(source) {
+  // The trailing newline keeps the layer as tall as the textarea.
+  el.syntaxContent.innerHTML = rustHtml(source) + "\n";
+  syncHighlightScroll();
 }
 
 el.source.addEventListener("scroll", syncHighlightScroll);
@@ -193,14 +309,16 @@ async function run(transform) {
   const source = el.source.value;
   const report = transform(source);
   const current = ++generation;
+  renderSyntax(source);
   renderHighlights(source, report.errors);
   renderErrorList(source, report.errors);
-  el.expanded.textContent =
+  el.expanded.innerHTML = rustHtml(
     report.expanded !== ""
       ? report.expanded
       : report.errors.length > 0
         ? "// expansion failed; see errors"
-        : "";
+        : "",
+  );
   // Graphviz rendering is async; drop results that a newer input has
   // superseded.
   const [simplified, raw] = await Promise.all([
@@ -213,7 +331,16 @@ async function run(transform) {
 }
 
 async function main() {
-  el.source.value = SAMPLE;
+  for (const [i, example] of EXAMPLES.entries()) {
+    const option = document.createElement("option");
+    option.value = String(i);
+    option.textContent = example.name;
+    el.examples.append(option);
+  }
+  el.examples.value = String(DEFAULT_EXAMPLE);
+  el.source.value = EXAMPLES[DEFAULT_EXAMPLE].code;
+  renderSyntax(el.source.value);
+
   const transform = await loadTransform();
   if (transform == null) return;
 
@@ -221,6 +348,16 @@ async function main() {
   el.source.addEventListener("input", () => {
     clearTimeout(timer);
     timer = setTimeout(() => run(transform), DEBOUNCE_MS);
+  });
+
+  el.examples.addEventListener("change", () => {
+    const example = EXAMPLES[Number(el.examples.value)];
+    if (!example) return;
+    clearTimeout(timer);
+    el.source.value = example.code;
+    el.source.scrollTop = 0;
+    el.source.scrollLeft = 0;
+    run(transform);
   });
 
   await run(transform);

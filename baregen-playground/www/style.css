@@ -69,6 +69,27 @@ main {
   border-bottom: 1px solid var(--border);
 }
 
+.pane-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.pane-header h2 { border-bottom: none; flex: 1; }
+
+.pane-header label { font-size: 0.8rem; color: #666; }
+
+.pane-header select {
+  margin-right: 1rem;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.15rem 0.3rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+}
+
 /* --- Editor with an error-highlight layer behind the textarea --- */
 
 #editor {
@@ -92,19 +113,25 @@ main {
   tab-size: 4;
 }
 
-#highlight-layer {
+#highlight-layer,
+#syntax-layer {
   position: absolute;
   inset: 0;
   overflow: hidden;
-  color: transparent;
   pointer-events: none;
 }
+
+/* Error layer: invisible text, only range backgrounds. */
+#highlight-layer { color: transparent; }
 
 #highlight-layer mark {
   color: transparent;
   background: var(--error-bg);
   border-radius: 2px;
 }
+
+/* Syntax layer: the visible text (hljs token colors on top). */
+#syntax-layer { color: #222; background: transparent; }
 
 #source {
   position: absolute;
@@ -113,9 +140,13 @@ main {
   height: 100%;
   resize: none;
   background: transparent;
-  color: #222;
+  /* Text is drawn by the syntax layer; keep the caret and selection. */
+  color: transparent;
+  caret-color: #222;
   outline: none;
 }
+
+#source::selection { background: rgba(122, 75, 214, 0.25); }
 
 #source:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
 
