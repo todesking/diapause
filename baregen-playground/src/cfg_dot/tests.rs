@@ -39,7 +39,8 @@ fn if_body() {
         pre,
         r#"digraph cfg {
     rankdir=TB;
-    node [shape=box, fontname="monospace"];
+    node [shape=box, fontname="Courier"];
+    edge [fontname="Courier"];
     b0 [label="b0 (entry)\lif n > 0\l"];
     b1 [label="b1\lreturn n\l"];
     b2 [label="b2\lyield n\l"];
@@ -55,7 +56,8 @@ fn if_body() {
         post,
         r#"digraph cfg {
     rankdir=TB;
-    node [shape=box, fontname="monospace"];
+    node [shape=box, fontname="Courier"];
+    edge [fontname="Courier"];
     b0 [label="b0 [Start] (entry)\lif n > 0\l"];
     b1 [label="b1 [B1]\lreturn n\l"];
     b2 [label="b2 (inline)\lyield n\l", style=dashed];
@@ -87,14 +89,15 @@ fn match_body() {
         pre,
         r#"digraph cfg {
     rankdir=TB;
-    node [shape=box, fontname="monospace"];
+    node [shape=box, fontname="Courier"];
+    edge [fontname="Courier"];
     b0 [label="b0 (entry)\lmatch n\l"];
     b1 [label="b1\lreturn ()\l"];
     b2 [label="b2\lyield 0u32\l"];
     b3 [label="b3 (resume)\lreturn __tmp0\l", peripheries=2];
     b4 [label="b4\lyield k\l"];
     b5 [label="b5 (resume)\lreturn __tmp1\l", peripheries=2];
-    b6 [label="b6\lreturn { }\l"];
+    b6 [label="b6\lreturn {}\l"];
     b0 -> b2 [label="0"];
     b0 -> b4 [label="k if k > 10"];
     b0 -> b6 [label="_"];
@@ -107,13 +110,14 @@ fn match_body() {
         post,
         r#"digraph cfg {
     rankdir=TB;
-    node [shape=box, fontname="monospace"];
+    node [shape=box, fontname="Courier"];
+    edge [fontname="Courier"];
     b0 [label="b0 [Start] (entry)\lmatch n\l"];
     b1 [label="b1 (inline)\lyield 0u32\l", style=dashed];
     b2 [label="b2 [S1] (resume)\lreturn __tmp0\l", peripheries=2];
     b3 [label="b3 (inline)\lyield k\l", style=dashed];
     b4 [label="b4 [S2] (resume)\lreturn __tmp1\l", peripheries=2];
-    b5 [label="b5 (inline)\lreturn { }\l", style=dashed];
+    b5 [label="b5 (inline)\lreturn {}\l", style=dashed];
     b0 -> b1 [label="0"];
     b0 -> b3 [label="k if k > 10"];
     b0 -> b5 [label="_"];
@@ -148,11 +152,12 @@ fn loop_body_with_opaque_break() {
         pre,
         r#"digraph cfg {
     rankdir=TB;
-    node [shape=box, fontname="monospace"];
-    b0 [label="b0 (entry)\llet mut i = 0u32 ;\l"];
+    node [shape=box, fontname="Courier"];
+    edge [fontname="Courier"];
+    b0 [label="b0 (entry)\llet mut i = 0u32;\l"];
     b1 [label="b1\lyield i\l"];
     b2 [label="b2\lreturn i\l"];
-    b3 [label="b3 (resume)\li += 1 ;\lif i > 3 { __baregen_jump ! (0) ; }\l", peripheries=2];
+    b3 [label="b3 (resume)\li += 1;\lif i > 3 { __baregen_jump!(0); }\l", peripheries=2];
     b0 -> b1;
     b1 -> b3 [label="resume"];
     b3 -> b1;
@@ -164,11 +169,12 @@ fn loop_body_with_opaque_break() {
         post,
         r#"digraph cfg {
     rankdir=TB;
-    node [shape=box, fontname="monospace"];
-    b0 [label="b0 [Start] (entry)\llet mut i = 0u32 ;\l"];
+    node [shape=box, fontname="Courier"];
+    edge [fontname="Courier"];
+    b0 [label="b0 [Start] (entry)\llet mut i = 0u32;\l"];
     b1 [label="b1 [B1]\lyield i\l"];
     b2 [label="b2 [B2]\lreturn i\l"];
-    b3 [label="b3 [S1] (resume)\li += 1 ;\lif i > 3 { __baregen_jump ! (0) ; }\l", peripheries=2];
+    b3 [label="b3 [S1] (resume)\li += 1;\lif i > 3 { __baregen_jump!(0); }\l", peripheries=2];
     b0 -> b1;
     b1 -> b3 [label="resume"];
     b3 -> b1;
@@ -200,10 +206,11 @@ fn tail_loop_with_completing_break() {
         post,
         r#"digraph cfg {
     rankdir=TB;
-    node [shape=box, fontname="monospace"];
+    node [shape=box, fontname="Courier"];
+    edge [fontname="Courier"];
     b0 [label="b0 [Start] (entry)\l"];
     b1 [label="b1 [B1]\lyield 1u32\l"];
-    b2 [label="b2 [S1] (resume)\lif f () { __baregen_jump ! (0 , 42) ; }\l", peripheries=2];
+    b2 [label="b2 [S1] (resume)\lif f() { __baregen_jump!(0, 42); }\l", peripheries=2];
     complete [shape=ellipse, label="complete"];
     b0 -> b1;
     b1 -> b2 [label="resume"];
@@ -230,8 +237,9 @@ fn for_body() {
         pre,
         r#"digraph cfg {
     rankdir=TB;
-    node [shape=box, fontname="monospace"];
-    b0 [label="b0 (entry)\llet mut __iter0 = :: core :: iter :: IntoIterator :: into_it…\l"];
+    node [shape=box, fontname="Courier"];
+    edge [fontname="Courier"];
+    b0 [label="b0 (entry)\llet mut __iter0 = ::core::iter::IntoIterator::into_iter(v);\l"];
     b1 [label="b1\l__iter0.next()\l"];
     b2 [label="b2\lyield x\l"];
     b3 [label="b3\lreturn ()\l"];
@@ -248,8 +256,9 @@ fn for_body() {
         post,
         r#"digraph cfg {
     rankdir=TB;
-    node [shape=box, fontname="monospace"];
-    b0 [label="b0 [Start] (entry)\llet mut __iter0 = :: core :: iter :: IntoIterator :: into_it…\l"];
+    node [shape=box, fontname="Courier"];
+    edge [fontname="Courier"];
+    b0 [label="b0 [Start] (entry)\llet mut __iter0 = ::core::iter::IntoIterator::into_iter(v);\l"];
     b1 [label="b1 [B1]\l__iter0.next()\l"];
     b2 [label="b2 (inline)\lyield x\l", style=dashed];
     b3 [label="b3 (inline)\lreturn ()\l", style=dashed];
@@ -279,14 +288,15 @@ fn yield_all_body() {
         pre,
         r#"digraph cfg {
     rankdir=TB;
-    node [shape=box, fontname="monospace"];
+    node [shape=box, fontname="Courier"];
+    edge [fontname="Courier"];
     b0 [label="b0 (entry)\lyield 0u32\l"];
-    b1 [label="b1 (resume)\llet mut __dg0 = sub ;\lmatch :: baregen :: Coroutine :: start (& mut __dg0)\l", peripheries=2];
+    b1 [label="b1 (resume)\llet mut __dg0 = sub;\lmatch ::baregen::Coroutine::start(&mut __dg0)\l", peripheries=2];
     b2 [label="b2\lreturn ()\l"];
-    b3 [label="b3\l{ }\l"];
+    b3 [label="b3\l{}\l"];
     b4 [label="b4\lyield __y0\l"];
     b5 [label="b5 (resume)\l", peripheries=2];
-    b6 [label="b6\lmatch :: baregen :: Coroutine :: resume (& mut __dg0 , __rv0)\l"];
+    b6 [label="b6\lmatch ::baregen::Coroutine::resume(&mut __dg0, __rv0)\l"];
     b7 [label="b7\l"];
     b8 [label="b8\l"];
     b9 [label="b9\l"];
@@ -294,13 +304,13 @@ fn yield_all_body() {
     b11 [label="b11\lyield __y0\l"];
     b12 [label="b12 (resume)\l", peripheries=2];
     b0 -> b1 [label="resume"];
-    b1 -> b3 [label=":: baregen :: CoroutineState :: Complete (_)"];
-    b1 -> b4 [label=":: baregen :: CoroutineState :: Yielded (__y0)"];
+    b1 -> b3 [label="::baregen::CoroutineState::Complete(_)"];
+    b1 -> b4 [label="::baregen::CoroutineState::Yielded(__y0)"];
     b3 -> b2;
     b4 -> b5 [label="resume __rv0"];
     b5 -> b6;
-    b6 -> b9 [label=":: baregen :: CoroutineState :: Complete (_)"];
-    b6 -> b11 [label=":: baregen :: CoroutineState :: Yielded (__y0)"];
+    b6 -> b9 [label="::baregen::CoroutineState::Complete(_)"];
+    b6 -> b11 [label="::baregen::CoroutineState::Yielded(__y0)"];
     b7 -> b2;
     b8 -> b6;
     b9 -> b7;
@@ -314,25 +324,26 @@ fn yield_all_body() {
         post,
         r#"digraph cfg {
     rankdir=TB;
-    node [shape=box, fontname="monospace"];
+    node [shape=box, fontname="Courier"];
+    edge [fontname="Courier"];
     b0 [label="b0 [Start] (entry)\lyield 0u32\l"];
-    b1 [label="b1 [S1] (resume)\llet mut __dg0 = sub ;\lmatch :: baregen :: Coroutine :: start (& mut __dg0)\l", peripheries=2];
+    b1 [label="b1 [S1] (resume)\llet mut __dg0 = sub;\lmatch ::baregen::Coroutine::start(&mut __dg0)\l", peripheries=2];
     b2 [label="b2 [B2]\lreturn ()\l"];
-    b3 [label="b3 (inline)\l{ }\l", style=dashed];
+    b3 [label="b3 (inline)\l{}\l", style=dashed];
     b4 [label="b4 (inline)\lyield __y0\l", style=dashed];
     b5 [label="b5 [S2] (resume)\l", peripheries=2];
-    b6 [label="b6 [B1]\lmatch :: baregen :: Coroutine :: resume (& mut __dg0 , __rv0)\l"];
+    b6 [label="b6 [B1]\lmatch ::baregen::Coroutine::resume(&mut __dg0, __rv0)\l"];
     b7 [label="b7 (inline)\l", style=dashed];
     b8 [label="b8 (inline)\lyield __y0\l", style=dashed];
     b9 [label="b9 [S3] (resume)\l", peripheries=2];
     b0 -> b1 [label="resume"];
-    b1 -> b3 [label=":: baregen :: CoroutineState :: Complete (_)"];
-    b1 -> b4 [label=":: baregen :: CoroutineState :: Yielded (__y0)"];
+    b1 -> b3 [label="::baregen::CoroutineState::Complete(_)"];
+    b1 -> b4 [label="::baregen::CoroutineState::Yielded(__y0)"];
     b3 -> b2;
     b4 -> b5 [label="resume __rv0"];
     b5 -> b6;
-    b6 -> b7 [label=":: baregen :: CoroutineState :: Complete (_)"];
-    b6 -> b8 [label=":: baregen :: CoroutineState :: Yielded (__y0)"];
+    b6 -> b7 [label="::baregen::CoroutineState::Complete(_)"];
+    b6 -> b8 [label="::baregen::CoroutineState::Yielded(__y0)"];
     b7 -> b2;
     b8 -> b9 [label="resume __rv0"];
     b9 -> b6;
@@ -353,5 +364,5 @@ fn escapes_quotes_in_labels() {
             }
         },
     );
-    assert!(post.contains(r#"let s = \"a \\\"quoted\\\" str\" ;"#));
+    assert!(post.contains(r#"let s = \"a \\\"quoted\\\" str\";"#));
 }

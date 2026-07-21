@@ -6,7 +6,7 @@
 
 use std::fmt::Write;
 
-use quote::ToTokens;
+use quote::{ToTokens, quote};
 
 use baregen_macro_core::analyze_cfg::Analysis;
 use baregen_macro_core::cfg::{Cfg, OpaqueJumpKind, Terminator};
@@ -33,7 +33,12 @@ pub fn cfg_to_dot(cfg: &Cfg, analysis: Option<&Analysis>) -> String {
     let mut out = String::new();
     out.push_str("digraph cfg {\n");
     out.push_str("    rankdir=TB;\n");
-    out.push_str("    node [shape=box, fontname=\"monospace\"];\n");
+    // Courier, not "monospace": Graphviz has built-in metrics for the
+    // core PostScript fonts, so node boxes are sized for the exact
+    // glyph widths the browser will use; with an unknown font name the
+    // renderer guesses and labels overflow their boxes.
+    out.push_str("    node [shape=box, fontname=\"Courier\"];\n");
+    out.push_str("    edge [fontname=\"Courier\"];\n");
     for (i, _) in cfg.blocks.iter().enumerate() {
         write_node(&mut out, cfg, analysis, i);
     }
@@ -109,7 +114,7 @@ fn write_edges(out: &mut String, cfg: &Cfg, i: usize) {
         }
         Terminator::Match { arms, .. } => {
             for arm in arms {
-                let mut label = tokens_line(&arm.pat);
+                let mut label = pat_line(&arm.pat);
                 if let Some(guard) = &arm.guard {
                     let _ = write!(label, " if {}", tokens_line(guard));
                 }
@@ -130,7 +135,7 @@ fn write_edges(out: &mut String, cfg: &Cfg, i: usize) {
         Terminator::IterNext {
             pat, body, exit, ..
         } => {
-            edge(out, i, *body, &format!("Some({})", tokens_line(pat)), false);
+            edge(out, i, *body, &format!("Some({})", pat_line(pat)), false);
             edge(out, i, *exit, "None", false);
         }
         Terminator::Return(_) => {}
@@ -176,10 +181,75 @@ fn has_complete_jump(cfg: &Cfg) -> bool {
         .any(|&j| matches!(cfg.opaque_jumps[j].kind, OpaqueJumpKind::Complete))
 }
 
-/// One display line for a syntax node: its token string, elided past
-/// [`MAX_LINE_CHARS`].
+/// One display line for a statement or expression: prettyplease output
+/// (so the code reads with source-like spacing rather than the raw
+/// token string's space-between-every-token), collapsed to a single
+/// line and elided past [`MAX_LINE_CHARS`].
 fn tokens_line<T: ToTokens>(node: &T) -> String {
-    let s = node.to_token_stream().to_string();
+    let line = in_fn_body(node).unwrap_or_else(|| node.to_token_stream().to_string());
+    elide(line)
+}
+
+/// Like [`tokens_line`], but for patterns, which cannot stand alone in
+/// a fn body and are formatted behind a `match` arm instead.
+fn pat_line(pat: &syn::Pat) -> String {
+    let formatted = (|| {
+        let file: syn::File = syn::parse2(quote! { fn f() { match x { #pat => {} } } }).ok()?;
+        let flat = collapse(&prettyplease::unparse(&file));
+        let s = flat.strip_prefix("fn f() { match x { ")?;
+        let s = s
+            .strip_suffix(" => {} } }")
+            .or_else(|| s.strip_suffix(" => {}, } }"))?;
+        Some(s.to_string())
+    })();
+    elide(formatted.unwrap_or_else(|| pat.to_token_stream().to_string()))
+}
+
+/// Formats `node` by wrapping it as the body of a dummy fn, running
+/// prettyplease, and stripping the wrapper again. `None` when the
+/// wrapped tokens do not reparse (the caller then falls back to the
+/// raw token string).
+fn in_fn_body<T: ToTokens>(node: &T) -> Option<String> {
+    let tokens = node.to_token_stream();
+    let file: syn::File = syn::parse2(quote! { fn f() { #tokens } }).ok()?;
+    let flat = collapse(&prettyplease::unparse(&file));
+    Some(
+        flat.strip_prefix("fn f() { ")?
+            .strip_suffix(" }")?
+            .to_string(),
+    )
+}
+
+/// Joins prettyplease output into one line: lines are trimmed and
+/// space-separated, except that no space follows an opening `(`/`[` or
+/// precedes a closing `)`/`]`/`>` or a leading `.` (method chains),
+/// and a trailing comma is dropped right before such a closer.
+fn collapse(pretty: &str) -> String {
+    let mut out = String::new();
+    for line in pretty.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if out.is_empty() {
+            out.push_str(trimmed);
+            continue;
+        }
+        let closes = trimmed.starts_with([')', ']', '>']);
+        if closes && out.ends_with(',') {
+            out.pop();
+        }
+        let opens = out.ends_with(['(', '[']);
+        if !(opens || closes || trimmed.starts_with('.')) {
+            out.push(' ');
+        }
+        out.push_str(trimmed);
+    }
+    out
+}
+
+/// Elides `s` past [`MAX_LINE_CHARS`].
+fn elide(s: String) -> String {
     let mut chars = s.chars();
     let head: String = chars.by_ref().take(MAX_LINE_CHARS).collect();
     if chars.next().is_some() {

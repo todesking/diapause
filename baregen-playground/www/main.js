@@ -284,22 +284,30 @@ function scrollLineIntoView(line) {
 
 const vizPromise = vizInstance();
 
-/** Renders `dot` to an element to place in a CFG view (never throws). */
+/**
+ * Renders `dot` to the elements to place in a CFG view (never throws).
+ * Alongside the SVG, the DOT source rides along in a hidden <pre> so it
+ * can be grabbed from the element inspector when debugging the export.
+ */
 async function renderCfg(dot, emptyMessage) {
   if (dot == null) {
     const p = document.createElement("p");
     p.className = "placeholder";
     p.textContent = emptyMessage;
-    return p;
+    return [p];
   }
+  const source = document.createElement("pre");
+  source.className = "cfg-dot-source";
+  source.hidden = true;
+  source.textContent = dot;
   try {
     const viz = await vizPromise;
-    return viz.renderSVGElement(dot);
+    return [viz.renderSVGElement(dot), source];
   } catch (err) {
     const failure = document.createElement("div");
     failure.className = "render-error";
     failure.textContent = `Graphviz rendering failed: ${err}\n\n${dot}`;
-    return failure;
+    return [failure];
   }
 }
 
@@ -343,8 +351,8 @@ async function run(transform) {
     renderCfg(report.cfg_dot_raw, "No CFG (lowering failed)."),
   ]);
   if (current !== generation) return;
-  el.cfgSimplified.replaceChildren(simplified);
-  el.cfgRaw.replaceChildren(raw);
+  el.cfgSimplified.replaceChildren(...simplified);
+  el.cfgRaw.replaceChildren(...raw);
 }
 
 async function main() {
