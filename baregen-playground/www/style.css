@@ -45,21 +45,6 @@ main {
   grid-template-columns: 1fr 1fr;
 }
 
-@media (max-width: 900px) {
-  /* Stacked panes size independently: the output grows with its
-     content, the input keeps a fixed viewport share and scrolls. */
-  main { grid-template-columns: 1fr; grid-auto-rows: auto; }
-  body { height: auto; }
-  /* --editor-content-height is measured off the syntax layer in JS.
-     flex: none, or the base rule's flex-basis: 0 would override the
-     height and pin the editor to its min-height. */
-  #editor {
-    flex: none;
-    height: max(8rem, var(--editor-content-height, 40vh));
-  }
-  #input-pane { border-right: none; border-bottom: 1px solid var(--border); }
-}
-
 .pane {
   min-width: 0;
   min-height: 0;
@@ -235,4 +220,23 @@ main {
   font-family: var(--mono);
   font-size: 12px;
   white-space: pre-wrap;
+}
+
+/* --- Stacked layout (narrow screens) --- */
+/* Kept last: these override same-specificity base rules above, which
+   would otherwise win by source order. */
+
+@media (max-width: 900px) {
+  /* Stacked panes size independently: the output grows with its
+     content, the input grows with the typed code. */
+  main { grid-template-columns: 1fr; grid-auto-rows: auto; }
+  body { height: auto; }
+  /* --editor-content-height is measured off the syntax layer in JS.
+     flex: none, or the base rule's flex-basis: 0 would override the
+     height and pin the editor to its min-height. */
+  #editor {
+    flex: none;
+    height: max(8rem, var(--editor-content-height, 40vh));
+  }
+  #input-pane { border-right: none; border-bottom: 1px solid var(--border); }
 }
