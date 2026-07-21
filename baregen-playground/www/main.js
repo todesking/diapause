@@ -11,7 +11,11 @@ import rust from "./vendor/highlight/rust.min.js";
 
 hljs.registerLanguage("rust", rust);
 
-const DEBOUNCE_MS = 250;
+// Applies only to the transform + CFG/error rendering; the syntax
+// layer repaints on every keystroke, since the textarea's own text is
+// transparent and typing would otherwise be invisible until the
+// debounce fires.
+const DEBOUNCE_MS = 120;
 
 // Selectable inputs, ordered simplest first. All are lifted from the
 // baregen test suite, so they are known-good transforms; helpers they
@@ -353,6 +357,9 @@ async function main() {
   el.examples.value = String(DEFAULT_EXAMPLE);
   el.source.value = EXAMPLES[DEFAULT_EXAMPLE].code;
   renderSyntax(el.source.value);
+  // Registered before the wasm load so typing stays visible (the
+  // textarea's own text is transparent) even if the load fails.
+  el.source.addEventListener("input", () => renderSyntax(el.source.value));
 
   const transform = await loadTransform();
   if (transform == null) return;
