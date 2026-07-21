@@ -798,7 +798,7 @@ impl Lowerer {
         // open here). Invalid, non-diverging code reaches the
         // `unreachable!` at run time instead of failing to compile.
         if !self.is_current_terminated() {
-            self.terminate(Terminator::Return(syn::parse_quote_spanned!(
+            self.terminate(Terminator::Unreachable(syn::parse_quote_spanned!(
                 else_token.span() =>
                     ::core::unreachable!("the `else` block of `let ... else` must diverge")
             )));

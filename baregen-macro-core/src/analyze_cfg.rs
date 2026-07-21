@@ -940,7 +940,7 @@ fn terminator_exprs(t: &Terminator) -> Vec<&syn::Expr> {
             .collect(),
         Terminator::Yield { value, .. } => vec![value],
         Terminator::IterNext { .. } => Vec::new(),
-        Terminator::Return(e) => vec![e],
+        Terminator::Return(e) | Terminator::Unreachable(e) => vec![e],
     }
 }
 

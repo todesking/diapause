@@ -484,7 +484,7 @@ fn let_else_becomes_a_refutable_match() {
     };
     let resume = &cfg.blocks[next];
     assert_eq!(resume.stmts.len(), 1, "the rewritten `return` stays opaque");
-    assert!(matches!(resume.terminator, Terminator::Return(_)));
+    assert!(matches!(resume.terminator, Terminator::Unreachable(_)));
 }
 
 #[test]
@@ -505,8 +505,7 @@ fn let_else_break_terminates_the_else_arm() {
     assert!(
         cfg.blocks
             .iter()
-            .all(|b| !matches!(&b.terminator, Terminator::Return(e)
-                if quote::quote!(#e).to_string().contains("unreachable"))),
+            .all(|b| !matches!(&b.terminator, Terminator::Unreachable(_))),
     );
 }
 

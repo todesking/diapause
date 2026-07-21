@@ -806,6 +806,10 @@ impl Codegen<'_> {
                     return ::baregen::CoroutineState::Complete(__ret);
                 }
             }
+            // A bare diverging expression: assigning it to `__ret` like
+            // a `Return` would trip `clippy::diverging_sub_expression`
+            // on the user's spans.
+            Terminator::Unreachable(e) => quote!(#e),
             Terminator::IterNext {
                 iter,
                 pat,

@@ -102,6 +102,7 @@ fn terminator_line(term: &Terminator) -> Option<String> {
         Terminator::Yield { value, .. } => Some(format!("yield {}", tokens_line(value))),
         Terminator::IterNext { iter, .. } => Some(format!("{iter}.next()")),
         Terminator::Return(e) => Some(format!("return {}", tokens_line(e))),
+        Terminator::Unreachable(_) => Some("unreachable".to_string()),
     }
 }
 
@@ -138,7 +139,7 @@ fn write_edges(out: &mut String, cfg: &Cfg, i: usize) {
             edge(out, i, *body, &format!("Some({})", pat_line(pat)), false);
             edge(out, i, *exit, "None", false);
         }
-        Terminator::Return(_) => {}
+        Terminator::Return(_) | Terminator::Unreachable(_) => {}
     }
     for &j in &cfg.blocks[i].jumps {
         match cfg.opaque_jumps[j].kind {

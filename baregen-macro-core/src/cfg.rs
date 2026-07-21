@@ -229,6 +229,13 @@ pub enum Terminator {
     /// or `()`. Early `return` is handled by expression rewriting, not
     /// by this terminator.
     Return(syn::Expr),
+    /// Statically unreachable fall-through (the diverging `else` block
+    /// of a lowered `let ... else` left the block open). Expands to a
+    /// bare diverging expression rather than a `Return`-style
+    /// `let __ret: T = ..;`, which would put the divergence in value
+    /// position and trip `clippy::diverging_sub_expression` on the
+    /// user's spans.
+    Unreachable(syn::Expr),
 }
 
 #[derive(Debug, Clone)]
@@ -260,7 +267,9 @@ impl Terminator {
             Terminator::IterNext { body, exit, .. } => {
                 Successors::Fixed([Some(*body), Some(*exit)].into_iter())
             }
-            Terminator::Return(_) => Successors::Fixed([None, None].into_iter()),
+            Terminator::Return(_) | Terminator::Unreachable(_) => {
+                Successors::Fixed([None, None].into_iter())
+            }
         }
     }
 }
@@ -449,6 +458,6 @@ fn retarget(t: &mut Terminator, remap: &[usize]) {
             *body = remap[*body];
             *exit = remap[*exit];
         }
-        Terminator::Return(_) => {}
+        Terminator::Return(_) | Terminator::Unreachable(_) => {}
     }
 }
