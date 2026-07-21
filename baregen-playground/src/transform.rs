@@ -5,7 +5,9 @@
 //! packages the expansion, the CFG DOT renderings, and any errors
 //! (with source positions) into a serializable report.
 
-use baregen_macro_core::{cfg_to_dot, expand_debug};
+use baregen_macro_core::expand_debug;
+
+use crate::cfg_dot::cfg_to_dot;
 use proc_macro2::{LineColumn, TokenStream};
 use serde::Serialize;
 

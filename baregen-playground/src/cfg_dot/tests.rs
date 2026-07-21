@@ -5,8 +5,9 @@
 use quote::quote;
 use syn::parse_quote;
 
+use baregen_macro_core::expand_debug;
+
 use super::cfg_to_dot;
-use crate::expand_debug;
 
 /// Runs the debug pipeline and renders (unsimplified without analysis,
 /// simplified with analysis).

@@ -1,15 +1,15 @@
-//! Graphviz DOT export of a [`Cfg`] for debugging front ends (the
-//! playground renders the string client-side with a wasm build of
-//! Graphviz). Works on both the unsimplified and the simplified CFG;
-//! when an [`Analysis`] is supplied, blocks are additionally annotated
-//! with their state-variant names.
+//! Graphviz DOT export of a [`Cfg`] (the playground renders the string
+//! client-side with a wasm build of Graphviz). Works on both the
+//! unsimplified and the simplified CFG; when an [`Analysis`] is
+//! supplied, blocks are additionally annotated with their state-variant
+//! names.
 
 use std::fmt::Write;
 
 use quote::ToTokens;
 
-use crate::analyze_cfg::Analysis;
-use crate::cfg::{Cfg, OpaqueJumpKind, Terminator};
+use baregen_macro_core::analyze_cfg::Analysis;
+use baregen_macro_core::cfg::{Cfg, OpaqueJumpKind, Terminator};
 
 /// Longest rendered statement/expression line; the rest is elided so a
 /// single long opaque statement cannot blow up the node width.

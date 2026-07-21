@@ -7,6 +7,7 @@
 //! JS object. The logic lives in [`transform`] (the module) so it can
 //! be tested on the host target.
 
+pub mod cfg_dot;
 mod transform;
 
 pub use transform::{ErrorInfo, TransformOutput, transform};

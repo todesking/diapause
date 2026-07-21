@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 baregen-macro-core = { path = "../baregen-macro-core" }
 syn = { version = "2", features = ["full"] }
+quote = "1"
 # `span-locations` makes fallback (non-proc-macro) spans carry real
 # line/column info, so errors can be positioned in the pasted source.
 proc-macro2 = { version = "1", features = ["span-locations"] }
