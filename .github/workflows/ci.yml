@@ -19,6 +19,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          # Bare metal target for the no_std regression check below.
+          targets: thumbv7em-none-eabihf
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --all --check
@@ -28,3 +30,7 @@ jobs:
       # default (fixed) generator seed.
       - name: Test
         run: cargo test --workspace
+      # Guards the no_std claim: build the no-std test crate (and thus
+      # diapause itself) for a bare metal target with no std available.
+      - name: Build for bare metal target
+        run: cargo build -p diapause-no-std-test --target thumbv7em-none-eabihf
