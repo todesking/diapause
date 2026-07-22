@@ -1,7 +1,7 @@
 //! Coroutines without any `yield_!`: `start()` runs the whole body and
 //! returns `Complete`.
 
-use diapause::{Coroutine, CoroutineState};
+use diapause::{Coroutine, CoroutineState, CoroutineStatus};
 
 #[diapause::coroutine]
 fn no_args() {}
@@ -37,6 +37,19 @@ mod outer {
 fn start_completes_unit() {
     let mut c = no_args();
     assert_eq!(c.start(), CoroutineState::Complete(()));
+}
+
+#[test]
+fn status_goes_straight_from_not_started_to_done() {
+    let mut c = add(2, 3);
+    assert_eq!(c.status(), CoroutineStatus::NotStarted);
+    assert!(!c.is_started());
+    assert!(!c.is_done());
+
+    c.start();
+    assert_eq!(c.status(), CoroutineStatus::Done);
+    assert!(c.is_started());
+    assert!(c.is_done());
 }
 
 #[test]

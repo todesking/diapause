@@ -1,6 +1,6 @@
 //! State machine behaviour for coroutines containing `yield_!`.
 
-use diapause::{Coroutine, CoroutineState};
+use diapause::{Coroutine, CoroutineState, CoroutineStatus};
 
 #[diapause::coroutine(yield = u32)]
 fn counter() {
@@ -14,6 +14,29 @@ fn yields_in_order_then_completes() {
     assert_eq!(c.start(), CoroutineState::Yielded(1));
     assert_eq!(c.resume(()), CoroutineState::Yielded(2));
     assert_eq!(c.resume(()), CoroutineState::Complete(()));
+}
+
+#[test]
+fn status_reflects_the_coroutine_lifecycle() {
+    let mut c = counter();
+    assert_eq!(c.status(), CoroutineStatus::NotStarted);
+    assert!(!c.is_started());
+    assert!(!c.is_done());
+
+    c.start();
+    assert_eq!(c.status(), CoroutineStatus::Suspended);
+    assert!(c.is_started());
+    assert!(!c.is_done());
+
+    c.resume(());
+    assert_eq!(c.status(), CoroutineStatus::Suspended);
+    assert!(c.is_started());
+    assert!(!c.is_done());
+
+    c.resume(());
+    assert_eq!(c.status(), CoroutineStatus::Done);
+    assert!(c.is_started());
+    assert!(c.is_done());
 }
 
 #[diapause::coroutine(yield = u32, resume = String)]
@@ -78,9 +101,11 @@ fn panic_during_resume_poisons_the_state() {
     assert_eq!(c.start(), CoroutineState::Yielded(1));
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.resume(true)));
     assert!(caught.is_err());
+    assert_eq!(c.status(), CoroutineStatus::Poisoned);
     let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.resume(false)));
     let msg = *poisoned.unwrap_err().downcast::<&str>().unwrap();
     assert_eq!(msg, "Poisoned");
+    assert_eq!(c.status(), CoroutineStatus::Poisoned);
 }
 
 #[diapause::coroutine(yield = u32, resume = u32)]
