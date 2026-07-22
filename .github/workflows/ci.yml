@@ -7,6 +7,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Wider difftest sweep than the local default of 48 cases; the seed
+  # stays fixed, so this is still deterministic.
+  DIAPAUSE_DIFFTEST_CASES: "300"
 
 jobs:
   ci:
