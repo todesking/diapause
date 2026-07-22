@@ -162,8 +162,9 @@ use proc_macro::TokenStream;
 /// With the `fingerprint` attribute flag, each data-carrying variant
 /// additionally stores that hash in a plain `__fp: u64` field —
 /// derives persist it as ordinary data — `start`/`resume` panic when
-/// it does not match the current source, and a generated inherent
-/// method `check_fingerprint(&self) -> Result<(), FingerprintMismatch>`
+/// it does not match the current source, and the state enum implements
+/// the `diapause::Fingerprinted` trait, whose
+/// `check_fingerprint(&self) -> Result<(), FingerprintMismatch>` method
 /// validates it gracefully right after deserializing. Enabling the
 /// flag invalidates previously persisted states (missing `__fp`
 /// field). `fingerprint = "tag"` hashes the tag instead of the

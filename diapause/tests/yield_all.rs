@@ -194,7 +194,7 @@ fn delegation_works_inside_an_expanded_loop() {
 #[should_panic(expected = "Already started")]
 fn delegating_to_a_started_coroutine_panics() {
     let mut g = inner_sum(1);
-    g.start();
+    let _ = g.start();
     // Rebuild the outer coroutine around the already-started state.
     #[diapause::coroutine(yield = u32, resume = u32)]
     fn resume_started(g: inner_sum::State) -> u32 {
@@ -202,5 +202,5 @@ fn delegating_to_a_started_coroutine_panics() {
         v
     }
     let mut c = resume_started(g);
-    c.start();
+    let _ = c.start();
 }

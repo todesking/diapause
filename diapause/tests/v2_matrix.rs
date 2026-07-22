@@ -312,7 +312,7 @@ fn labeled_continue_from_inner_loop_to_outer_for() {
 
 fn assert_resume_panics_poisoned<C: Coroutine<R>, R>(c: &mut C, resume: R) {
     let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        c.resume(resume);
+        let _ = c.resume(resume);
     }));
     let msg = *poisoned.unwrap_err().downcast::<&str>().unwrap();
     assert_eq!(msg, "Poisoned");

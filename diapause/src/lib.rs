@@ -64,6 +64,7 @@ pub use diapause_macro::coroutine;
 struct ReadmeDoctests;
 
 /// The result of a [`Coroutine::start`] / [`Coroutine::resume`] call.
+#[must_use = "this contains the yielded or returned value; dropping it loses that value"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoroutineState<Y, R> {
     /// The coroutine suspended at a `yield_!` with this value.
@@ -76,19 +77,20 @@ pub enum CoroutineState<Y, R> {
 ///
 /// Reports which of `start`/`resume` may currently be called without
 /// panicking, without having to call either and risk the panic.
+#[must_use = "querying the status has no effect unless the result is inspected"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoroutineStatus {
     /// Neither `start` nor `resume` has run yet. Only `start` is valid;
-    /// calling `resume` panics with `"Not started"`.
+    /// calling `resume` panics.
     NotStarted,
     /// The coroutine is suspended at a `yield_!`. Only `resume` is
-    /// valid; calling `start` panics with `"Already started"`.
+    /// valid; calling `start` panics.
     Suspended,
-    /// The coroutine ran to completion. Both `start` and `resume` panic
-    /// (`"Already started"` / `"Already done"`).
+    /// The coroutine ran to completion. Both `start` and `resume`
+    /// panic.
     Done,
     /// A previous `start`/`resume` call panicked partway through a
-    /// transition. Both `start` and `resume` panic with `"Poisoned"`.
+    /// transition. Both `start` and `resume` panic.
     Poisoned,
 }
 
@@ -101,6 +103,10 @@ pub enum CoroutineStatus {
 /// Unlike nightly's `std::ops::Coroutine`, `resume` takes `&mut self`
 /// without `Pin`: borrows are never stored in the state, so the
 /// generated state machines are always `Unpin`.
+///
+/// The conditions under which `start`/`resume` panic are documented on
+/// each method (and reported by [`status`](Self::status) beforehand);
+/// the panic messages themselves are not part of the stable API.
 pub trait Coroutine<R = ()> {
     /// The type of values passed out at each suspension point (the
     /// attribute's `yield = ..`, defaulting to `()`).
@@ -116,9 +122,8 @@ pub trait Coroutine<R = ()> {
     ///
     /// # Panics
     ///
-    /// Panics if the coroutine has not been started (`"Not started"`),
-    /// has already completed (`"Already done"`), or panicked during a
-    /// previous transition (`"Poisoned"`).
+    /// Panics if the coroutine has not been started, has already
+    /// completed, or panicked during a previous transition.
     fn resume(&mut self, resume: R) -> CoroutineState<Self::Yield, Self::Return>;
 
     /// Starts the coroutine, running it until the first suspension point
@@ -129,40 +134,107 @@ pub trait Coroutine<R = ()> {
     ///
     /// # Panics
     ///
-    /// Panics if the coroutine has already been started
-    /// (`"Already started"`).
+    /// Panics if the coroutine has already been started, has completed,
+    /// or panicked during a previous transition.
     fn start(&mut self) -> CoroutineState<Self::Yield, Self::Return>;
 
     /// Reports which of `start`/`resume` may currently be called without
     /// panicking, so that callers can check before calling either.
     fn status(&self) -> CoroutineStatus;
 
-    /// Whether the coroutine has been started, i.e. `resume` (rather
-    /// than `start`) is the call that would not panic with
-    /// `"Not started"`.
+    /// Whether the coroutine has been started, i.e. it is past the
+    /// point where `start` may be called.
     ///
     /// Equivalent to `status() != CoroutineStatus::NotStarted`.
     fn is_started(&self) -> bool {
         self.status() != CoroutineStatus::NotStarted
     }
 
-    /// Whether the coroutine has run to completion, i.e. both
-    /// `start`/`resume` would panic with `"Already done"` /
-    /// `"Already started"`.
+    /// Whether the coroutine has run to completion and returned its
+    /// final value.
     ///
     /// Equivalent to `status() == CoroutineStatus::Done`.
     fn is_done(&self) -> bool {
         self.status() == CoroutineStatus::Done
     }
+
+    /// Non-panicking [`start`](Self::start): checks [`status`](Self::status)
+    /// first and returns the offending status instead of panicking when the
+    /// coroutine is not in the [`NotStarted`](CoroutineStatus::NotStarted)
+    /// state.
+    fn try_start(&mut self) -> Result<CoroutineState<Self::Yield, Self::Return>, CoroutineStatus> {
+        match self.status() {
+            CoroutineStatus::NotStarted => Ok(self.start()),
+            status => Err(status),
+        }
+    }
+
+    /// Non-panicking [`resume`](Self::resume): checks
+    /// [`status`](Self::status) first and returns the offending status
+    /// instead of panicking when the coroutine is not in the
+    /// [`Suspended`](CoroutineStatus::Suspended) state. The `resume` value
+    /// is dropped in that case.
+    fn try_resume(
+        &mut self,
+        resume: R,
+    ) -> Result<CoroutineState<Self::Yield, Self::Return>, CoroutineStatus> {
+        match self.status() {
+            CoroutineStatus::Suspended => Ok(self.resume(resume)),
+            status => Err(status),
+        }
+    }
+}
+
+/// Forwarding impl so that generic drivers can take a coroutine by
+/// mutable reference, and a coroutine can be partially iterated without
+/// being consumed (`for x in Iter::new(&mut c)`).
+impl<C, R> Coroutine<R> for &mut C
+where
+    C: Coroutine<R> + ?Sized,
+{
+    type Yield = C::Yield;
+    type Return = C::Return;
+
+    fn resume(&mut self, resume: R) -> CoroutineState<C::Yield, C::Return> {
+        (**self).resume(resume)
+    }
+
+    fn start(&mut self) -> CoroutineState<C::Yield, C::Return> {
+        (**self).start()
+    }
+
+    fn status(&self) -> CoroutineStatus {
+        (**self).status()
+    }
+}
+
+/// Fingerprint validation of a persisted coroutine state.
+///
+/// Implemented by the state enums that [`macro@coroutine`] generates
+/// when the attribute is given the `fingerprint` flag, so that generic
+/// persistence layers can validate states without naming each concrete
+/// state type.
+pub trait Fingerprinted {
+    /// The fingerprint of the current coroutine source: an FNV-1a hash
+    /// of the attribute arguments, signature, and body tokens (or of the
+    /// tag, with `fingerprint = "tag"`).
+    const FINGERPRINT: u64;
+
+    /// Checks that this state was created by the same coroutine source
+    /// (see [`Self::FINGERPRINT`]). Call it right after deserializing to
+    /// detect a mismatch gracefully; `start`/`resume` panic on the same
+    /// condition. Terminal states (`Done`, `Poisoned`) carry no
+    /// fingerprint and always pass.
+    fn check_fingerprint(&self) -> Result<(), FingerprintMismatch>;
 }
 
 /// A persisted coroutine state does not match the source of the
 /// coroutine it is checked against.
 ///
-/// Returned by the `check_fingerprint` method that [`macro@coroutine`]
-/// generates when the attribute is given the `fingerprint` flag. Call
-/// it right after deserializing to detect the mismatch gracefully;
-/// `start`/`resume` panic on the same condition.
+/// Returned by [`Fingerprinted::check_fingerprint`], which
+/// [`macro@coroutine`] implements when the attribute is given the
+/// `fingerprint` flag. Call it right after deserializing to detect the
+/// mismatch gracefully; `start`/`resume` panic on the same condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FingerprintMismatch {
     /// The fingerprint of the current source (`State::FINGERPRINT`).
@@ -184,6 +256,15 @@ impl core::fmt::Display for FingerprintMismatch {
 
 impl core::error::Error for FingerprintMismatch {}
 
+mod sealed {
+    /// Seals [`Try`](super::Try) and [`FromResidual`](super::FromResidual)
+    /// to `Result` and `Option`: `?` in a coroutine supports exactly the
+    /// operand types `?` in a plain function does.
+    pub trait Sealed {}
+    impl<T, E> Sealed for Result<T, E> {}
+    impl<T> Sealed for Option<T> {}
+}
+
 /// Desugaring target for `?` inside a `#[diapause::coroutine]` function.
 ///
 /// The coroutine transformation rewrites `expr?` into a `branch` call so
@@ -191,9 +272,9 @@ impl core::error::Error for FingerprintMismatch {}
 /// types are `Result` and `Option`, exactly as with `?` in a plain
 /// function. This trait shows up in rustc error messages when `?` is
 /// used on an unsupported type, but it is an internal implementation
-/// detail: implementing it for other types is not supported.
+/// detail: it is sealed and cannot be implemented for other types.
 #[doc(hidden)]
-pub trait Try {
+pub trait Try: sealed::Sealed {
     type Output;
     type Residual;
     fn branch(self) -> core::ops::ControlFlow<Self::Residual, Self::Output>;
@@ -203,9 +284,10 @@ pub trait Try {
 /// the residual carried out by an early-exiting `?`.
 ///
 /// Like `Try`, this is an internal implementation detail that only
-/// exists in error messages; implementing it is not supported.
+/// exists in error messages; it is sealed and cannot be implemented
+/// for other types.
 #[doc(hidden)]
-pub trait FromResidual<R> {
+pub trait FromResidual<R>: sealed::Sealed {
     fn from_residual(r: R) -> Self;
 }
 
@@ -257,7 +339,11 @@ impl<T> FromResidual<()> for Option<T> {
 /// [`IntoIterator`] directly (the `#[coroutine]` macro generates it), so
 /// the state can be passed straight to a `for` loop without wrapping it in
 /// `Iter::new`. `Iter::new` remains as the general entry point, e.g. when
-/// naming the iterator type or converting a value already held as `C`.
+/// naming the iterator type or converting a value already held as `C`;
+/// `Iter::new(&mut c)` borrows the coroutine instead of consuming it
+/// (via the `Coroutine for &mut C` forwarding impl), so
+/// `for x in Iter::new(&mut c)` iterates partially and leaves the rest
+/// resumable.
 ///
 /// This wrapper does not implement `Deref`/`DerefMut`; access the wrapped
 /// coroutine explicitly through [`get_ref`](Self::get_ref),
@@ -343,6 +429,15 @@ where
 {
     type Item = C::Yield;
 
+    /// Drives the coroutine to its next suspension point and returns the
+    /// yielded value, or `None` once it completes (the completion value
+    /// is discarded).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the coroutine panicked during a previous transition
+    /// (i.e. its [`status`](Coroutine::status) is
+    /// [`Poisoned`](CoroutineStatus::Poisoned)).
     fn next(&mut self) -> Option<Self::Item> {
         let step = match self.coroutine.status() {
             CoroutineStatus::NotStarted => self.coroutine.start(),

@@ -46,7 +46,7 @@ fn status_goes_straight_from_not_started_to_done() {
     assert!(!c.is_started());
     assert!(!c.is_done());
 
-    c.start();
+    let _ = c.start();
     assert_eq!(c.status(), CoroutineStatus::Done);
     assert!(c.is_started());
     assert!(c.is_done());
@@ -80,21 +80,21 @@ fn visibility_is_propagated() {
 #[should_panic(expected = "Not started")]
 fn resume_before_start_panics() {
     let mut c = add(1, 2);
-    c.resume(());
+    let _ = c.resume(());
 }
 
 #[test]
 #[should_panic(expected = "Already started")]
 fn double_start_panics() {
     let mut c = add(1, 2);
-    c.start();
-    c.start();
+    let _ = c.start();
+    let _ = c.start();
 }
 
 #[test]
 #[should_panic(expected = "Already done")]
 fn resume_after_done_panics() {
     let mut c = add(1, 2);
-    c.start();
-    c.resume(());
+    let _ = c.start();
+    let _ = c.resume(());
 }

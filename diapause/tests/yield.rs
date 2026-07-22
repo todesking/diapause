@@ -23,17 +23,17 @@ fn status_reflects_the_coroutine_lifecycle() {
     assert!(!c.is_started());
     assert!(!c.is_done());
 
-    c.start();
+    let _ = c.start();
     assert_eq!(c.status(), CoroutineStatus::Suspended);
     assert!(c.is_started());
     assert!(!c.is_done());
 
-    c.resume(());
+    let _ = c.resume(());
     assert_eq!(c.status(), CoroutineStatus::Suspended);
     assert!(c.is_started());
     assert!(!c.is_done());
 
-    c.resume(());
+    let _ = c.resume(());
     assert_eq!(c.status(), CoroutineStatus::Done);
     assert!(c.is_started());
     assert!(c.is_done());
@@ -130,15 +130,15 @@ fn types_are_inferred_without_annotations() {
 #[should_panic(expected = "Not started")]
 fn resume_before_start_panics() {
     let mut c = counter();
-    c.resume(());
+    let _ = c.resume(());
 }
 
 #[test]
 #[should_panic(expected = "Already done")]
 fn resume_after_complete_panics() {
     let mut c = counter();
-    c.start();
-    c.resume(());
-    c.resume(());
-    c.resume(());
+    let _ = c.start();
+    let _ = c.resume(());
+    let _ = c.resume(());
+    let _ = c.resume(());
 }

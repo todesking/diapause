@@ -286,12 +286,18 @@ impl Prepared {
         let resume_body = build_resume_dispatch(&cx, &suspension);
         let status_body = build_status_dispatch(&cx, &suspension);
         let drive_fn = build_drive_fn(&cx, &suspension.placeholder);
-        let fp_check_fn = fp_enabled.then(|| build_check_fingerprint(&cx));
+        let fp_impl = fp_enabled.then(|| build_fingerprinted_impl(&cx, fingerprint));
 
         // A coroutine driven with `()` resume values can be iterated, so
         // emit an `IntoIterator` into `diapause::Iter` that feeds `for`
         // loops without an explicit `Iter::new`. Guarded on a syntactic
         // `resume = ()` (covers both the explicit form and the default).
+        // Only the by-value impl is generated: an `IntoIterator` for
+        // `&mut State` would make rustc's reachability analysis mark the
+        // state fields pub-reachable and fire `private_interfaces` on
+        // private coroutines holding crate-private types; partial
+        // iteration goes through `Iter::new(&mut c)` instead (via the
+        // blanket `Coroutine for &mut C` impl).
         let into_iter_impl = is_unit_ty(resume_ty).then(|| {
             quote! {
                 impl #impl_generics ::core::iter::IntoIterator for State #ty_generics
@@ -350,14 +356,14 @@ impl Prepared {
 
             #into_iter_impl
 
+            #fp_impl
+
             impl #impl_generics State #ty_generics #where_clause {
                 /// Fingerprint of the coroutine source this state type was
                 /// generated from: an FNV-1a hash of the attribute
                 /// arguments, signature, and body tokens. Editing the
                 /// coroutine changes it; comments and formatting do not.
                 pub const FINGERPRINT: u64 = #fingerprint;
-
-                #fp_check_fn
 
                 #drive_fn
             }
@@ -719,38 +725,39 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
     }
 }
 
-/// Builds the inherent `check_fingerprint` method (only when the
-/// `fingerprint` flag was given): the graceful counterpart of the
-/// panicking guard in `start`/`resume`.
-fn build_check_fingerprint(cx: &ExpandCtx) -> TokenStream {
+/// Builds the `diapause::Fingerprinted` impl (only when the
+/// `fingerprint` flag was given): `check_fingerprint` is the graceful
+/// counterpart of the panicking guard in `start`/`resume`.
+fn build_fingerprinted_impl(cx: &ExpandCtx, fingerprint: u64) -> TokenStream {
     let data_variants = cx
         .analysis
         .variants
         .iter()
         .filter(|v| v.block != cx.cfg.entry)
         .map(|v| &v.ident);
+    let (impl_generics, ty_generics, where_clause) = cx.generics.split_for_impl();
     quote! {
-        /// Checks that this state was created by the same coroutine
-        /// source (see [`Self::FINGERPRINT`]). Call it right after
-        /// deserializing to detect a mismatch gracefully;
-        /// `start`/`resume` panic on the same condition. Terminal
-        /// states (`Done`, `Poisoned`) carry no fingerprint and
-        /// always pass.
-        pub fn check_fingerprint(
-            &self,
-        ) -> ::core::result::Result<(), ::diapause::FingerprintMismatch> {
-            let found = match self {
-                State::Start { __fp, .. } => *__fp,
-                #(State::#data_variants { __fp, .. } => *__fp,)*
-                _ => return ::core::result::Result::Ok(()),
-            };
-            if found == Self::FINGERPRINT {
-                ::core::result::Result::Ok(())
-            } else {
-                ::core::result::Result::Err(::diapause::FingerprintMismatch {
-                    expected: Self::FINGERPRINT,
-                    found,
-                })
+        impl #impl_generics ::diapause::Fingerprinted for State #ty_generics
+        #where_clause
+        {
+            const FINGERPRINT: u64 = #fingerprint;
+
+            fn check_fingerprint(
+                &self,
+            ) -> ::core::result::Result<(), ::diapause::FingerprintMismatch> {
+                let found = match self {
+                    State::Start { __fp, .. } => *__fp,
+                    #(State::#data_variants { __fp, .. } => *__fp,)*
+                    _ => return ::core::result::Result::Ok(()),
+                };
+                if found == <Self as ::diapause::Fingerprinted>::FINGERPRINT {
+                    ::core::result::Result::Ok(())
+                } else {
+                    ::core::result::Result::Err(::diapause::FingerprintMismatch {
+                        expected: <Self as ::diapause::Fingerprinted>::FINGERPRINT,
+                        found,
+                    })
+                }
             }
         }
     }

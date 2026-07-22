@@ -188,7 +188,7 @@ Adding `fingerprint` to the attribute stamps every state with a hash of
 the coroutine's source and validates it before resuming:
 
 ```rust
-use diapause::{Coroutine, CoroutineState};
+use diapause::{Coroutine, CoroutineState, Fingerprinted};
 use serde::{Deserialize, Serialize};
 
 #[diapause::coroutine(yield = u32, fingerprint)]
@@ -222,9 +222,10 @@ fn main() {
 - The `fingerprint` flag additionally stores that hash in every state
   as a plain `__fp: u64` field — any derive (serde, `Clone`, ...)
   handles it as ordinary data — makes `start()`/`resume()` panic on a
-  mismatch as a last line of defense, and generates
+  mismatch as a last line of defense, and implements the
+  `diapause::Fingerprinted` trait, whose
   `fn check_fingerprint(&self) -> Result<(), diapause::FingerprintMismatch>`
-  for graceful validation right after deserializing.
+  validates gracefully right after deserializing.
 - Enabling the flag is itself a breaking change for previously
   persisted states: they lack the `__fp` field and fail to deserialize.
 - `fingerprint = "some-tag"` hashes the tag instead of the source: an

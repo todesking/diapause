@@ -246,6 +246,39 @@ fn into_iterator_generic_coroutine() {
     assert_eq!(words, ["hi", "hi"]);
 }
 
+/// `Iter::new(&mut c)` borrows the coroutine (via the `Coroutine for
+/// `&mut C` forwarding impl), so a `for` loop can iterate partially
+/// without consuming it.
+#[test]
+fn iter_by_mut_ref_partial_iteration() {
+    use diapause::{Coroutine, CoroutineState, CoroutineStatus};
+
+    #[diapause::coroutine(yield = u32, resume = ())]
+    fn count() {
+        let nums: [u32; 4] = [1, 2, 3, 4];
+        for n in nums {
+            yield_!(n);
+        }
+    }
+
+    let mut c = count();
+    let mut sum = 0;
+    for n in diapause::Iter::new(&mut c) {
+        sum += n;
+        if n == 2 {
+            break;
+        }
+    }
+    assert_eq!(sum, 3);
+    // The coroutine survives the loop, suspended, and can be driven on —
+    // directly or through another borrowing `Iter`.
+    assert_eq!(c.status(), CoroutineStatus::Suspended);
+    assert_eq!(c.resume(()), CoroutineState::Yielded(3));
+    let rest: Vec<u32> = diapause::Iter::new(&mut c).collect();
+    assert_eq!(rest, [4]);
+    assert_eq!(c.status(), CoroutineStatus::Done);
+}
+
 #[diapause::coroutine(yield = u32, resume = ())]
 fn inner_yields() {
     let nums: [u32; 2] = [10, 20];

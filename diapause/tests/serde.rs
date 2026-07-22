@@ -4,7 +4,7 @@
 //! (`Range<u32>` here), so serde derives work with their ordinary
 //! semantics and the mid-iteration cursor (start/end) round-trips.
 
-use diapause::{Coroutine, CoroutineState};
+use diapause::{Coroutine, CoroutineState, Fingerprinted};
 use serde::{Deserialize, Serialize};
 
 #[diapause::coroutine(yield = u32, resume = u32)]
@@ -91,7 +91,7 @@ fn fingerprints_differ_between_edited_sources() {
 #[test]
 fn check_fingerprint_rejects_a_state_from_edited_source() {
     let mut c = tally_v1(4);
-    c.start();
+    let _ = c.start();
     let json = serde_json::to_string(&c).unwrap();
 
     // Structurally compatible, so deserialization itself succeeds; the
@@ -109,10 +109,10 @@ fn check_fingerprint_rejects_a_state_from_edited_source() {
 #[should_panic(expected = "this state was created by a different version of `tally_v2`")]
 fn resume_panics_on_a_state_from_edited_source() {
     let mut c = tally_v1(4);
-    c.start();
+    let _ = c.start();
     let json = serde_json::to_string(&c).unwrap();
     let mut restored: tally_v2::State = serde_json::from_str(&json).unwrap();
-    restored.resume(1);
+    let _ = restored.resume(1);
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn start_panics_on_a_state_from_edited_source() {
     let c = tally_v1(4);
     let json = serde_json::to_string(&c).unwrap();
     let mut restored: tally_v2::State = serde_json::from_str(&json).unwrap();
-    restored.start();
+    let _ = restored.start();
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn enabling_fingerprint_invalidates_old_persisted_states() {
     // states lack the `__fp` field, so pre-fingerprint data fails to
     // deserialize (missing field) instead of resuming unchecked.
     let mut c = running_sum(4);
-    c.start();
+    let _ = c.start();
     let json = serde_json::to_string(&c).unwrap();
     assert!(serde_json::from_str::<tally_v1::State>(&json).is_err());
 }
@@ -168,13 +168,29 @@ fn manual_fingerprint_pins_compatibility_across_edits() {
     assert_eq!(pinned_v1::State::FINGERPRINT, pinned_v2::State::FINGERPRINT);
 
     let mut c = pinned_v1(4);
-    c.start();
+    let _ = c.start();
     let json = serde_json::to_string(&c).unwrap();
 
     // The v1 state resumes under v2's edited body without complaint.
     let mut restored: pinned_v2::State = serde_json::from_str(&json).unwrap();
     restored.check_fingerprint().unwrap();
     assert_eq!(restored.resume(10), CoroutineState::Yielded(1));
+}
+
+/// `check_fingerprint` comes from the `Fingerprinted` trait, so a
+/// persistence layer can validate states generically.
+#[test]
+fn fingerprinted_is_usable_generically() {
+    fn validate<S: Fingerprinted>(s: &S) -> Result<(), diapause::FingerprintMismatch> {
+        s.check_fingerprint()
+    }
+
+    let c = tally_v1(4);
+    validate(&c).unwrap();
+    assert_eq!(
+        <tally_v1::State as Fingerprinted>::FINGERPRINT,
+        tally_v1::State::FINGERPRINT
+    );
 }
 
 #[test]
@@ -269,7 +285,7 @@ fn inclusive_range_round_trips_at_every_suspension() {
 #[test]
 fn serialized_inclusive_iterator_exposes_exhaustion() {
     let mut c = inclusive_sum(1);
-    c.start();
+    let _ = c.start();
     assert_eq!(c.resume(()), CoroutineState::Yielded(1));
 
     // Suspended after the final element: the wrapper records the
@@ -285,7 +301,7 @@ fn serialized_inclusive_iterator_exposes_exhaustion() {
 #[test]
 fn serialized_state_exposes_the_iterator_cursor() {
     let mut c = running_sum(3);
-    c.start();
+    let _ = c.start();
     let value: serde_json::Value = serde_json::to_value(&c).unwrap();
     // Suspended at the first yield: the S1 variant holds the range
     // iterator just after producing 0.
