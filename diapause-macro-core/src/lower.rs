@@ -392,9 +392,11 @@ const ERR_UNHOISTABLE: &str = "yield_! is not supported in this position: inside
      expression it is only supported when everything evaluated before it is a path, a \
      literal, or another yield_!, in an unconditionally evaluated position; bind the \
      resume value first: `let r = yield_!(..);` and use `r` here";
-const ERR_TRAILING_YIELD: &str =
-    "yield_! as the trailing expression is not supported; add a semicolon";
-const ERR_FOREIGN_MACRO: &str = "yield_! cannot appear inside another macro invocation";
+const ERR_TRAILING_YIELD: &str = "yield_! as the trailing expression is not supported; \
+     add a semicolon to discard the resume value, or bind it and return it: \
+     `let r = yield_!(..); r`";
+const ERR_FOREIGN_MACRO: &str = "yield_! cannot appear inside another macro invocation; \
+     bind the resume value first: `let r = yield_!(..);` and use `r` in the macro";
 const ERR_LET_ELSE_INIT: &str = "yield_! in the initializer of `let ... else` is not \
      supported; bind the resume value first: `let r = yield_!(..);` and then \
      `let Pattern = r else { .. };`";
@@ -413,7 +415,8 @@ const ERR_VALUE_POSITION: &str = "yield_! in value position is only supported wh
      `let mut x: Option<T> = None;` before it, assign `x = Some(...);` where the value \
      is produced, and use `x.unwrap()` afterwards";
 const ERR_TAIL: &str = "yield_! in the trailing expression is not supported here; \
-     add a semicolon";
+     add a semicolon to discard the resume value, or bind it and return it: \
+     `let r = yield_!(..); r`";
 const ERR_COND: &str = "yield_! in a condition is only supported in `if` when \
      everything evaluated before it is a path, a literal, or another yield_!; bind it \
      first: `let c = yield_!(..);`. A `while` condition is re-evaluated every iteration \
@@ -422,13 +425,18 @@ const ERR_SCRUTINEE: &str = "yield_! in a scrutinee is only supported for \
      `match`/`if let`/`let ... else` when everything evaluated before it is a path, a \
      literal, or another yield_!; bind it first: `let s = yield_!(..);`. A `while let` \
      scrutinee is re-evaluated every iteration and cannot contain yield_!";
-const ERR_GUARD: &str = "yield_! in a match guard is not supported";
-const ERR_UNSAFE: &str = "yield_! inside an unsafe block is not supported";
+const ERR_GUARD: &str = "yield_! in a match guard is not supported; yield before the \
+     `match` (`let g = yield_!(..);`) and use `g` in the guard, or move the check \
+     into the arm body";
+const ERR_UNSAFE: &str = "yield_! inside an unsafe block is not supported; yield \
+     outside the block (`let r = yield_!(..);`) and use `r` inside it";
 const ERR_FOR_HEAD: &str = "yield_! in a `for` loop's iterator expression is only \
      supported when everything evaluated before it is a path, a literal, or another \
      yield_!; bind it first: `let r = yield_!(..);`";
 const ERR_BREAK_VALUE: &str = "`break` with a value can only target a loop containing \
-     yield_! when the loop is a `let` initializer or the function's trailing expression";
+     yield_! when the loop is a `let` initializer or the function's trailing \
+     expression; otherwise assign the value to a variable declared before the loop \
+     and `break;` without one";
 const ERR_YIELD_ALL_OPERAND: &str = "yield_all! takes a single variable holding the \
      coroutine to delegate to; bind it first: `let sub: SubTy = make_sub(..);` and then \
      `yield_all!(sub)`";

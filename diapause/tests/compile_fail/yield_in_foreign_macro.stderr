@@ -1,4 +1,4 @@
-error: yield_! cannot appear inside another macro invocation
+error: yield_! cannot appear inside another macro invocation; bind the resume value first: `let r = yield_!(..);` and use `r` in the macro
  --> tests/compile_fail/yield_in_foreign_macro.rs:3:5
   |
 3 |     println!("{}", yield_!(1));
