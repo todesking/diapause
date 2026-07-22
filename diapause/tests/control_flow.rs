@@ -141,6 +141,81 @@ fn yield_in_else_if_let_chain() {
     assert_eq!(c.resume(()), CoroutineState::Complete(30));
 }
 
+/// An edition-2024 let-chain condition (a `let` link, a bool link
+/// reading its binding, and a trailing bool link): every link must
+/// succeed to take the `then` branch, and any failure falls through to
+/// the same `else`.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn if_let_chain_yield(opt: Option<u32>, c: bool) -> u32 {
+    let mut out: u32 = 0;
+    if let Some(v) = opt
+        && v > 0
+        && c
+    {
+        out += v;
+        let r = yield_!(out);
+        out += r;
+    } else {
+        yield_!(0);
+        out = 100;
+    }
+    out
+}
+
+#[test]
+fn yield_in_if_let_chain_all_links_match() {
+    let mut c = if_let_chain_yield(Some(3), true);
+    assert_eq!(c.start(), CoroutineState::Yielded(3));
+    assert_eq!(c.resume(4), CoroutineState::Complete(7));
+}
+
+#[test]
+fn yield_in_if_let_chain_pattern_link_fails() {
+    let mut c = if_let_chain_yield(None, true);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(9), CoroutineState::Complete(100));
+}
+
+#[test]
+fn yield_in_if_let_chain_bool_link_using_the_binding_fails() {
+    // `Some(0)` matches the pattern but fails `v > 0`.
+    let mut c = if_let_chain_yield(Some(0), true);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(9), CoroutineState::Complete(100));
+}
+
+#[test]
+fn yield_in_if_let_chain_trailing_bool_link_fails() {
+    // `Some(3)` matches the pattern and `v > 0`, but `c` is false.
+    let mut c = if_let_chain_yield(Some(3), false);
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(9), CoroutineState::Complete(100));
+}
+
+/// `while` with a let-chain condition: the extra bool link only gates
+/// entry, so the loop still exits once the scrutinee is exhausted.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn drain_stack_while_above(threshold: u32) -> u32 {
+    let mut stack: Vec<u32> = vec![1, 2, 3];
+    let mut sum: u32 = 0;
+    while let Some(x) = stack.pop()
+        && x > threshold
+    {
+        let r = yield_!(x);
+        sum += r;
+    }
+    sum
+}
+
+#[test]
+fn yield_in_while_let_chain_stops_at_the_bool_link() {
+    // pop order is 3, 2, 1; the bool link exits the loop once x <= 1.
+    let mut c = drain_stack_while_above(1);
+    assert_eq!(c.start(), CoroutineState::Yielded(3));
+    assert_eq!(c.resume(10), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(20), CoroutineState::Complete(30));
+}
+
 /// `if let` as a `let` initializer: the arm binding is rebound with an
 /// annotation so it can cross the yield.
 #[diapause::coroutine(yield = u32)]
