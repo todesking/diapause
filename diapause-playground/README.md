@@ -44,6 +44,9 @@ dist/
 ```
 
 `dist/` is self-contained; deploy it to any static file host as-is.
+Pushes to `main` deploy it to GitHub Pages automatically
+(`.github/workflows/deploy-playground.yml`), served at
+<https://todesking.github.io/diapause/>.
 
 ## Run locally
 
