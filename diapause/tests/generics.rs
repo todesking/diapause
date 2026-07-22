@@ -258,3 +258,70 @@ fn slice_reference_across_yield() {
     assert_eq!(c.start(), CoroutineState::Yielded(1));
     assert_eq!(c.resume(()), CoroutineState::Complete(60));
 }
+
+// Multiple impl Trait arguments
+#[diapause::coroutine(yield = i32)]
+fn multiple_impl_trait(f: impl Fn(i32) -> i32, g: impl Fn(i32) -> i32) -> i32 {
+    yield_!(1);
+    f(g(41))
+}
+
+#[test]
+fn multiple_impl_trait_args() {
+    let mut c = multiple_impl_trait(|n| n + 1, |n| n * 2);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete((41 * 2) + 1));
+}
+
+// impl Trait with associated type
+#[diapause::coroutine(yield = u32)]
+fn impl_with_assoc_type(iter: impl Iterator<Item = u32>) -> u32 {
+    yield_!(1);
+    iter.sum()
+}
+
+#[test]
+fn impl_trait_with_associated_type() {
+    let vec = vec![1, 2, 3, 4, 5];
+    let mut c = impl_with_assoc_type(vec.into_iter());
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(15));
+}
+
+// impl Trait + type parameter mixed
+#[diapause::coroutine(yield = u32)]
+fn impl_and_type_param<T: Clone>(x: T, f: impl Fn(T) -> T) -> T {
+    yield_!(1);
+    f(x)
+}
+
+#[test]
+fn impl_trait_and_type_param_mixed() {
+    let mut c = impl_and_type_param(42, |n| n + 1);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(43));
+
+    let mut c = impl_and_type_param("x".to_string(), |s| s + "y");
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete("xy".to_string()));
+}
+
+// impl Trait with IntoIterator (owned)
+#[diapause::coroutine(yield = u32)]
+fn impl_into_iter(items: impl IntoIterator<Item = u32>) -> u32 {
+    yield_!(1);
+    items.into_iter().sum()
+}
+
+#[test]
+fn impl_trait_with_into_iterator() {
+    let vec = vec![1, 2, 3, 4, 5];
+    let mut c = impl_into_iter(vec);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(15));
+
+    let arr = [10, 20, 30];
+    let mut c = impl_into_iter(arr);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(60));
+}
