@@ -72,6 +72,26 @@ pub enum CoroutineState<Y, R> {
     Complete(R),
 }
 
+/// The result of a [`Coroutine::status`] query.
+///
+/// Reports which of `start`/`resume` may currently be called without
+/// panicking, without having to call either and risk the panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoroutineStatus {
+    /// Neither `start` nor `resume` has run yet. Only `start` is valid;
+    /// calling `resume` panics with `"Not started"`.
+    NotStarted,
+    /// The coroutine is suspended at a `yield_!`. Only `resume` is
+    /// valid; calling `start` panics with `"Already started"`.
+    Suspended,
+    /// The coroutine ran to completion. Both `start` and `resume` panic
+    /// (`"Already started"` / `"Already done"`).
+    Done,
+    /// A previous `start`/`resume` call panicked partway through a
+    /// transition. Both `start` and `resume` panic with `"Poisoned"`.
+    Poisoned,
+}
+
 /// A resumable computation.
 ///
 /// Implemented by the state enums that [`macro@coroutine`] generates.
@@ -112,6 +132,28 @@ pub trait Coroutine<R = ()> {
     /// Panics if the coroutine has already been started
     /// (`"Already started"`).
     fn start(&mut self) -> CoroutineState<Self::Yield, Self::Return>;
+
+    /// Reports which of `start`/`resume` may currently be called without
+    /// panicking, so that callers can check before calling either.
+    fn status(&self) -> CoroutineStatus;
+
+    /// Whether the coroutine has been started, i.e. `resume` (rather
+    /// than `start`) is the call that would not panic with
+    /// `"Not started"`.
+    ///
+    /// Equivalent to `status() != CoroutineStatus::NotStarted`.
+    fn is_started(&self) -> bool {
+        self.status() != CoroutineStatus::NotStarted
+    }
+
+    /// Whether the coroutine has run to completion, i.e. both
+    /// `start`/`resume` would panic with `"Already done"` /
+    /// `"Already started"`.
+    ///
+    /// Equivalent to `status() == CoroutineStatus::Done`.
+    fn is_done(&self) -> bool {
+        self.status() == CoroutineStatus::Done
+    }
 }
 
 /// A persisted coroutine state does not match the source of the
