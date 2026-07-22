@@ -1,4 +1,5 @@
 #![no_std]
+#![warn(missing_docs)]
 //! Coroutines/generators via code transformation, without `async`.
 //!
 //! Annotate a function with [`macro@coroutine`] and it is rewritten into

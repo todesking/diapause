@@ -3,6 +3,7 @@
 //! The transformation itself lives in `diapause-macro-core`; this crate
 //! only adapts it to the proc-macro interface. Users should depend on
 //! `diapause`, which re-exports the attribute.
+#![warn(missing_docs)]
 
 use proc_macro::TokenStream;
 
