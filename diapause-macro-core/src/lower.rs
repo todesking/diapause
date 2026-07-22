@@ -693,10 +693,12 @@ impl Lowerer {
     /// so the binding needs a syntactically known type; without the
     /// annotation the analysis reports the usual annotate-the-type error.
     fn lower_let_value(&mut self, local: &syn::Local) {
-        let init = local
-            .init
-            .as_ref()
-            .expect("BUG: a yield is inside the initializer");
+        // The statement contains a yield_! but has no initializer, so it
+        // sits in the binding pattern or the type annotation (e.g.
+        // `let yield_!(x);`) — neither is a supported position.
+        let Some(init) = local.init.as_ref() else {
+            return self.err(syn::Error::new_spanned(local, ERR_UNHOISTABLE));
+        };
         let expr = strip_parens(&init.expr);
         let supported = matches!(
             expr,

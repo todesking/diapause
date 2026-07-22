@@ -1270,6 +1270,20 @@ mod tests {
     }
 
     #[test]
+    fn let_with_yield_in_pattern_errors_without_panic() {
+        // `let yield_!(a);` parses as a `let` with a macro pattern and
+        // no initializer: the yield is in the binding, not an
+        // initializer. Lowering must report a diagnostic rather than
+        // panic on the missing initializer. Regression: found by the
+        // `expand` fuzz target.
+        let item: syn::ItemFn =
+            syn::parse_str("fn c(a: u32) {\n    let yield_!(a);\n}").expect("input parses as a fn");
+        let err = expand(quote!(yield = u32), item)
+            .expect_err("a yield in a let pattern must be a diagnostic");
+        assert!(err.to_string().contains("not supported in this position"));
+    }
+
+    #[test]
     fn expand_debug_parse_error_has_no_artifacts() {
         let dbg = expand_debug(
             quote!(banana = i32),
