@@ -41,7 +41,13 @@ impl Parse for MacroArgs {
             if name == "fingerprint" {
                 let value = if input.peek(Token![=]) {
                     input.parse::<Token![=]>()?;
-                    Fingerprint::Manual(input.parse::<syn::LitStr>()?)
+                    let lit = input.parse::<syn::LitStr>().map_err(|e| {
+                        syn::Error::new(
+                            e.span(),
+                            "`fingerprint` takes a string literal: `fingerprint = \"tag\"`",
+                        )
+                    })?;
+                    Fingerprint::Manual(lit)
                 } else {
                     Fingerprint::FromSource
                 };
@@ -109,6 +115,15 @@ mod tests {
         assert!(msg.contains("duplicate `yield` argument"), "got: {msg}");
         let msg = expand_err(quote!(resume = i32, resume = u32));
         assert!(msg.contains("duplicate `resume` argument"), "got: {msg}");
+    }
+
+    #[test]
+    fn non_string_fingerprint_value_is_rejected() {
+        let msg = expand_err(quote!(fingerprint = 42));
+        assert!(
+            msg.contains("`fingerprint` takes a string literal: `fingerprint = \"tag\"`"),
+            "got: {msg}"
+        );
     }
 
     #[test]

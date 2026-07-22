@@ -16,7 +16,7 @@ error: duplicate `fingerprint` argument
 7 | #[diapause::coroutine(fingerprint, fingerprint)]
   |                                    ^^^^^^^^^^^
 
-error: expected string literal
+error: `fingerprint` takes a string literal: `fingerprint = "tag"`
   --> tests/compile_fail/bad_attr_args.rs:10:37
    |
 10 | #[diapause::coroutine(fingerprint = 42)]
