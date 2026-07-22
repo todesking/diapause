@@ -1,0 +1,13 @@
+error[E0277]: `State` is not an iterator
+  --> tests/compile_fail/into_iterator_requires_unit_resume.rs:14:14
+   |
+14 |     for _ in needs_resume() {}
+   |              ^^^^^^^^^^^^^^ `State` is not an iterator
+   |
+help: the trait `Iterator` is not implemented for `State`
+  --> tests/compile_fail/into_iterator_requires_unit_resume.rs:5:1
+   |
+ 5 | #[diapause::coroutine(yield = u32, resume = u32)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: required for `State` to implement `IntoIterator`
+   = note: this error originates in the attribute macro `diapause::coroutine` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -28,7 +28,7 @@ fn iter_basic_iteration() {
     assert_eq!(iter.next(), None);
 }
 
-/// Iteration with for loop.
+/// Iteration with for loop over an explicit `Iter::new`.
 #[test]
 fn iter_for_loop() {
     #[diapause::coroutine(yield = u32, resume = ())]
@@ -44,6 +44,58 @@ fn iter_for_loop() {
         sum += n;
     }
     assert_eq!(sum, 15);
+}
+
+/// A `resume = ()` coroutine implements `IntoIterator`, so it can be
+/// passed directly to a `for` loop without `Iter::new`.
+#[test]
+fn into_iterator_direct_for_loop() {
+    #[diapause::coroutine(yield = u32, resume = ())]
+    fn count_to_five() {
+        let nums: [u32; 5] = [1, 2, 3, 4, 5];
+        for n in nums {
+            yield_!(n);
+        }
+    }
+
+    let mut sum = 0;
+    for n in count_to_five() {
+        sum += n;
+    }
+    assert_eq!(sum, 15);
+}
+
+/// `IntoIterator::into_iter` yields a `diapause::Iter` that can be driven
+/// with `next`.
+#[test]
+fn into_iterator_into_iter_call() {
+    #[diapause::coroutine(yield = u32, resume = ())]
+    fn count() {
+        let nums: [u32; 2] = [7, 8];
+        for n in nums {
+            yield_!(n);
+        }
+    }
+
+    let mut iter = count().into_iter();
+    assert_eq!(iter.next(), Some(7));
+    assert_eq!(iter.next(), Some(8));
+    assert_eq!(iter.next(), None);
+}
+
+/// Omitting `resume` (defaulting to `()`) still generates `IntoIterator`.
+#[test]
+fn into_iterator_default_resume() {
+    #[diapause::coroutine(yield = u32)]
+    fn count() {
+        let nums: [u32; 2] = [1, 2];
+        for n in nums {
+            yield_!(n);
+        }
+    }
+
+    let collected: u32 = count().into_iter().sum();
+    assert_eq!(collected, 3);
 }
 
 /// Iter can be used as an IntoIterator (since Iterator auto-implements it).
@@ -90,19 +142,78 @@ fn iter_consumed_after_iteration() {
     assert_eq!(iter.next(), None);
 }
 
-/// Iter deref access to underlying coroutine.
+/// `get_ref` exposes the wrapped coroutine for inspection (e.g. its
+/// status) without consuming the iterator.
 #[test]
-fn iter_deref_access() {
+fn iter_get_ref() {
+    use diapause::{Coroutine, CoroutineStatus};
+
     #[diapause::coroutine(yield = u32, resume = ())]
     fn single_yield() {
         yield_!(42);
     }
 
     let mut iter = diapause::Iter::new(single_yield());
-    // Deref to access coroutine's methods (if needed)
-    // Just test that Deref works
-    let _c: &_ = &*iter;
+    assert_eq!(iter.get_ref().status(), CoroutineStatus::NotStarted);
     assert_eq!(iter.next(), Some(42));
+    assert_eq!(iter.get_ref().status(), CoroutineStatus::Suspended);
+    assert_eq!(iter.next(), None);
+    assert_eq!(iter.get_ref().status(), CoroutineStatus::Done);
+}
+
+/// Driving the coroutine directly through `get_mut` stays consistent with
+/// continued iteration, because `next` re-derives its action from the
+/// coroutine's `status()` rather than any shadow state in the `Iter`.
+#[test]
+fn iter_get_mut_stays_consistent() {
+    use diapause::{Coroutine, CoroutineState};
+
+    #[diapause::coroutine(yield = u32, resume = ())]
+    fn count() {
+        let nums: [u32; 4] = [1, 2, 3, 4];
+        for n in nums {
+            yield_!(n);
+        }
+    }
+
+    let mut iter = diapause::Iter::new(count());
+    // Drive the first step directly through the coroutine.
+    assert_eq!(iter.get_mut().start(), CoroutineState::Yielded(1));
+    // The Iter picks up seamlessly from the coroutine's real status.
+    assert_eq!(iter.next(), Some(2));
+    // Drive another step directly.
+    assert_eq!(iter.get_mut().resume(()), CoroutineState::Yielded(3));
+    assert_eq!(iter.next(), Some(4));
+    assert_eq!(iter.next(), None);
+}
+
+/// A `Poisoned` coroutine makes `next` panic rather than silently ending.
+#[test]
+#[should_panic(expected = "Poisoned")]
+fn iter_poisoned_panics() {
+    use diapause::Coroutine;
+
+    #[diapause::coroutine(yield = u32, resume = ())]
+    fn boom() {
+        let vals: [u32; 1] = [1];
+        let divisor = 0u32;
+        for v in vals {
+            // Panics while evaluating the yield expression during `start`.
+            yield_!(v / divisor);
+        }
+    }
+
+    let mut iter = diapause::Iter::new(boom());
+    // First `next` runs `start`, which panics inside the transition and
+    // leaves the coroutine Poisoned.
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next()));
+    assert!(poisoned.is_err());
+    assert_eq!(
+        iter.get_ref().status(),
+        diapause::CoroutineStatus::Poisoned
+    );
+    // The next call observes Poisoned and re-panics.
+    let _ = iter.next();
 }
 
 /// Iter can be converted back to inner coroutine.
@@ -119,6 +230,23 @@ fn iter_into_inner() {
     let iter = diapause::Iter::new(count());
     let _c = iter.into_inner();
     // Can't use c afterward since it's consumed, but we've proven the method exists
+}
+
+/// `IntoIterator` is generated for generic coroutines too, with the
+/// generics propagated onto the impl.
+#[test]
+fn into_iterator_generic_coroutine() {
+    #[diapause::coroutine(yield = T, resume = ())]
+    fn repeat<T: Clone>(value: T) {
+        yield_!(value.clone());
+        yield_!(value);
+    }
+
+    let collected: Vec<u32> = repeat(9u32).into_iter().collect();
+    assert_eq!(collected, [9, 9]);
+
+    let words: Vec<String> = repeat("hi".to_string()).into_iter().collect();
+    assert_eq!(words, ["hi", "hi"]);
 }
 
 #[diapause::coroutine(yield = u32, resume = ())]
