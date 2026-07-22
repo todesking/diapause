@@ -211,7 +211,7 @@ impl<T> FromResidual<()> for Option<T> {
 /// the coroutine's yielded values. The coroutine's completion value is
 /// discarded.
 ///
-/// # Example
+/// # Example: Direct iteration
 ///
 /// ```
 /// use diapause::{Coroutine, CoroutineState};
@@ -229,6 +229,26 @@ impl<T> FromResidual<()> for Option<T> {
 /// assert_eq!(iter.next(), Some(1));
 /// assert_eq!(iter.next(), Some(2));
 /// assert_eq!(iter.next(), None);
+/// ```
+///
+/// # Example: Using for loop
+///
+/// ```
+/// use diapause::Coroutine;
+///
+/// #[diapause::coroutine(yield = u32, resume = ())]
+/// fn count_to_three() {
+///     let nums: [u32; 3] = [1, 2, 3];
+///     for n in nums {
+///         yield_!(n);
+///     }
+/// }
+///
+/// let mut sum = 0;
+/// for n in diapause::Iter::new(count_to_three()) {
+///     sum += n;
+/// }
+/// assert_eq!(sum, 6);
 /// ```
 pub struct Iter<C> {
     coroutine: C,
