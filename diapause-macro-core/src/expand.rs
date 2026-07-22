@@ -1249,6 +1249,27 @@ mod tests {
     }
 
     #[test]
+    fn reborrow_of_non_local_name_crossing_yield_does_not_panic() {
+        // A direct borrow of a name that is not a local binding (a
+        // `static`/`const`, or an undefined name rustc will diagnose)
+        // is rebuilt by name after resume. The IR self-check must not
+        // treat its source as a missing field and panic; it should
+        // hand the tokens to rustc, which then reports any bad name.
+        // Regression: found by the `expand` fuzz target.
+        let item: syn::ItemFn = parse_quote! {
+            fn c() -> u32 {
+                let w: &u32 = &UNDEFINED_GLOBAL;
+                let r = yield_!(1u32);
+                (*w).wrapping_add(r)
+            }
+        };
+        let out = expand(quote!(yield = u32, resume = u32), item)
+            .expect("a non-local reborrow must expand, not error");
+        // The rebuilt borrow references the name verbatim for rustc.
+        assert!(out.to_string().contains("UNDEFINED_GLOBAL"));
+    }
+
+    #[test]
     fn expand_debug_parse_error_has_no_artifacts() {
         let dbg = expand_debug(
             quote!(banana = i32),

@@ -570,7 +570,10 @@ impl Validator<'_> {
                 available.extend((0..self.n_args).map(|i| self.cfg.bindings[i].ident.to_string()));
             }
             for rb in &v.reborrows {
-                if !available.contains(&rb.source.to_string()) {
+                // A non-local source (a `static`/`const`, or an
+                // undefined name rustc will diagnose) is rebuilt
+                // verbatim and need not be a field or earlier reborrow.
+                if rb.source_is_local && !available.contains(&rb.source.to_string()) {
                     self.report(format!(
                         "the reborrow `{} = &{}` at the head of {} has no source: \
                          `{}` is neither a field nor an earlier reborrow",

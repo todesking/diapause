@@ -43,6 +43,12 @@ pub struct Reborrow {
     pub target_mut: Option<syn::Token![mut]>,
     pub source: syn::Ident,
     pub mutable: bool,
+    /// Whether `source` names a tracked local binding. A borrow of a
+    /// non-local name (`static`/`const`, or a name rustc will reject) is
+    /// still rebuilt verbatim, but its source is not a variant field or
+    /// an earlier reborrow, so the IR self-check must not require it to
+    /// be one.
+    pub source_is_local: bool,
 }
 
 /// A block that becomes a coroutine state (an enum variant): a non-inline
@@ -270,8 +276,8 @@ impl Context<'_> {
                 let b = &self.cfg.bindings[t.0];
                 let BorrowSource::Direct {
                     source_ident,
+                    source,
                     mutable,
-                    ..
                 } = &b.borrow
                 else {
                     unreachable!("BUG: rebuild of a non-borrow binding")
@@ -281,6 +287,7 @@ impl Context<'_> {
                     target_mut: b.mutability,
                     source: source_ident.clone(),
                     mutable: *mutable,
+                    source_is_local: source.is_some(),
                 }
             })
             .collect()
