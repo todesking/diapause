@@ -1,0 +1,56 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn co((b0, b1): (u32, u32), a2: u32) -> Option<u32> {
+    let a0: u32 = b0;
+    let a1: u32 = b1;
+    let r0 = yield_!(((a0).wrapping_add(a0)).wrapping_mul(a0));
+    let mut c1: u32 = 0u32;
+    'l0: loop {
+        if c1 >= 2u32 {
+            break 'l0;
+        }
+        c1 = c1.wrapping_add(1u32);
+        let r2 = yield_!(a1);
+    }
+    if (2) < (r0) {
+        match (((a1, ((r0, 13).1)).0)) % 2u32 {
+            0u32 if ((a1) < (a1)) && ((a0) < ((7u32).wrapping_add(a1))) => yield_!(((-(((11) % 16u32) as i32)) as u32)),
+            _ => yield_!(((r0, a1).1)),
+        };
+    }
+    yield_!(a0);
+    yield_!(6u32);
+    let mut c3: u32 = 0u32;
+    'l1: while c3 < 4u32 {
+        c3 = c3.wrapping_add(1u32);
+        let w4: &u32 = &c1;
+        let z5: &&u32 = &w4;
+        let 0u32 = (14u32) % 4u32 else {
+            match (r0) % 2u32 {
+                0u32 if (((a2, a1).1)) % 3u32 == 0u32 => yield_!((c1).wrapping_add(r0)),
+                _ => 2u32,
+            };
+            let s6: crate::case_021::co::State = crate::case_021::co((((c3).wrapping_add(9)) % 16u32), ((6) % 16u32));
+            yield_all!(s6);
+            break 'l1;
+        };
+        let r7 = yield_!((((a0) as u64) as u32));
+        let mut v8: u32 = (**z5);
+    }
+    let mut c9: u32 = 0u32;
+    'l2: loop {
+        if c9 >= 1u32 {
+            break 'l2 None;
+        }
+        c9 = c9.wrapping_add(1u32);
+        fn g10(v: u32) -> u32 {
+            v.wrapping_mul(2u32)
+        }
+        let mut v11: u32 = g10((((a2) as u64) as u32));
+        let mut v12: u32 = c9;
+        let mut c13: u32 = 0u32;
+        'l3: while c13 < 4u32 {
+            c13 = c13.wrapping_add(1u32);
+            let r14 = yield_!(v11);
+        }
+    }
+}

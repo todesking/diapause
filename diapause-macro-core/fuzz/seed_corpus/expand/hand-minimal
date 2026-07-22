@@ -1,0 +1,5 @@
+#[diapause::coroutine(yield = u32, resume = String)]
+fn foo(a: u32) -> usize {
+    let r = yield_!(a + 1);
+    r.len()
+}

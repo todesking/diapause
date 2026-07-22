@@ -1,0 +1,6 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn foo(a: Result<u32, ()>) -> Result<u32, ()> {
+    let x = a?;
+    let y = yield_!(x);
+    Ok(y)
+}

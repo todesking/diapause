@@ -1,0 +1,33 @@
+[package]
+name = "diapause-macro-core-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Detach from the parent workspace: this crate depends on nightly-only
+# libfuzzer tooling and must never affect the stable workspace build.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+proc-macro2 = "1"
+syn = { version = "2", features = ["full"] }
+
+[dependencies.diapause-macro-core]
+path = ".."
+
+[[bin]]
+name = "expand"
+path = "fuzz_targets/expand.rs"
+test = false
+doc = false
+bench = false
+
+# Keep debug assertions on so `expand`'s internal IR self-check (which
+# panics on codegen-invariant violations) is exercised while fuzzing.
+[profile.release]
+debug-assertions = true
+overflow-checks = true

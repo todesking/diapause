@@ -1,0 +1,11 @@
+#[diapause::coroutine(yield = (), resume = u32)]
+fn co(a0: u32, a1: u32) -> u32 {
+    let mut v2: u32 = if ((diapause_difftest::Pair { x: a0, y: a0 }.y)) % 3u32 == 0u32 {
+        a0
+    } else {
+        let f0 = |v: u32| -> u32 { v.wrapping_add(5u32) };
+        let mut v1: u32 = f0(((a0) % 6u32));
+        15u32
+    };
+    yield_!()
+}

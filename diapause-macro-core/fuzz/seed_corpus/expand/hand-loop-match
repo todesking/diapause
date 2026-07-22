@@ -1,0 +1,13 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn foo(mut n: u32) -> u32 {
+    let mut acc: u32 = 0;
+    while n > 0 {
+        let r = yield_!(n);
+        acc = match r {
+            0 => acc,
+            other => acc + other,
+        };
+        n -= 1;
+    }
+    acc
+}

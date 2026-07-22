@@ -1,0 +1,27 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn co((b0, b1): (u32, u32), a2: u32) -> Result<u32, diapause_difftest::Err1> {
+    let a0: u32 = b0;
+    let a1: u32 = b1;
+    let 0u32 = (((a1) % 4u32)) % 4u32 else {
+        let mut o0: Option<u32> = None;
+        if (((((a1) as u64) as u32)) < ((a0).wrapping_sub(15u32))) && ((6u32) % 2u32 == 0u32) {
+            let 0u32 = (((((a1).wrapping_sub(3)) as u64) as u32)) % 4u32 else {
+                let q1: Result<u32, diapause_difftest::Err2> = Ok(a1);
+                match (3u32) % 2u32 {
+                    0u32 => {
+                        yield_!((((8u32, a1).0)).wrapping_add(((a0) % 2u32)));
+                        let q2: Result<u32, diapause_difftest::Err2> = Ok((((diapause_difftest::Pair { x: 0u32, y: a0 }.x)) % 3u32));
+                        let q3: Result<u32, diapause_difftest::Err2> = Ok((diapause_difftest::Pair { x: 5u32, y: (13u32).wrapping_add(6u32) }.x));
+                    }
+                    _ => {
+                        return Ok(2u32);
+                    }
+                }
+                return Ok(((((a0).wrapping_mul(0u32)) as u64) as u32));
+            };
+        } else {
+        }
+        return Ok(8u32);
+    };
+    Ok(a0)
+}

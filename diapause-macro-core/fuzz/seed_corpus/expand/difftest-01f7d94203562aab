@@ -1,0 +1,17 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn co(a0: u32, a1: u32) -> Option<u32> {
+    let mut v0: u32 = if (a0) < (a1) {
+        ((-(((4u32) % 16u32) as i32)) as u32)
+    } else {
+        a0
+    };
+    if (((((15) as u64) as u32)) % 2u32 == 0u32) || ((14u32) % 2u32 == 0u32) {
+        let s1: crate::case_005::co::State = crate::case_005::co(((v0) % 16u32), ((4u32) % 16u32));
+        let q2: Result<u32, diapause_difftest::Err1> = yield_all!(s1);
+        if ((diapause_difftest::Pair { x: 5u32, y: v0 }.x)) < (12u32) {
+            let r3: u32 = u32::wrapping_add(yield_!(13u32), yield_!((v0).wrapping_add(a0)));
+        }
+    } else {
+    }
+    Some(1u32)
+}

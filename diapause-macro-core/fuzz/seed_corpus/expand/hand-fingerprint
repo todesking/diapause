@@ -1,0 +1,4 @@
+#[diapause::coroutine(yield = (), resume = (), fingerprint)]
+fn foo() {
+    yield_!(());
+}

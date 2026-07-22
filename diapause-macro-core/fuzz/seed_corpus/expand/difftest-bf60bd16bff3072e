@@ -1,0 +1,52 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn co(a0: u32, a1: u32) -> u32 {
+    match (a1) % 3u32 {
+        0u32 => {
+            match (((((diapause_difftest::Pair { x: 15, y: 8 }.x)) as u64) as u32)) % 2u32 {
+                0u32 => {
+                    let s0: crate::case_002::co::State = crate::case_002::co(((a0) % 16u32), ((a0) % 16u32));
+                    yield_all!(s0);
+                    yield_!((((2u32).wrapping_sub(9u32)) % 3u32));
+                    let mut v12: u32 = match (a0) % 2u32 {
+                        0u32 => {
+                            let mut c1: u32 = 0u32;
+                            'l0: while c1 < 4u32 {
+                                c1 = c1.wrapping_add(1u32);
+                                fn g2(v: u32) -> u32 {
+                                    v.wrapping_mul(9u32)
+                                }
+                                let mut v3: u32 = g2((c1).wrapping_mul(c1));
+                            }
+                            let mut m4 = c1;
+                            'l1: for i5 in 0u32..a0 {
+                                yield_!(a0);
+                                let s6: crate::case_035::co::State = crate::case_035::co((((0u32).wrapping_mul(4u32)) % 16u32), ((6u32) % 16u32));
+                                let mut o7: Option<u32> = yield_all!(s6);
+                            }
+                            fn g8(v: u32) -> u32 {
+                                v.wrapping_mul(3u32)
+                            }
+                            let mut v9: u32 = g8(a1);
+                            fn g10(v: u32) -> u32 {
+                                v.wrapping_mul(12u32)
+                            }
+                            let mut v11: u32 = g10(15u32);
+                            (9u32).wrapping_sub(a0)
+                        }
+                        _ => {
+                            (6u32).wrapping_sub((((a0) as u64) as u32))
+                        }
+                    };
+                }
+                _ => {
+                }
+            }
+            return a1;
+        }
+        1u32 => {
+        }
+        _ => {
+        }
+    }
+    ((5u32, (a1).wrapping_sub(a1)).0)
+}

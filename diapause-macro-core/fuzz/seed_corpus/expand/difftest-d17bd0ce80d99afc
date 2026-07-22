@@ -1,0 +1,27 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn co((b0, b1): (u32, u32), a2: u32) -> u32 {
+    let a0: u32 = b0;
+    let a1: u32 = b1;
+    if ((((1) as u64) as u32)) < (a1) {
+        let w0: &u32 = &a2;
+        yield_!(((-(((a1) % 16u32) as i32)) as u32));
+        match (a0) % 2u32 {
+            0u32 => (a0).wrapping_add(a2),
+            _ => 1,
+        };
+        let mut v1: u32 = (*w0);
+        v1 = u32::wrapping_add(v1, yield_!(((a2, a1).0)));
+        return 10u32;
+    } else {
+        yield_!((((a0).wrapping_sub(a1)) % 4u32));
+        let mut v2: u32 = (format!("x{}", (a0).wrapping_mul(a0)).len() as u32);
+    }
+    let mut m3 = a1;
+    yield_!(((m3, a2).0));
+    m3 ^= yield_!(m3);
+    'l0: for i4 in 0u32..=2u32 {
+        yield_!((diapause_difftest::Pair { x: (0u32).wrapping_add(a0), y: a1 }.y));
+        yield_!(a0);
+    }
+    yield_!((diapause_difftest::Pair { x: ((14u32) % 4u32), y: a2 }.x))
+}

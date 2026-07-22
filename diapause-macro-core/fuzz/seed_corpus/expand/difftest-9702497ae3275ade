@@ -1,0 +1,8 @@
+#[diapause::coroutine(yield = u32, resume = u32, fingerprint = "difftest-tag")]
+fn co((b0, b1): (u32, u32), a2: u32) -> u32 {
+    let a0: u32 = b0;
+    let a1: u32 = b1;
+    let mut o0: Option<u32> = Some((a2).wrapping_mul(8u32));
+    format!("{:?}", a0);
+    yield_!(11)
+}

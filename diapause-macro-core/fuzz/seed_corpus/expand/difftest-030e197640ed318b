@@ -1,0 +1,38 @@
+#[diapause::coroutine(yield = u32, resume = u32, fingerprint)]
+fn co(a0: u32, a1: u32) {
+    match (((((7u32) as u64) as u32)).wrapping_mul(((a0) % 6u32))) % 2u32 {
+        0u32 if (a0) < (4u32) => ((-(((a0) % 16u32) as i32)) as u32),
+        _ => yield_!(6u32),
+    };
+    match (((-(((a0) % 16u32) as i32)) as u32)) % 3u32 {
+        0u32 if ((a1).wrapping_mul(a0)) < ((a1).wrapping_sub(5u32)) => {
+            match (1u32) % 2u32 {
+                0u32 => {
+                    let w0: &u32 = &a0;
+                    let r1: u32 = yield_!((a0).wrapping_mul(a0));
+                    let mut v2: u32 = (*w0);
+                    match (14u32) % 3u32 {
+                        0u32 => {
+                            let s3: crate::case_002::co::State = crate::case_002::co(((a0) % 16u32), ((((12, r1).1)) % 16u32));
+                            let mut o4: Option<u32> = yield_all!(s3);
+                        }
+                        1u32 if (4) % 3u32 == 0u32 => {
+                            v2 = v2;
+                            return;
+                        }
+                        _ => {
+                            let mut v5: u32 = r1;
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        1u32 => {
+        }
+        _ => {
+        }
+    }
+    yield_!(((diapause_difftest::Pair { x: 5u32, y: a0 }.y)).wrapping_mul(a0));
+}

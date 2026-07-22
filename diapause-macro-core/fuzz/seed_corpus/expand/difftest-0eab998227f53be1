@@ -1,0 +1,30 @@
+#[diapause::coroutine(yield = u32, resume = u32, fingerprint)]
+fn co((b0, b1): (u32, u32), a2: u32) -> Result<u32, diapause_difftest::Err1> {
+    let a0: u32 = b0;
+    let a1: u32 = b1;
+    match (a1) % 3u32 {
+        0u32 => yield_!((10u32).wrapping_sub(4u32)),
+        1u32 => yield_!(a0),
+        _ => (5u32).wrapping_mul(a1),
+    };
+    'l0: {
+        let w0: &u32 = &a1;
+        let z1: &&u32 = &w0;
+        let s2: crate::case_012::co::State = crate::case_012::co(((13) % 16u32), ((((-(((a2) % 16u32) as i32)) as u32)) % 16u32));
+        let q3: Result<u32, diapause_difftest::Err1> = yield_all!(s2);
+        let r4 = yield_!(((8u32) % 5u32));
+        'l1: for i5 in 0u32..1u32 {
+            let q6: Result<u32, diapause_difftest::Err2> = Ok(((-(((((-(((12u32) % 16u32) as i32)) as u32)) % 16u32) as i32)) as u32));
+            let mut c7: u32 = 0u32;
+            let mut v9: u32 = 'l2: loop {
+                if c7 >= 4u32 {
+                    break 'l2 ((-(((a1) % 16u32) as i32)) as u32);
+                }
+                c7 = c7.wrapping_add(1u32);
+                let v8: u32 = q6?;
+            };
+        }
+        let mut v10: u32 = (**z1);
+    }
+    Ok(yield_!(a1))
+}

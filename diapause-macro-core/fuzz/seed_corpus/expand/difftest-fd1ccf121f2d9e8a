@@ -1,0 +1,56 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn co(a0: u32, a1: u32) -> Option<u32> {
+    let w0 = &a0;
+    yield_!((*w0));
+    let mut v1: u32 = (*w0);
+    let mut c2: u32 = 0u32;
+    'l0: while c2 < 1u32 {
+        c2 = c2.wrapping_add(1u32);
+        let mut v3: u32 = (7u32).wrapping_mul(a0);
+        let s4: crate::case_017::co::State = crate::case_017::co((((v1).wrapping_sub(v3)) % 16u32), ((1u32) % 16u32));
+        yield_all!(s4);
+        fn g5(v: u32) -> u32 {
+            v.wrapping_mul(11u32)
+        }
+        let mut v6: u32 = g5((diapause_difftest::Pair { x: a1, y: v1 }.y));
+        match (4u32) % 2u32 {
+            0u32 => yield_!(5u32),
+            _ => yield_!((((v6) as u64) as u32)),
+        };
+        let r7 = yield_!((6u32).wrapping_add(5u32));
+        let n8 = -4i32;
+        yield_!(((r7).wrapping_mul(v6)).wrapping_add(v1));
+        let mut m9 = a1;
+        let mut o10: Option<u32> = Some(8);
+    }
+    let mut c11: u32 = 0u32;
+    'l1: loop {
+        if c11 >= 3u32 {
+            break 'l1 Some(a1);
+        }
+        c11 = c11.wrapping_add(1u32);
+        let r12: u32 = yield_!((a1).wrapping_sub(a1));
+        match (14u32) % 3u32 {
+            0u32 => yield_!(((8u32, r12).1)),
+            1u32 => 2u32,
+            _ => a0,
+        };
+        match (((((a0, a0).1), (11u32).wrapping_mul(12u32)).0)) % 3u32 {
+            0u32 if ((c11).wrapping_mul(c11)) < (1u32) => {
+                let mut c13: u32 = 0u32;
+                'l2: loop {
+                    if c13 >= 2u32 {
+                        break 'l2;
+                    }
+                    c13 = c13.wrapping_add(1u32);
+                    let s14: crate::case_015::co::State = crate::case_015::co(((((1u32, r12).1)) % 16u32), (((diapause_difftest::Pair { x: 8u32, y: a1 }.x)) % 16u32));
+                    let v15: u32 = yield_all!(s14);
+                }
+            }
+            1u32 if (12u32) % 3u32 == 0u32 => {
+            }
+            _ => {
+            }
+        }
+    }
+}

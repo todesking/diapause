@@ -1,0 +1,29 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn co(a0: u32, a1: u32) {
+    match ((((a1) as u64) as u32)) % 3u32 {
+        0u32 if ((15u32) % 2u32 == 0u32) && ((3u32) < (a1)) => {
+            yield_!(a0);
+            let r0 = yield_!(15);
+        }
+        1u32 => {
+            let r1 = yield_!((((0u32, a0).1)).wrapping_mul(a0));
+        }
+        _ => {
+            match (8u32) % 2u32 {
+                0u32 => {
+                    let r2: u32 = u32::wrapping_add(yield_!(a0), yield_!((a0).wrapping_mul(a0)));
+                }
+                _ => {
+                    'l0: {
+                        let w3 = &a0;
+                        let r4 = yield_!(a1);
+                        let mut v5: u32 = (*w3);
+                    }
+                }
+            }
+            let s6: crate::case_012::co::State = crate::case_012::co(((((-(((14u32) % 16u32) as i32)) as u32)) % 16u32), ((6) % 16u32));
+            let q7: Result<u32, diapause_difftest::Err1> = yield_all!(s6);
+        }
+    }
+    ()
+}

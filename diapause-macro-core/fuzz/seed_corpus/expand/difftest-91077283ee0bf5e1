@@ -1,0 +1,45 @@
+#[diapause::coroutine(yield = u32, resume = u32, fingerprint)]
+fn co(a0: u32, a1: u32) -> () {
+    if ((a0) < ((((a1) as u64) as u32))) || (((11u32).wrapping_add(9u32)) % 3u32 == 0u32) {
+        if (6) % 2u32 == 0u32 {
+            let f0 = |v: u32| v.wrapping_add(12u32);
+            let mut v1: u32 = f0(((-(((a0) % 16u32) as i32)) as u32));
+            return;
+        } else if (((((a0) as u64) as u32)) < (a0)) && ((a1) < ((14u32).wrapping_mul(a1))) {
+            let mut c2: u32 = 0u32;
+            'l0: loop {
+                if c2 >= 4u32 {
+                    break 'l0;
+                }
+                c2 = c2.wrapping_add(1u32);
+                let mut v3: u32 = if ((((a0) as u64) as u32)) < ((a1).wrapping_mul(11u32)) {
+                    ((-(((9u32) % 16u32) as i32)) as u32)
+                } else {
+                    (((-(((a1) % 16u32) as i32)) as u32)).wrapping_add(7u32)
+                };
+                let mut c4: u32 = 0u32;
+                'l1: loop {
+                    if c4 >= 4u32 {
+                        break 'l1;
+                    }
+                    c4 = c4.wrapping_add(1u32);
+                    fn g5(v: u32) -> u32 {
+                        v.wrapping_mul(8u32)
+                    }
+                    let mut v6: u32 = g5((11u32).wrapping_sub(12u32));
+                    yield_!((((14u32).wrapping_add(c2)) % 4u32));
+                    fn g7(v: u32) -> u32 {
+                        v.wrapping_mul(8u32)
+                    }
+                    let mut v8: u32 = g7((9u32).wrapping_add(v6));
+                    let f9 = |v: u32| -> u32 { v.wrapping_add(15u32) };
+                    let mut v10: u32 = f9(13u32);
+                    v8 = ((11u32).wrapping_mul(v8)).wrapping_mul(v8);
+                }
+            }
+        } else {
+        }
+        return;
+    }
+    ()
+}

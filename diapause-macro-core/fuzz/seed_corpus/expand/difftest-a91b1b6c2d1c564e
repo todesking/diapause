@@ -1,0 +1,40 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn co((b0, b1): (u32, u32), a2: u32) -> u32 {
+    let a0: u32 = b0;
+    let a1: u32 = b1;
+    'l0: {
+        let mut c0: u32 = 0u32;
+        let mut v7: u32 = 'l1: loop {
+            if c0 >= 3u32 {
+                break 'l1 (a1).wrapping_add(a2);
+            }
+            c0 = c0.wrapping_add(1u32);
+            let n1 = -8i32;
+            if ((13) % 3u32 == 0u32) || (((diapause_difftest::Pair { x: a2, y: a1 }.y)) < (a2)) {
+                let w2: &u32 = &a0;
+                let z3: &&u32 = &w2;
+                yield_!(c0);
+                let mut v4: u32 = (**z3);
+                break 'l1 (((((a0) as u64) as u32), ((14u32) % 2u32)).1);
+            } else {
+                let f5 = |v: u32| v.wrapping_add(9u32);
+                let mut v6: u32 = f5((a1).wrapping_mul(0u32));
+            }
+        };
+        v7 = ((v7) % 5u32);
+        let mut c8: u32 = 0u32;
+        let mut v9: u32 = 'l2: loop {
+            if c8 >= 4u32 {
+                break 'l2 7;
+            }
+            c8 = c8.wrapping_add(1u32);
+            if ((a2).wrapping_sub(c8)) % 2u32 == 0u32 {
+                yield_!(a1);
+                continue 'l2;
+            } else {
+            }
+        };
+    }
+    let s10: crate::case_000::co::State = crate::case_000::co((((a1) % 16u32), (((diapause_difftest::Pair { x: a0, y: 14u32 }.x)) % 16u32)));
+    yield_all!(s10)
+}

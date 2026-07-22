@@ -1,0 +1,16 @@
+#[diapause::coroutine(yield = u32, resume = u32, fingerprint = "difftest-tag")]
+fn co(a0: u32, a1: u32) -> u32 {
+    'l0: for i0 in 0u32..=a0 {
+        let r1: u32 = u32::wrapping_add(yield_!((diapause_difftest::Pair { x: a0, y: a1 }.y)), yield_!((a1).wrapping_mul(11)));
+        let arr2: [u32; 4] = [(r1).wrapping_add(r1), (diapause_difftest::Pair { x: 15u32, y: 7u32 }.y), r1, (diapause_difftest::Pair { x: i0, y: 8u32 }.y)];
+        if ((((1u32) as u64) as u32)) % 2u32 == 0u32 {
+            let r3: u32 = u32::wrapping_add(yield_!((((14) as u64) as u32)), yield_!(a1));
+            let mut o4: Option<u32> = None;
+            let mut m5 = a1;
+            let mut v6: u32 = (14u32).wrapping_add((0u32).wrapping_mul(13));
+        } else {
+            continue;
+        }
+    }
+    yield_!(((((((a0) as u64) as u32)) as u64) as u32))
+}

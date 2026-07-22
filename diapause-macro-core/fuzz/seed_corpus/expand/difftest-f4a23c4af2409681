@@ -1,0 +1,12 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn co(a0: u32, a1: u32) -> Option<u32> {
+    let w0: &u32 = &a1;
+    let z1 = &w0;
+    let r2: u32 = yield_!(a0);
+    let mut v3: u32 = (**z1);
+    let w4 = &mut v3;
+    let r5: u32 = yield_!(a1);
+    *w4 = 8u32;
+    let mut v6: u32 = v3;
+    None
+}

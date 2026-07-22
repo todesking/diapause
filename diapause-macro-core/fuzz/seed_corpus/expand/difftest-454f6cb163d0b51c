@@ -1,0 +1,15 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn co((b0, b1): (u32, u32)) -> u32 {
+    let a0: u32 = b0;
+    let a1: u32 = b1;
+    if ((a1).wrapping_add(a0)) % 3u32 == 0u32 {
+        let mut v1: u32 = if ((4u32) < (a1)) && ((a0) < (a0)) {
+            11
+        } else {
+            let r0: u32 = u32::wrapping_add(yield_!((5u32).wrapping_mul(a1)), yield_!(((5u32, 15u32).0)));
+            (((a1) as u64) as u32)
+        };
+        yield_!(9);
+    }
+    (0u32).wrapping_mul((((a1) as u64) as u32))
+}

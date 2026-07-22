@@ -1,0 +1,24 @@
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn co(a0: u32, a1: u32) -> () {
+    let r0 = yield_!((a1).wrapping_add(15u32));
+    if (a0) < (a1) {
+        let w1 = &a0;
+        let arr2: [u32; 4] = [12, (diapause_difftest::Pair { x: 5, y: a0 }.x), (a1).wrapping_add(a1), a1];
+        yield_!((*w1));
+        let mut v3: u32 = (*w1);
+        match (11u32) % 3u32 {
+            0u32 if (((1, 1u32).1)) < (10) => 5u32,
+            1u32 => 15u32,
+            _ => (r0).wrapping_sub(a1),
+        };
+        return;
+    }
+    let mut c4: u32 = 0u32;
+    'l0: loop {
+        if c4 >= 3u32 {
+            break 'l0 ();
+        }
+        c4 = c4.wrapping_add(1u32);
+        let mut v5: u32 = (((a1) as u64) as u32);
+    }
+}
