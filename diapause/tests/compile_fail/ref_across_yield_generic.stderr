@@ -1,0 +1,5 @@
+error: `reference` is held across yield_! but borrows a non-trivial place; only direct borrows of local variables (`let y = &x;` / `let y = &mut x;`) can be reconstructed after resume
+ --> tests/compile_fail/ref_across_yield_generic.rs:5:9
+  |
+5 |     let reference = &items[0];
+  |         ^^^^^^^^^
