@@ -9,8 +9,8 @@ fn simple_counter() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use diapause::{Coroutine, CoroutineState};
     use super::*;
+    use diapause::{Coroutine, CoroutineState};
 
     #[test]
     fn coroutine_works_in_no_std() {
