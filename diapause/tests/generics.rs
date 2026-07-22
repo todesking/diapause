@@ -115,3 +115,68 @@ fn type_params_and_multiple_reference_args() {
     assert_eq!(c.resume(()), CoroutineState::Complete(3 + 2));
     assert_eq!(s, ">7!");
 }
+
+// Type parameter appears in yield type
+#[diapause::coroutine(yield = T)]
+fn yield_type_param<T: Clone + Default>(x: T) -> T {
+    yield_!(x.clone());
+    x
+}
+
+#[test]
+fn type_param_in_yield_type() {
+    let mut c = yield_type_param(42i32);
+    assert_eq!(c.start(), CoroutineState::Yielded(42));
+    assert_eq!(c.resume(()), CoroutineState::Complete(42));
+
+    let mut c = yield_type_param("hello".to_string());
+    assert_eq!(c.start(), CoroutineState::Yielded("hello".to_string()));
+    assert_eq!(c.resume(()), CoroutineState::Complete("hello".to_string()));
+}
+
+// Type parameter appears in return type
+#[diapause::coroutine(yield = u32)]
+fn return_type_param<T: Clone>(x: T, _y: T) -> T {
+    yield_!(1);
+    x
+}
+
+#[test]
+fn type_param_in_return_type() {
+    let mut c = return_type_param(42i32, 0i32);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(42));
+
+    let mut c = return_type_param("test".to_string(), "".to_string());
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete("test".to_string()));
+}
+
+// Multiple type parameters
+#[diapause::coroutine(yield = U)]
+fn multiple_type_params<T: Display, U: Clone>(x: T, y: U) -> U {
+    yield_!(y.clone());
+    let _s = format!("{}", x);
+    y
+}
+
+#[test]
+fn multiple_type_params_in_function() {
+    let mut c = multiple_type_params(42, "result".to_string());
+    assert_eq!(c.start(), CoroutineState::Yielded("result".to_string()));
+    assert_eq!(c.resume(()), CoroutineState::Complete("result".to_string()));
+}
+
+// Type parameter with multiple bounds
+#[diapause::coroutine(yield = u32)]
+fn multiple_bounds<T: Clone + Display + Default>() -> T {
+    yield_!(1);
+    T::default()
+}
+
+#[test]
+fn type_param_with_multiple_bounds() {
+    let mut c = multiple_bounds::<i32>();
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(0));
+}
