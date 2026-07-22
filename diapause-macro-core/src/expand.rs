@@ -284,6 +284,7 @@ impl Prepared {
             .any(|b| matches!(b.ty, TySource::RangeInclusiveIter(_)))
             .then(|| range_inclusive_iter_def(&derive_attrs));
         let resume_body = build_resume_dispatch(&cx, &suspension);
+        let status_body = build_status_dispatch(&cx, &suspension);
         let drive_fn = build_drive_fn(&cx, &suspension.placeholder);
         let fp_check_fn = fp_enabled.then(|| build_check_fingerprint(&cx));
 
@@ -322,6 +323,10 @@ impl Prepared {
                     _resume: #resume_ty,
                 ) -> ::diapause::CoroutineState<#yield_ty, #ret_ty> {
                     #resume_body
+                }
+
+                fn status(&self) -> ::diapause::CoroutineStatus {
+                    #status_body
                 }
             }
 
@@ -574,6 +579,47 @@ fn build_resume_dispatch(cx: &ExpandCtx, suspension: &Suspension) -> TokenStream
                 #invalid_arm
             }
             self.__drive(::core::option::Option::Some(_resume))
+        }
+    }
+}
+
+/// Builds `status()`'s body: a match on the discriminant only, dispatched
+/// on whether the coroutine ever suspends (`suspension.has_yields`), same
+/// as `build_resume_dispatch`.
+fn build_status_dispatch(cx: &ExpandCtx, suspension: &Suspension) -> TokenStream {
+    // Mirrors build_resume_dispatch's `s_idents`/`has_internal`: resume
+    // points map to `Suspended`, and internal-transition variants (only
+    // reachable through forged states, same as `resume`'s "Invalid
+    // state") map to `Poisoned` as the closest fit among the four
+    // statuses.
+    let s_idents: Vec<&syn::Ident> = cx
+        .analysis
+        .variants
+        .iter()
+        .filter(|v| cx.cfg.blocks[v.block].resume_point)
+        .map(|v| &v.ident)
+        .collect();
+    let has_internal = (0..cx.cfg.blocks.len())
+        .any(|b| b != cx.cfg.entry && !cx.cfg.blocks[b].inline && !cx.cfg.blocks[b].resume_point);
+    let invalid_arm = has_internal.then(|| quote!(_ => ::diapause::CoroutineStatus::Poisoned,));
+
+    if !suspension.has_yields {
+        quote! {
+            match self {
+                State::Start { .. } => ::diapause::CoroutineStatus::NotStarted,
+                State::Done => ::diapause::CoroutineStatus::Done,
+                #invalid_arm
+            }
+        }
+    } else {
+        quote! {
+            match self {
+                #(State::#s_idents { .. } => ::diapause::CoroutineStatus::Suspended,)*
+                State::Start { .. } => ::diapause::CoroutineStatus::NotStarted,
+                State::Done => ::diapause::CoroutineStatus::Done,
+                State::Poisoned => ::diapause::CoroutineStatus::Poisoned,
+                #invalid_arm
+            }
         }
     }
 }
