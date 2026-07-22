@@ -13,10 +13,11 @@
 //!
 //! Positions hoisted from: expression statements, `let` initializers
 //! (including `let ... else` scrutinees), trailing expressions,
-//! non-block match-arm bodies, `if` conditions (the first link of an
-//! `else if` chain only — later links are conditionally evaluated),
-//! `match`/`if let` scrutinees, and `for` heads. `while` conditions and
-//! `while let` scrutinees are re-evaluated every iteration and are
+//! non-block match-arm bodies, `if` conditions (the first link only —
+//! of an `else if` chain, or of an edition-2024 let-chain condition;
+//! later links are conditionally evaluated either way), `match`/`if
+//! let` scrutinees, and `for` heads. `while` conditions and `while
+//! let`/let-chain scrutinees are re-evaluated every iteration and are
 //! never hoisted. Conditionally evaluated positions (`&&`/`||` right
 //! operands, match guards, control flow nested inside an expression)
 //! and separate scopes (closures, async blocks, items) are skipped.
@@ -29,7 +30,7 @@ use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 
-use crate::lower::{is_let_chain, is_yield_all_macro, is_yield_macro, skip_nested_scopes};
+use crate::lower::{is_yield_all_macro, is_yield_macro, skip_nested_scopes};
 
 /// Rewrites hoistable expression-position yields in `body` (see the
 /// module docs). Runs before `rewrite_early_exits`, so `?` operators
@@ -123,9 +124,12 @@ impl Hoister {
             // exposes the same head position as the bare form.
             syn::Expr::Paren(p) => self.head(&mut p.expr),
             syn::Expr::Group(g) => self.head(&mut g.expr),
+            // A let-chain condition (`c1 && let p = e && c2 && ..`) is a
+            // `Binary(&&)` tree here, not `Expr::Let`; `walk`'s `&&` arm
+            // already stops hoisting past the first link (mirroring a
+            // bare `a && b`), and its `Expr::Let` arm hoists that link's
+            // scrutinee when it is the leading one.
             syn::Expr::If(ei) => match &mut *ei.cond {
-                // Let chains are rejected wholesale by lowering.
-                c if is_let_chain(c) => {}
                 syn::Expr::Let(el) => self.walk(&mut el.expr),
                 c => self.walk(c),
             },
@@ -157,6 +161,11 @@ impl Hoister {
             // foreign macro), so nothing after it hoists either.
             syn::Expr::Macro(_) => self.pure = false,
             syn::Expr::Path(_) | syn::Expr::Lit(_) => {}
+            // The leading link of a let-chain condition (`let p = e &&
+            // ..`): reached only as the left operand of the `&&` arm
+            // below, so its own purity does not need setting here — the
+            // caller marks the chain impure right after this returns.
+            syn::Expr::Let(el) => self.walk(&mut el.expr),
             syn::Expr::Paren(p) => self.walk(&mut p.expr),
             // Invisible-delimiter groups appear when the body reaches us
             // through another macro's expansion (an `$expr` fragment
@@ -567,6 +576,48 @@ mod tests {
     }
 
     #[test]
+    fn if_let_chain_leading_bool_link_hoists() {
+        assert_hoists(
+            parse_quote!({
+                if f(yield_!(1))
+                    && let Some(x) = opt
+                {
+                    g(x);
+                }
+            }),
+            parse_quote!({
+                let __tmp0 = yield_!(1);
+                if f(__tmp0)
+                    && let Some(x) = opt
+                {
+                    g(x);
+                }
+            }),
+        );
+    }
+
+    #[test]
+    fn if_let_chain_leading_let_link_hoists() {
+        assert_hoists(
+            parse_quote!({
+                if let Some(x) = f(yield_!(1))
+                    && c
+                {
+                    g(x);
+                }
+            }),
+            parse_quote!({
+                let __tmp0 = yield_!(1);
+                if let Some(x) = f(__tmp0)
+                    && c
+                {
+                    g(x);
+                }
+            }),
+        );
+    }
+
+    #[test]
     fn match_scrutinee() {
         assert_hoists(
             parse_quote!({
@@ -815,6 +866,24 @@ mod tests {
                 f();
             } else if g(yield_!(1)) {
                 h();
+            }
+        }));
+    }
+
+    #[test]
+    fn if_let_chain_later_link_never_hoists() {
+        // Conditionally evaluated, like the right operand of a bare
+        // `&&`: only the leading link is unconditionally evaluated.
+        assert_unchanged(parse_quote!({
+            if c && let Some(x) = f(yield_!(1)) {
+                g(x);
+            }
+        }));
+        assert_unchanged(parse_quote!({
+            if let Some(x) = opt
+                && f(yield_!(1))
+            {
+                g(x);
             }
         }));
     }

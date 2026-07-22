@@ -420,8 +420,6 @@ const ERR_SCRUTINEE: &str = "yield_! in a scrutinee is only supported for \
      scrutinee is re-evaluated every iteration and cannot contain yield_!";
 const ERR_GUARD: &str = "yield_! in a match guard is not supported";
 const ERR_UNSAFE: &str = "yield_! inside an unsafe block is not supported";
-const ERR_LET_CHAIN: &str = "a let-chain condition is not supported when the body contains \
-     yield_!; use nested `if let` or `match` instead";
 const ERR_FOR_HEAD: &str = "yield_! in a `for` loop's iterator expression is only \
      supported when everything evaluated before it is a path, a literal, or another \
      yield_!; bind it first: `let r = yield_!(..);`";
@@ -1220,6 +1218,33 @@ pub(crate) fn is_let_chain(cond: &syn::Expr) -> bool {
     !matches!(cond, syn::Expr::Let(_)) && contains_let(cond)
 }
 
+/// One link of an edition-2024 let-chain condition, in left-to-right
+/// evaluation order.
+enum LetChainLink<'a> {
+    Cond(&'a syn::Expr),
+    Let(&'a syn::ExprLet),
+}
+
+/// Splits a let-chain condition into its `&&`-joined links, left to
+/// right (the same recursion `is_let_chain` uses to detect one). Only
+/// meaningful when [`is_let_chain`] holds; a chain always has at least
+/// two links, since a lone `let` is not one.
+fn flatten_let_chain(cond: &syn::Expr) -> Vec<LetChainLink<'_>> {
+    fn go<'a>(e: &'a syn::Expr, out: &mut Vec<LetChainLink<'a>>) {
+        match e {
+            syn::Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_)) => {
+                go(&b.left, out);
+                go(&b.right, out);
+            }
+            syn::Expr::Let(el) => out.push(LetChainLink::Let(el)),
+            other => out.push(LetChainLink::Cond(other)),
+        }
+    }
+    let mut out = Vec::new();
+    go(cond, &mut out);
+    out
+}
+
 /// Turns a discarded expression into a statement: block-like expressions
 /// (if/match/loop/etc.) are already valid statements on their own, while
 /// everything else needs a semicolon to keep the statement sequence valid.
@@ -1275,11 +1300,6 @@ impl Lowerer {
     /// shared `join` block. The arms' trailing expressions are handled
     /// per `ctx` (discarded, assigned to a binding, or returned).
     fn lower_if_arms(&mut self, ei: &syn::ExprIf, join: BlockId, ctx: TailCtx) {
-        if is_let_chain(&ei.cond) {
-            self.err(syn::Error::new_spanned(ei.if_token, ERR_LET_CHAIN));
-            self.terminate(Terminator::Goto(join));
-            return;
-        }
         let then_bb = self.new_block(false);
         // Without an `else`, the false edge produces `()`: in `Store`
         // context it needs a block that assigns it (otherwise the
@@ -1288,33 +1308,43 @@ impl Lowerer {
             (None, TailCtx::Store(_)) | (Some(_), _) => self.new_block(false),
             (None, _) => join,
         };
-        // `if let pat = scrutinee` lowers like a two-arm `match`: the
-        // pattern arm enters the then block, `_` the else block.
-        let pat = match &*ei.cond {
-            syn::Expr::Let(el) => {
-                self.check_no_yield(&el.expr, ERR_SCRUTINEE);
-                self.record_expr_uses(&el.expr, self.current);
-                self.terminate(refutable_match(&el.expr, &el.pat, then_bb, else_bb));
-                Some(&*el.pat)
-            }
-            cond => {
-                self.check_no_yield(cond, ERR_COND);
-                self.record_expr_uses(cond, self.current);
-                self.terminate(Terminator::Branch {
-                    cond: cond.clone(),
-                    then_: then_bb,
-                    else_: else_bb,
-                });
-                None
-            }
-        };
-        self.current = then_bb;
-        self.in_scope(|lw| {
-            if let Some(pat) = pat {
-                lw.define_pat_bindings(pat, then_bb, BindingKind::ArmPat, None);
-            }
-            lw.lower_stmt_list(&ei.then_branch.stmts, ctx);
-        });
+        if is_let_chain(&ei.cond) {
+            // Every link's bindings must stay visible through later
+            // links and the `then` branch, and nowhere else: one scope
+            // covers wiring the whole chain and lowering the branch.
+            self.in_scope(|lw| {
+                lw.lower_let_chain_cond(&ei.cond, then_bb, else_bb);
+                lw.lower_stmt_list(&ei.then_branch.stmts, ctx);
+            });
+        } else {
+            // `if let pat = scrutinee` lowers like a two-arm `match`: the
+            // pattern arm enters the then block, `_` the else block.
+            let pat = match &*ei.cond {
+                syn::Expr::Let(el) => {
+                    self.check_no_yield(&el.expr, ERR_SCRUTINEE);
+                    self.record_expr_uses(&el.expr, self.current);
+                    self.terminate(refutable_match(&el.expr, &el.pat, then_bb, else_bb));
+                    Some(&*el.pat)
+                }
+                cond => {
+                    self.check_no_yield(cond, ERR_COND);
+                    self.record_expr_uses(cond, self.current);
+                    self.terminate(Terminator::Branch {
+                        cond: cond.clone(),
+                        then_: then_bb,
+                        else_: else_bb,
+                    });
+                    None
+                }
+            };
+            self.current = then_bb;
+            self.in_scope(|lw| {
+                if let Some(pat) = pat {
+                    lw.define_pat_bindings(pat, then_bb, BindingKind::ArmPat, None);
+                }
+                lw.lower_stmt_list(&ei.then_branch.stmts, ctx);
+            });
+        }
         self.goto_if_open(join);
         match &ei.else_branch {
             Some((_, else_expr)) => {
@@ -1335,6 +1365,47 @@ impl Lowerer {
                     self.terminate(Terminator::Goto(join));
                 }
             }
+        }
+    }
+
+    /// Wires an edition-2024 let-chain condition (`c1 && let p = e &&
+    /// c2 && ..`) into a chain of `Branch`/`Match` terminators: each
+    /// link's failure jumps straight to `else_bb`, so the source-level
+    /// `else` never gets duplicated into one copy per link. A `let`
+    /// link's pattern bindings are defined in the block reached right
+    /// after it succeeds, so later links and `then_bb` see them; the
+    /// caller must run this inside the scope that should hold them
+    /// (they must not outlive the `if`/`while`). Only the leading link
+    /// can have been hoisted (see `hoist.rs`), so a `yield_!` surviving
+    /// in a later link is rejected exactly as in a bare condition or
+    /// scrutinee. Leaves `self.current` set to `then_bb`.
+    fn lower_let_chain_cond(&mut self, cond: &syn::Expr, then_bb: BlockId, else_bb: BlockId) {
+        let links = flatten_let_chain(cond);
+        let last = links.len() - 1;
+        for (i, link) in links.into_iter().enumerate() {
+            let target = if i == last {
+                then_bb
+            } else {
+                self.new_block(false)
+            };
+            match link {
+                LetChainLink::Cond(c) => {
+                    self.check_no_yield(c, ERR_COND);
+                    self.record_expr_uses(c, self.current);
+                    self.terminate(Terminator::Branch {
+                        cond: c.clone(),
+                        then_: target,
+                        else_: else_bb,
+                    });
+                }
+                LetChainLink::Let(el) => {
+                    self.check_no_yield(&el.expr, ERR_SCRUTINEE);
+                    self.record_expr_uses(&el.expr, self.current);
+                    self.terminate(refutable_match(&el.expr, &el.pat, target, else_bb));
+                    self.define_pat_bindings(&el.pat, target, BindingKind::ArmPat, None);
+                }
+            }
+            self.current = target;
         }
     }
 
@@ -1439,7 +1510,7 @@ impl Lowerer {
             return self.lower_while_let(ew, el);
         }
         if is_let_chain(&ew.cond) {
-            return self.err(syn::Error::new_spanned(ew.while_token, ERR_LET_CHAIN));
+            return self.lower_while_let_chain(ew);
         }
         self.with_loop_frame(
             &ew.label,
@@ -1476,6 +1547,34 @@ impl Lowerer {
             },
             |lw, body| lw.define_pat_bindings(&el.pat, body, BindingKind::ArmPat, None),
         );
+    }
+
+    /// `while c1 && let p = e && c2 { .. }` — an edition-2024 let-chain
+    /// condition in a `while` loop: equivalent to `loop { if <chain> {
+    /// .. } else { break; } }`. Unlike [`Lowerer::with_loop_frame`], the
+    /// whole condition is wired from inside the loop's own scope rather
+    /// than before it: a `let` link's bindings must be visible to later
+    /// links and to the body, and must go out of scope again at the end
+    /// of every iteration (the chain is re-evaluated from the top each
+    /// time around, exactly like a `while let` scrutinee).
+    fn lower_while_let_chain(&mut self, ew: &syn::ExprWhile) {
+        let header = self.new_block(false);
+        self.terminate(Terminator::Goto(header));
+        let exit = self.new_block(false);
+        self.labels.push(Frame {
+            label: ew.label.as_ref().map(|l| l.name.ident.to_string()),
+            header: Some(header),
+            dest: BreakDest::of(TailCtx::Discard, exit),
+        });
+        self.current = header;
+        self.in_scope(|lw| {
+            let body = lw.new_block(false);
+            lw.lower_let_chain_cond(&ew.cond, body, exit);
+            lw.lower_stmt_list(&ew.body.stmts, TailCtx::Discard);
+        });
+        self.terminate(Terminator::Goto(header));
+        self.labels.pop();
+        self.current = exit;
     }
 
     /// Expands `for pat in EXPR { .. }`: the preheader (current block)

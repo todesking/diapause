@@ -453,6 +453,149 @@ fn while_let_becomes_a_header_match() {
     ));
 }
 
+/// A let-chain condition mixing bool and `let` links (`c1 && let Some(x)
+/// = opt && c2`) desugars into one `Branch`/`Match` per link, in order;
+/// every link's failure jumps straight to the shared `else` block
+/// rather than to a separate copy of it.
+#[test]
+fn if_let_chain_mixes_bool_and_let_links() {
+    let block: syn::Block = parse_quote!({
+        if c1
+            && let Some(x) = opt
+            && c2
+        {
+            yield_!(x);
+        } else {
+            other();
+        }
+    });
+    let cfg = lower_args(&["c1", "opt", "c2"], &block);
+    let Terminator::Branch {
+        cond,
+        then_: link2,
+        else_: else_bb,
+    } = &cfg.blocks[cfg.entry].terminator
+    else {
+        panic!("first link should branch on c1");
+    };
+    let c1: syn::Expr = parse_quote!(c1);
+    assert_eq!(*cond, c1);
+    let else_bb = *else_bb;
+
+    let Terminator::Match { arms, .. } = &cfg.blocks[*link2].terminator else {
+        panic!("second link should match on opt");
+    };
+    assert_eq!(arms.len(), 2);
+    assert_eq!(
+        arms[1].body, else_bb,
+        "the let link's failure should jump straight to the shared else block"
+    );
+    let link3 = arms[0].body;
+    assert_eq!(cfg.blocks[link3].defs, ids(&[binding(&cfg, "x")]));
+
+    let Terminator::Branch {
+        cond,
+        then_: then_bb,
+        else_,
+    } = &cfg.blocks[link3].terminator
+    else {
+        panic!("third link should branch on c2");
+    };
+    let c2: syn::Expr = parse_quote!(c2);
+    assert_eq!(*cond, c2);
+    assert_eq!(
+        *else_, else_bb,
+        "the third link's failure should jump straight to the shared else \
+         block too, not a duplicate"
+    );
+    assert!(matches!(
+        cfg.blocks[*then_bb].terminator,
+        Terminator::Yield { .. }
+    ));
+}
+
+/// A chain of three or more links (here, two `let`s and a bool):
+/// bindings from an earlier `let` link stay in scope for a later
+/// link's condition, not just for the `then` branch.
+#[test]
+fn if_let_chain_with_three_links_shares_bindings_across_links() {
+    let block: syn::Block = parse_quote!({
+        if let Some(x) = ox
+            && x > 0
+            && let Some(y) = oy
+        {
+            yield_!(x + y);
+        }
+        done();
+    });
+    let cfg = lower_args(&["ox", "oy"], &block);
+    let Terminator::Match { arms, .. } = &cfg.blocks[cfg.entry].terminator else {
+        panic!("first (let) link should match on ox");
+    };
+    let link2 = arms[0].body;
+    assert_eq!(cfg.blocks[link2].defs, ids(&[binding(&cfg, "x")]));
+
+    let Terminator::Branch { then_: link3, .. } = &cfg.blocks[link2].terminator else {
+        panic!("second link should branch on `x > 0`, seeing x");
+    };
+    let Terminator::Match { arms, .. } = &cfg.blocks[*link3].terminator else {
+        panic!("third (let) link should match on oy");
+    };
+    let then_bb = arms[0].body;
+    // `y` from the third link and `x` from the first are both visible
+    // in the `then` branch, which uses `x + y`.
+    assert!(cfg.blocks[then_bb].defs.contains(&binding(&cfg, "y")));
+    assert!(matches!(
+        cfg.blocks[then_bb].terminator,
+        Terminator::Yield { .. }
+    ));
+}
+
+/// `while` with a let-chain condition: equivalent to `loop { if <chain>
+/// { .. } else { break; } }`. Every link's failure exits the loop, and
+/// the back edge re-enters the header to re-evaluate the whole chain.
+#[test]
+fn while_let_chain_wires_a_multi_link_header() {
+    let block: syn::Block = parse_quote!({
+        while let Some(x) = it.next()
+            && x > 0
+        {
+            yield_!(x);
+        }
+    });
+    let cfg = lower_args(&["it"], &block);
+    let Terminator::Goto(header) = cfg.blocks[cfg.entry].terminator else {
+        panic!("entry should fall into the header");
+    };
+    let Terminator::Match { arms, .. } = &cfg.blocks[header].terminator else {
+        panic!("header's first link should match on it.next()");
+    };
+    let wild: syn::Pat = parse_quote!(_);
+    assert_eq!(arms[1].pat, wild);
+    let exit = arms[1].body;
+    assert!(matches!(cfg.blocks[exit].terminator, Terminator::Return(_)));
+
+    let link2 = arms[0].body;
+    assert_eq!(cfg.blocks[link2].defs, ids(&[binding(&cfg, "x")]));
+    let Terminator::Branch {
+        then_: body, else_, ..
+    } = &cfg.blocks[link2].terminator
+    else {
+        panic!("second link should branch on `x > 0`");
+    };
+    assert_eq!(
+        *else_, exit,
+        "the second link's failure should exit the loop directly"
+    );
+    let Terminator::Yield { next, .. } = cfg.blocks[*body].terminator else {
+        panic!("loop body should yield");
+    };
+    assert!(matches!(
+        cfg.blocks[next].terminator,
+        Terminator::Goto(h) if h == header
+    ));
+}
+
 #[test]
 fn let_else_becomes_a_refutable_match() {
     let block: syn::Block = parse_quote!({
@@ -1212,6 +1355,35 @@ fn yield_in_conditions_is_rejected() {
     assert!(error_of(&block).to_string().contains("condition"));
 }
 
+/// Only a let-chain's leading link can have been hoisted (`hoist.rs`
+/// never extracts past the first `&&`), so an un-hoisted yield_! in a
+/// later link is rejected exactly like a bare condition/scrutinee.
+#[test]
+fn yield_in_a_later_let_chain_link_is_rejected() {
+    let block: syn::Block = parse_quote!({
+        if let Some(x) = opt
+            && yield_!(1) > 0
+        {
+            f(x);
+        }
+    });
+    assert!(error_of(&block).to_string().contains("condition"));
+    let block: syn::Block = parse_quote!({
+        if c && let Some(x) = yield_!(1) {
+            f(x);
+        }
+    });
+    assert!(error_of(&block).to_string().contains("scrutinee"));
+    let block: syn::Block = parse_quote!({
+        while let Some(x) = opt
+            && yield_!(1) > 0
+        {
+            f(x);
+        }
+    });
+    assert!(error_of(&block).to_string().contains("condition"));
+}
+
 #[test]
 fn yield_in_scrutinee_is_rejected() {
     let block: syn::Block = parse_quote!({
@@ -1255,26 +1427,6 @@ fn yield_in_unsafe_block_is_rejected() {
         }
     });
     assert!(error_of(&block).to_string().contains("unsafe"));
-}
-
-#[test]
-fn let_chain_conditions_are_rejected() {
-    let block: syn::Block = parse_quote!({
-        if let Some(x) = opt
-            && c
-        {
-            yield_!(x);
-        }
-    });
-    assert!(error_of(&block).to_string().contains("let-chain"));
-    let block: syn::Block = parse_quote!({
-        while let Some(x) = opt
-            && c
-        {
-            yield_!(x);
-        }
-    });
-    assert!(error_of(&block).to_string().contains("let-chain"));
 }
 
 #[test]
