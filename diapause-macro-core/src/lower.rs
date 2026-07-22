@@ -395,11 +395,15 @@ const ERR_UNHOISTABLE: &str = "yield_! is not supported in this position: inside
 const ERR_TRAILING_YIELD: &str =
     "yield_! as the trailing expression is not supported; add a semicolon";
 const ERR_FOREIGN_MACRO: &str = "yield_! cannot appear inside another macro invocation";
-const ERR_LET_ELSE_INIT: &str = "yield_! in the initializer of `let ... else` is not supported";
-const ERR_SIMPLE_BINDING: &str =
-    "the binding of `let ... = yield_!(...)` must be a simple identifier";
-const ERR_VALUE_LET_BINDING: &str =
-    "the binding of a `let` whose initializer contains yield_! must be a simple identifier";
+const ERR_LET_ELSE_INIT: &str = "yield_! in the initializer of `let ... else` is not \
+     supported; bind the resume value first: `let r = yield_!(..);` and then \
+     `let Pattern = r else { .. };`";
+const ERR_SIMPLE_BINDING: &str = "the binding of `let ... = yield_!(...)` must be a \
+     simple identifier; bind the resume value to one name and destructure it \
+     afterwards: `let r = yield_!(..); let (a, b) = r;`";
+const ERR_VALUE_LET_BINDING: &str = "the binding of a `let` whose initializer contains \
+     yield_! must be a simple identifier; bind the value to one name and destructure \
+     it in a following `let`";
 const ERR_YIELD_ARG: &str = "yield_! takes a single expression";
 const ERR_VALUE_POSITION: &str = "yield_! in value position is only supported when \
      everything evaluated before it is a path, a literal, or another yield_!, or when \
