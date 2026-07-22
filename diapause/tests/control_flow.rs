@@ -525,7 +525,7 @@ fn sum_odd_replies(n: u32) -> u32 {
     while i < n {
         i += 1;
         let r = yield_!(i);
-        if r.is_multiple_of(2) {
+        if r % 2 == 0 {
             continue;
         }
         sum += r;
