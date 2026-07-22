@@ -288,6 +288,24 @@ impl Prepared {
         let drive_fn = build_drive_fn(&cx, &suspension.placeholder);
         let fp_check_fn = fp_enabled.then(|| build_check_fingerprint(&cx));
 
+        // A coroutine driven with `()` resume values can be iterated, so
+        // emit an `IntoIterator` into `diapause::Iter` that feeds `for`
+        // loops without an explicit `Iter::new`. Guarded on a syntactic
+        // `resume = ()` (covers both the explicit form and the default).
+        let into_iter_impl = is_unit_ty(resume_ty).then(|| {
+            quote! {
+                impl #impl_generics ::core::iter::IntoIterator for State #ty_generics
+                #where_clause
+                {
+                    type Item = #yield_ty;
+                    type IntoIter = ::diapause::Iter<Self>;
+                    fn into_iter(self) -> Self::IntoIter {
+                        ::diapause::Iter::new(self)
+                    }
+                }
+            }
+        });
+
         quote! {
         #(#fn_attrs)*
         #vis fn #name #impl_generics (#(#arg_ident: #arg_ty),*) -> #name::State #ty_generics
@@ -329,6 +347,8 @@ impl Prepared {
                     #status_body
                 }
             }
+
+            #into_iter_impl
 
             impl #impl_generics State #ty_generics #where_clause {
                 /// Fingerprint of the coroutine source this state type was
@@ -984,6 +1004,17 @@ impl VisitMut for JumpMarkerReplacer<'_, '_> {
 /// stored variable mutably when the state is unpacked.
 fn bind_pat(mutability: &Option<syn::Token![mut]>, ident: &syn::Ident) -> TokenStream {
     quote!(#mutability #ident)
+}
+
+/// Whether `ty` is syntactically the unit type `()`, i.e. an empty tuple.
+///
+/// Used to decide whether to emit the `IntoIterator` impl, which only
+/// makes sense for `resume = ()` coroutines. The check is purely
+/// syntactic (the macro has no type information), which covers both the
+/// explicit `resume = ()` and the omitted-and-defaulted case, since the
+/// default is parsed into the same empty-tuple type.
+fn is_unit_ty(ty: &syn::Type) -> bool {
+    matches!(ty, syn::Type::Tuple(t) if t.elems.is_empty())
 }
 
 // === Source fingerprint ===
