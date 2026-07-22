@@ -351,6 +351,29 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, ctx: Ctx) {
             }
             out.push_str(&format!("{i}}}\n"));
         }
+        Stmt::IfLetChain {
+            opt,
+            bind,
+            rebind,
+            cond: c,
+            then_b,
+            else_b,
+        } => {
+            // Parenthesized so a top-level `||` inside a composed `Cond`
+            // reads as one opaque bool link, not a bare `||` joining the
+            // chain (which edition 2024 rejects outright).
+            out.push_str(&format!(
+                "{i}if let Some({bind}) = {opt} && ({}) {{\n",
+                cond(c)
+            ));
+            out.push_str(&format!("{}let mut {rebind}: u32 = {bind};\n", ind(l + 1)));
+            render_block(out, then_b, l + 1, ctx);
+            if let Some(eb) = else_b {
+                out.push_str(&format!("{i}}} else {{\n"));
+                render_block(out, eb, l + 1, ctx);
+            }
+            out.push_str(&format!("{i}}}\n"));
+        }
         Stmt::Match {
             scrut,
             modulus,
@@ -431,6 +454,33 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, ctx: Ctx) {
         } => {
             out.push_str(&format!(
                 "{i}'l{label}: while let Some({bind}) = {opt} {{\n"
+            ));
+            out.push_str(&format!("{}let mut {rebind}: u32 = {bind};\n", ind(l + 1)));
+            out.push_str(&format!(
+                "{}{opt} = if {rebind} < {limit}u32 {{\n{}Some(({rebind}).wrapping_add(1u32))\n{}}} else {{\n{}None\n{}}};\n",
+                ind(l + 1),
+                ind(l + 2),
+                ind(l + 1),
+                ind(l + 2),
+                ind(l + 1)
+            ));
+            render_block(out, body, l + 1, ctx);
+            out.push_str(&format!("{i}}}\n"));
+        }
+        Stmt::WhileLetChain {
+            opt,
+            bind,
+            rebind,
+            cond: c,
+            limit,
+            label,
+            body,
+        } => {
+            // See `IfLetChain`: parenthesized so a top-level `||` reads
+            // as one opaque bool link.
+            out.push_str(&format!(
+                "{i}'l{label}: while let Some({bind}) = {opt} && ({}) {{\n",
+                cond(c)
             ));
             out.push_str(&format!("{}let mut {rebind}: u32 = {bind};\n", ind(l + 1)));
             out.push_str(&format!(

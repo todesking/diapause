@@ -415,6 +415,8 @@ impl<'a> Gen<'a> {
             if has_opt {
                 kinds.push((2, 12));
                 kinds.push((2, 13));
+                kinds.push((1, 31));
+                kinds.push((1, 32));
             }
             if self.jump_possible() {
                 kinds.push((2, 16));
@@ -575,6 +577,8 @@ impl<'a> Gen<'a> {
                 Stmt::ForeignMacro { out, arg }
             }
             30 => self.gen_borrow_span(budget),
+            31 => self.gen_if_let_chain(budget),
+            32 => self.gen_while_let_chain(budget),
             29 => {
                 let name = self.fresh("g");
                 let mul = self.rng.below(16) as u32;
@@ -911,6 +915,41 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// An edition-2024 let-chain condition: the `let` link's binding is
+    /// pushed into scope only long enough to generate the following
+    /// bool link's condition (which may or may not read it), then
+    /// popped again before the immediate rebind — exactly the window in
+    /// which it is safe to reference despite carrying no syntactic
+    /// type.
+    fn gen_if_let_chain(&mut self, budget: &mut i32) -> Stmt {
+        let opt = self.pick_opt_var();
+        let bind = self.fresh("p");
+        let rebind = self.fresh("x");
+        self.depth += 1;
+        let mark = self.scope.len();
+        self.push_var(&bind, false, false);
+        let cond = self.gen_cond();
+        self.scope.truncate(mark);
+        self.push_var(&rebind, true, false);
+        let mut then_b = self.gen_block(budget);
+        self.scope.truncate(mark);
+        let mut else_b = if self.rng.chance(1, 2) {
+            Some(self.gen_block(budget))
+        } else {
+            None
+        };
+        self.depth -= 1;
+        self.maybe_append_jump(&mut then_b, &mut else_b);
+        Stmt::IfLetChain {
+            opt,
+            bind,
+            rebind,
+            cond,
+            then_b,
+            else_b,
+        }
+    }
+
     /// With some probability, append a diverging jump to at most one
     /// branch of a conditional, so a fall-through path always remains.
     fn maybe_append_jump(&mut self, then_b: &mut Vec<Stmt>, else_b: &mut Option<Vec<Stmt>>) {
@@ -1065,6 +1104,42 @@ impl<'a> Gen<'a> {
             opt,
             bind,
             rebind,
+            limit,
+            label,
+            body,
+        }
+    }
+
+    /// The let-chain form of [`Gen::gen_while_let`]: the extra bool link
+    /// only gates entry (it may narrow how many of the up-to-`limit + 1`
+    /// iterations actually run the body, never widen it), so the same
+    /// termination argument applies unchanged.
+    fn gen_while_let_chain(&mut self, budget: &mut i32) -> Stmt {
+        let opt = self.pick_opt_var();
+        let bind = self.fresh("p");
+        let rebind = self.fresh("x");
+        let limit = 1 + self.rng.below(4) as u32;
+        let label = self.fresh_label();
+        self.depth += 1;
+        self.loop_labels.push(LoopLabel {
+            id: label,
+            value: false,
+            block: false,
+        });
+        let mark = self.scope.len();
+        self.push_var(&bind, false, false);
+        let cond = self.gen_cond();
+        self.scope.truncate(mark);
+        self.push_var(&rebind, true, false);
+        let body = self.gen_loop_body(limit as u64 + 1, budget);
+        self.scope.truncate(mark);
+        self.loop_labels.pop();
+        self.depth -= 1;
+        Stmt::WhileLetChain {
+            opt,
+            bind,
+            rebind,
+            cond,
             limit,
             label,
             body,

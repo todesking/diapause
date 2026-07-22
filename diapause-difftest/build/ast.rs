@@ -251,6 +251,18 @@ pub enum Stmt {
         then_b: Vec<Stmt>,
         else_b: Option<Vec<Stmt>>,
     },
+    /// `if let Some(bind) = opt && cond { let mut rebind: u32 = bind;
+    /// .. }` — an edition-2024 let-chain condition: one `let` link
+    /// followed by a bool link that may read `bind`, still evaluated
+    /// before it is rebound so it never crosses a yield either.
+    IfLetChain {
+        opt: String,
+        bind: String,
+        rebind: String,
+        cond: Cond,
+        then_b: Vec<Stmt>,
+        else_b: Option<Vec<Stmt>>,
+    },
     /// `match (scrut) % modulus { 0 => .., .., _ => .. }` with
     /// `modulus` arms (last one is `_`), literal patterns only.
     /// Literal arms may carry a pure (yield-free) guard; a false guard
@@ -301,6 +313,20 @@ pub enum Stmt {
         opt: String,
         bind: String,
         rebind: String,
+        limit: u32,
+        label: usize,
+        body: Vec<Stmt>,
+    },
+    /// `'lN: while let Some(bind) = opt && cond { let mut rebind = bind;
+    /// opt = ..; .. }` — the let-chain form of `WhileLet`: the extra
+    /// bool link (which may read `bind`) only gates entry, so the
+    /// scrutinee-based termination bound still holds regardless of how
+    /// it evaluates.
+    WhileLetChain {
+        opt: String,
+        bind: String,
+        rebind: String,
+        cond: Cond,
         limit: u32,
         label: usize,
         body: Vec<Stmt>,
