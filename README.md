@@ -91,6 +91,8 @@ any code. `start()` runs the body up to the first `yield_!`; each
   edited source instead of resuming at a wrong program point.
 - **Panic safety**: a coroutine that panics mid-transition is left in a
   `Poisoned` state and panics on further use.
+- **`no_std` compatible**: the runtime crate has no `std` dependencies
+  and works in `no_std` environments. No allocation, no unsafe code.
 
 ## Delegating to a sub-coroutine
 
