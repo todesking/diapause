@@ -343,3 +343,27 @@ fn const_generic_parameter() {
     assert_eq!(c.start(), CoroutineState::Yielded(1));
     assert_eq!(c.resume(()), CoroutineState::Complete(30));
 }
+
+// Generic inner with fixed yield type, used in yield_all! delegation
+#[diapause::coroutine(yield = u32)]
+fn inner_generic_u32<T: Clone>(_x: T) -> u32 {
+    yield_!(100);
+    200
+}
+
+#[diapause::coroutine(yield = u32)]
+fn outer_delegates_to_generic<T: Clone>(x: T) -> u32 {
+    let g: inner_generic_u32::State<T> = inner_generic_u32(x);
+    yield_all!(g)
+}
+
+#[test]
+fn generic_coroutine_with_yield_all() {
+    let mut c = outer_delegates_to_generic("test".to_string());
+    assert_eq!(c.start(), CoroutineState::Yielded(100));
+    assert_eq!(c.resume(()), CoroutineState::Complete(200));
+
+    let mut c = outer_delegates_to_generic(42i32);
+    assert_eq!(c.start(), CoroutineState::Yielded(100));
+    assert_eq!(c.resume(()), CoroutineState::Complete(200));
+}
