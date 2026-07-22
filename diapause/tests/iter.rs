@@ -208,10 +208,7 @@ fn iter_poisoned_panics() {
     // leaves the coroutine Poisoned.
     let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| iter.next()));
     assert!(poisoned.is_err());
-    assert_eq!(
-        iter.get_ref().status(),
-        diapause::CoroutineStatus::Poisoned
-    );
+    assert_eq!(iter.get_ref().status(), diapause::CoroutineStatus::Poisoned);
     // The next call observes Poisoned and re-panics.
     let _ = iter.next();
 }
