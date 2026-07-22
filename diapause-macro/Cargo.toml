@@ -3,11 +3,15 @@ name = "diapause-macro"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Procedural macro for the diapause crate; depend on diapause instead"
+categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true
 
 [dependencies]
-diapause-macro-core = { path = "../diapause-macro-core" }
+diapause-macro-core = { path = "../diapause-macro-core", version = "0.1.0" }
 syn = { version = "2", features = ["full"] }
 proc-macro2 = "1"

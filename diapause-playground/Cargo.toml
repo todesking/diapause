@@ -3,6 +3,7 @@ name = "diapause-playground"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [lib]
 # `cdylib` is the wasm-bindgen artifact; `rlib` keeps the crate testable

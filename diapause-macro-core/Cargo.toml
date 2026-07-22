@@ -3,6 +3,10 @@ name = "diapause-macro-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Coroutine transformation internals of the diapause crate; depend on diapause instead"
+categories = ["development-tools::procedural-macro-helpers"]
 
 [dependencies]
 syn = { version = "2", features = ["full", "visit", "visit-mut", "extra-traits"] }

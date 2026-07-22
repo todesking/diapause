@@ -3,9 +3,15 @@ name = "diapause"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Coroutines/generators for stable Rust via code transformation — no async, no Pin, no allocation, no unsafe code"
+readme = "../README.md"
+keywords = ["coroutine", "generator", "yield", "state-machine", "no-std"]
+categories = ["rust-patterns", "no-std", "no-std::no-alloc"]
 
 [dependencies]
-diapause-macro = { path = "../diapause-macro" }
+diapause-macro = { path = "../diapause-macro", version = "0.1.0" }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
