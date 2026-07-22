@@ -253,10 +253,23 @@ impl<T> FromResidual<()> for Option<T> {
 /// the coroutine's yielded values. The coroutine's completion value is
 /// discarded.
 ///
+/// A coroutine whose `resume` type is `()` also implements
+/// [`IntoIterator`] directly (the `#[coroutine]` macro generates it), so
+/// the state can be passed straight to a `for` loop without wrapping it in
+/// `Iter::new`. `Iter::new` remains as the general entry point, e.g. when
+/// naming the iterator type or converting a value already held as `C`.
+///
+/// This wrapper does not implement `Deref`/`DerefMut`; access the wrapped
+/// coroutine explicitly through [`get_ref`](Self::get_ref),
+/// [`get_mut`](Self::get_mut), or [`into_inner`](Self::into_inner). The
+/// iterator holds no shadow state: `next` decides what to do by asking the
+/// coroutine's [`status`](Coroutine::status), so driving the coroutine
+/// directly through `get_mut` stays consistent with continued iteration.
+///
 /// # Example: Direct iteration
 ///
 /// ```
-/// use diapause::{Coroutine, CoroutineState};
+/// use diapause::Coroutine;
 ///
 /// #[diapause::coroutine(yield = u32, resume = ())]
 /// fn count_up() {
@@ -273,11 +286,12 @@ impl<T> FromResidual<()> for Option<T> {
 /// assert_eq!(iter.next(), None);
 /// ```
 ///
-/// # Example: Using for loop
+/// # Example: Using a for loop
+///
+/// A `resume = ()` coroutine implements `IntoIterator`, so it can be
+/// passed directly to `for`:
 ///
 /// ```
-/// use diapause::Coroutine;
-///
 /// #[diapause::coroutine(yield = u32, resume = ())]
 /// fn count_to_three() {
 ///     let nums: [u32; 3] = [1, 2, 3];
@@ -287,50 +301,39 @@ impl<T> FromResidual<()> for Option<T> {
 /// }
 ///
 /// let mut sum = 0;
-/// for n in diapause::Iter::new(count_to_three()) {
+/// for n in count_to_three() {
 ///     sum += n;
 /// }
 /// assert_eq!(sum, 6);
 /// ```
 pub struct Iter<C> {
     coroutine: C,
-    state: IterState,
-}
-
-enum IterState {
-    /// The coroutine has not been started yet.
-    NotStarted,
-    /// The coroutine is currently running (suspended at a yield).
-    Running,
-    /// The coroutine has completed.
-    Complete,
 }
 
 impl<C> Iter<C> {
     /// Creates a new iterator from a coroutine.
     pub const fn new(coroutine: C) -> Self {
-        Iter {
-            coroutine,
-            state: IterState::NotStarted,
-        }
+        Iter { coroutine }
+    }
+
+    /// Returns a shared reference to the wrapped coroutine.
+    pub fn get_ref(&self) -> &C {
+        &self.coroutine
+    }
+
+    /// Returns a mutable reference to the wrapped coroutine.
+    ///
+    /// Driving the coroutine through this reference stays consistent with
+    /// continued iteration: `next` re-derives what to do from the
+    /// coroutine's [`status`](Coroutine::status) rather than any state
+    /// cached in the `Iter`.
+    pub fn get_mut(&mut self) -> &mut C {
+        &mut self.coroutine
     }
 
     /// Consumes the iterator and returns the wrapped coroutine.
     pub fn into_inner(self) -> C {
         self.coroutine
-    }
-}
-
-impl<C> core::ops::Deref for Iter<C> {
-    type Target = C;
-    fn deref(&self) -> &C {
-        &self.coroutine
-    }
-}
-
-impl<C> core::ops::DerefMut for Iter<C> {
-    fn deref_mut(&mut self) -> &mut C {
-        &mut self.coroutine
     }
 }
 
@@ -341,28 +344,20 @@ where
     type Item = C::Yield;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.state {
-            IterState::Complete => None,
-            IterState::NotStarted => match self.coroutine.start() {
-                CoroutineState::Yielded(y) => {
-                    self.state = IterState::Running;
-                    Some(y)
-                }
-                CoroutineState::Complete(_) => {
-                    self.state = IterState::Complete;
-                    None
-                }
-            },
-            IterState::Running => match self.coroutine.resume(()) {
-                CoroutineState::Yielded(y) => Some(y),
-                CoroutineState::Complete(_) => {
-                    self.state = IterState::Complete;
-                    None
-                }
-            },
+        let step = match self.coroutine.status() {
+            CoroutineStatus::NotStarted => self.coroutine.start(),
+            CoroutineStatus::Suspended => self.coroutine.resume(()),
+            CoroutineStatus::Done => return None,
+            CoroutineStatus::Poisoned => panic!("Poisoned"),
+        };
+        match step {
+            CoroutineState::Yielded(y) => Some(y),
+            CoroutineState::Complete(_) => None,
         }
     }
 }
+
+impl<C> core::iter::FusedIterator for Iter<C> where C: Coroutine<()> {}
 
 /// Marks a suspension point inside a `#[diapause::coroutine]` function.
 ///
