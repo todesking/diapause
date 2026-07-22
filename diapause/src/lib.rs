@@ -205,6 +205,103 @@ impl<T> FromResidual<()> for Option<T> {
     }
 }
 
+/// A wrapper that implements `Iterator` for a coroutine.
+///
+/// Converts a coroutine with `resume = ()` into an `Iterator` that yields
+/// the coroutine's yielded values. The coroutine's completion value is
+/// discarded.
+///
+/// # Example
+///
+/// ```
+/// use diapause::{Coroutine, CoroutineState};
+///
+/// #[diapause::coroutine(yield = u32, resume = ())]
+/// fn count_up() {
+///     let nums: [u32; 3] = [0, 1, 2];
+///     for i in nums {
+///         yield_!(i);
+///     }
+/// }
+///
+/// let mut iter = diapause::Iter::new(count_up());
+/// assert_eq!(iter.next(), Some(0));
+/// assert_eq!(iter.next(), Some(1));
+/// assert_eq!(iter.next(), Some(2));
+/// assert_eq!(iter.next(), None);
+/// ```
+pub struct Iter<C> {
+    coroutine: C,
+    state: IterState,
+}
+
+enum IterState {
+    /// The coroutine has not been started yet.
+    NotStarted,
+    /// The coroutine is currently running (suspended at a yield).
+    Running,
+    /// The coroutine has completed.
+    Complete,
+}
+
+impl<C> Iter<C> {
+    /// Creates a new iterator from a coroutine.
+    pub const fn new(coroutine: C) -> Self {
+        Iter {
+            coroutine,
+            state: IterState::NotStarted,
+        }
+    }
+
+    /// Consumes the iterator and returns the wrapped coroutine.
+    pub fn into_inner(self) -> C {
+        self.coroutine
+    }
+}
+
+impl<C> core::ops::Deref for Iter<C> {
+    type Target = C;
+    fn deref(&self) -> &C {
+        &self.coroutine
+    }
+}
+
+impl<C> core::ops::DerefMut for Iter<C> {
+    fn deref_mut(&mut self) -> &mut C {
+        &mut self.coroutine
+    }
+}
+
+impl<C> Iterator for Iter<C>
+where
+    C: Coroutine<()>,
+{
+    type Item = C::Yield;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.state {
+            IterState::Complete => None,
+            IterState::NotStarted => match self.coroutine.start() {
+                CoroutineState::Yielded(y) => {
+                    self.state = IterState::Running;
+                    Some(y)
+                }
+                CoroutineState::Complete(_) => {
+                    self.state = IterState::Complete;
+                    None
+                }
+            },
+            IterState::Running => match self.coroutine.resume(()) {
+                CoroutineState::Yielded(y) => Some(y),
+                CoroutineState::Complete(_) => {
+                    self.state = IterState::Complete;
+                    None
+                }
+            },
+        }
+    }
+}
+
 /// Marks a suspension point inside a `#[diapause::coroutine]` function.
 ///
 /// `yield_!(expr)` suspends the coroutine, yielding `expr` to the caller.
