@@ -180,3 +180,81 @@ fn type_param_with_multiple_bounds() {
     assert_eq!(c.start(), CoroutineState::Yielded(1));
     assert_eq!(c.resume(()), CoroutineState::Complete(0));
 }
+
+// Reference to slice
+#[diapause::coroutine(yield = u32)]
+fn slice_ref(items: &[i32]) -> usize {
+    yield_!(1);
+    items.len()
+}
+
+#[test]
+fn reference_to_slice_argument() {
+    let arr = [1, 2, 3, 4, 5];
+    let mut c = slice_ref(&arr);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(5));
+}
+
+// Reference to &str
+#[diapause::coroutine(yield = u32)]
+fn str_ref(s: &str) -> usize {
+    yield_!(1);
+    s.len()
+}
+
+#[test]
+fn reference_to_str_argument() {
+    let mut c = str_ref("hello");
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(5));
+}
+
+// Mutable reference argument
+#[diapause::coroutine(yield = u32)]
+fn mutable_ref(vec: &mut Vec<u32>) -> u32 {
+    yield_!(1);
+    let sum: u32 = vec.iter().sum();
+    vec.push(sum);
+    sum
+}
+
+#[test]
+fn mutable_reference_argument() {
+    let mut v = vec![1, 2, 3];
+    let mut c = mutable_ref(&mut v);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(6));
+    assert_eq!(v, [1, 2, 3, 6]);
+}
+
+// Multiple references with different lifetimes
+#[diapause::coroutine(yield = u32)]
+fn multi_refs<'a, 'b>(s1: &'a str, s2: &'b str) -> usize {
+    yield_!(1);
+    s1.len() + s2.len()
+}
+
+#[test]
+fn multiple_reference_args_with_different_lifetimes() {
+    let s1 = "hello".to_string();
+    let s2 = "world".to_string();
+    let mut c = multi_refs(s1.as_str(), s2.as_str());
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(10));
+}
+
+// Slice with reference across yield
+#[diapause::coroutine(yield = u32)]
+fn slice_across_yield(items: &[u32]) -> u32 {
+    yield_!(1);
+    items.iter().sum()
+}
+
+#[test]
+fn slice_reference_across_yield() {
+    let arr = [10, 20, 30];
+    let mut c = slice_across_yield(&arr);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(60));
+}
