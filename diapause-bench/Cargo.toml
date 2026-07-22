@@ -1,0 +1,17 @@
+[package]
+name = "diapause-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+diapause = { path = "../diapause" }
+genawaiter = "0.99"
+
+[dev-dependencies]
+criterion = "0.7"
+
+[[bench]]
+name = "coroutines"
+harness = false

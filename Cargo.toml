@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "diapause",
+    "diapause-bench",
     "diapause-difftest",
     "diapause-macro",
     "diapause-macro-core", "diapause-no-std-test",
