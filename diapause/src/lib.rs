@@ -1,3 +1,4 @@
+#![no_std]
 //! Coroutines/generators via code transformation, without `async`.
 //!
 //! Annotate a function with [`macro@coroutine`] and it is rewritten into
