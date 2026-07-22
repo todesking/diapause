@@ -517,10 +517,11 @@ impl Context<'_> {
                         self.err(
                             ident.span(),
                             format!(
-                                "`{name}` is also stored in the coroutine state by the \
-                                 `break`/`continue` in this statement, which would capture \
-                                 this inner `{name}` instead of the stored one; rename the \
-                                 inner binding"
+                                "this `{name}` shadows a variable that the \
+                                 `break`/`continue` in this statement must store into the \
+                                 coroutine state; the jump would capture this inner \
+                                 `{name}` in place of the outer one; rename the inner \
+                                 binding"
                             ),
                         );
                     }

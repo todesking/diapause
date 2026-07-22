@@ -790,10 +790,7 @@ fn opaque_jump_shadowing_a_state_field_is_rejected() {
     });
     let (_, result) = lower_analyze(&[("n", "u32")], &block, &unit());
     let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("`sum` is also stored in the coroutine state"),
-        "got: {msg}"
-    );
+    assert!(msg.contains("this `sum` shadows a variable"), "got: {msg}");
     assert!(msg.contains("rename the inner binding"), "got: {msg}");
 }
 
