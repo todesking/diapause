@@ -1,4 +1,4 @@
-error: `v` is bound by a match arm pattern and must be stored across a state boundary, but arm patterns cannot be annotated with a type; rebind it at the top of the arm: `let v2: Type = v;`
+error: `v` is bound by a match arm pattern and held across yield_!, so it must be stored in the coroutine state, but arm patterns cannot be annotated with a type; rebind it with an explicit type at the top of the arm: `let v2: Type = v;`
  --> tests/compile_fail/if_let_chain_binding_across_yield.rs:4:17
   |
 4 |     if let Some(v) = x

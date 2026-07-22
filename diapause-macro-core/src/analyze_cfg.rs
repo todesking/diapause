@@ -841,14 +841,16 @@ fn range_inclusive_item(ty: &syn::Type) -> Option<&syn::Type> {
 }
 
 /// A binding whose type can't be spelled in an annotation (e.g. a match
-/// arm or destructuring `for` pattern) but that must be stored across a
-/// state boundary anyway: point the user at rebinding with an explicit
-/// type. `binder` names what bound it, `reason` says why it can't be
-/// annotated in place, and `site` is where to insert the rebind.
+/// arm or destructuring `for` pattern) but that is held across yield_!
+/// and must be stored in the coroutine state anyway: point the user at
+/// rebinding with an explicit type. `binder` names what bound it,
+/// `reason` says why it can't be annotated in place, and `site` is where
+/// to insert the rebind.
 fn unannotatable_binding_error(name: &str, binder: &str, reason: &str, site: &str) -> String {
     format!(
-        "`{name}` is bound by {binder} and must be stored across a state boundary, but \
-         {reason}; rebind it at the top of {site}: `let {name}2: Type = {name};`"
+        "`{name}` is bound by {binder} and held across yield_!, so it must be stored \
+         in the coroutine state, but {reason}; rebind it with an explicit type at the \
+         top of {site}: `let {name}2: Type = {name};`"
     )
 }
 
