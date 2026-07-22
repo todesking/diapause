@@ -325,3 +325,21 @@ fn impl_trait_with_into_iterator() {
     assert_eq!(c.start(), CoroutineState::Yielded(1));
     assert_eq!(c.resume(()), CoroutineState::Complete(60));
 }
+
+// Const generics
+#[diapause::coroutine(yield = u32)]
+fn const_generic_array<const N: usize>(arr: [u32; N]) -> u32 {
+    yield_!(1);
+    arr.iter().sum()
+}
+
+#[test]
+fn const_generic_parameter() {
+    let mut c = const_generic_array([1, 2, 3, 4, 5]);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(15));
+
+    let mut c = const_generic_array([10, 20]);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(()), CoroutineState::Complete(30));
+}
