@@ -4,7 +4,7 @@ members = [
     "diapause",
     "diapause-difftest",
     "diapause-macro",
-    "diapause-macro-core",
+    "diapause-macro-core", "diapause-no-std-test",
     "diapause-playground",
 ]
 

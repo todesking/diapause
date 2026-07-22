@@ -80,6 +80,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "diapause-no-std-test"
+version = "0.1.0"
+dependencies = [
+ "diapause",
+]
+
+[[package]]
 name = "diapause-playground"
 version = "0.1.0"
 dependencies = [
