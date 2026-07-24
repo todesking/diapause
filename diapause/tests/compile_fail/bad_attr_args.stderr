@@ -1,4 +1,4 @@
-error: unknown argument, expected `yield`, `resume`, or `fingerprint`
+error: unknown argument, expected `yield`, `resume`, `fingerprint`, or `in_place`
  --> tests/compile_fail/bad_attr_args.rs:1:23
   |
 1 | #[diapause::coroutine(banana = i32)]

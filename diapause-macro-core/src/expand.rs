@@ -1,17 +1,19 @@
 //! Code generation: turns the lowered CFG and its analysis into the
 //! state enum, the `Coroutine` impl, and the `__drive` dispatch loop.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
+use syn::ext::IdentExt;
 use syn::spanned::Spanned;
+use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
-use crate::analyze_cfg::{self, Analysis, ArgInfo, Variant};
+use crate::analyze_cfg::{self, Analysis, ArgInfo, InPlacePlan, Variant};
 use crate::args::{Fingerprint, MacroArgs};
-use crate::cfg::{BlockId, Cfg, OpaqueJumpKind, ResumeBinding, Terminator, TySource};
-use crate::lower::{self, skip_nested_scopes};
+use crate::cfg::{BindingId, BlockId, Cfg, OpaqueJumpKind, ResumeBinding, Terminator, TySource};
+use crate::lower::{self, PatBindingCollector, skip_nested_scopes};
 use crate::signature::{
     ArgVar, augment_generics, check_return_type, check_signature, parse_args,
     phantom_for_unused_params,
@@ -200,7 +202,12 @@ impl Prepared {
 
     fn analyze(&self, cfg: &Cfg) -> syn::Result<Analysis> {
         let arg_infos: Vec<ArgInfo> = self.args.iter().map(ArgInfo::from).collect();
-        analyze_cfg::analyze(cfg, &arg_infos, &self.macro_args.resume_ty)
+        analyze_cfg::analyze_with(
+            cfg,
+            &arg_infos,
+            &self.macro_args.resume_ty,
+            self.macro_args.in_place,
+        )
     }
 
     /// Turns the CFG and its analysis into the generated item tokens.
@@ -673,6 +680,7 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
         yield_ty: cx.yield_ty,
         ret_ty: cx.ret_ty,
         start_pattern: quote!(State::Start { #(#arg_pat,)* .. }),
+        placeholder: placeholder.clone(),
         fp_pat: cx.fp_enabled().then(|| quote!(__fp: _,)),
         fp_init: cx.fp_enabled().then(|| quote!(__fp: Self::FINGERPRINT,)),
     };
@@ -682,6 +690,29 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
         .iter()
         .map(|v| codegen.arm(v))
         .collect();
+    // In-place resume: eligible suspension variants run on `self`
+    // directly, before the placeholder swap (see
+    // `analyze_cfg::InPlacePlan`). Every path in a fast arm returns,
+    // so falling through to the swap means no fast arm matched.
+    let fast_arms: Vec<TokenStream> = cx
+        .analysis
+        .in_place
+        .iter()
+        .map(|p| codegen.fast_arm(p))
+        .collect();
+    let fast_dispatch = (!fast_arms.is_empty()).then(|| {
+        // `non_snake_case`: `__self_{name}` of a synthetic field
+        // (`__iter0`, `__dg0`) has interior consecutive underscores.
+        // The standard arms below re-compile the same user code, so
+        // genuine user naming warnings still surface there.
+        quote! {
+            #[allow(non_snake_case)]
+            match *self {
+                #(#fast_arms)*
+                _ => {}
+            }
+        }
+    });
     let resume_ty = cx.resume_ty;
     let yield_ty = cx.yield_ty;
     let ret_ty = cx.ret_ty;
@@ -694,18 +725,23 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
         /// a body without internal transitions never continues
         /// `'__dispatch`. `unused_assignments`: splitting a variable
         /// across state arms lets rustc see per-arm dead stores that
-        /// are live on another path of the original body.)
+        /// are live on another path of the original body.
+        /// `unused_parens`: the in-place arms rewrite stored
+        /// variables into parenthesized dereferences, which rustc
+        /// flags when one lands in an already-delimited position.)
         #[allow(
             unused_mut,
             unreachable_code,
             path_statements,
             unused_labels,
-            unused_assignments
+            unused_assignments,
+            unused_parens
         )]
         fn __drive(
             &mut self,
             mut __resume: ::core::option::Option<#resume_ty>,
         ) -> ::diapause::CoroutineState<#yield_ty, #ret_ty> {
+            #fast_dispatch
             // Fields must be moved out through &mut self, so the
             // state is swapped for a placeholder up front; a
             // panic in user code leaves it behind.
@@ -772,6 +808,9 @@ struct Codegen<'a> {
     yield_ty: &'a syn::Type,
     ret_ty: &'a syn::Type,
     start_pattern: TokenStream,
+    /// The placeholder swapped into `*self` (`State::Poisoned`, or
+    /// `State::Done` when the body never yields).
+    placeholder: TokenStream,
     /// `__fp: _,` in variant unpack patterns when fingerprinting.
     fp_pat: Option<TokenStream>,
     /// `__fp: Self::FINGERPRINT,` in constructed next-state values.
@@ -790,9 +829,17 @@ impl Codegen<'_> {
             let fp_pat = &self.fp_pat;
             quote!(State::#ident { #(#pats,)* #fp_pat })
         };
-        // A resume-point variant's only predecessor is its yield, so the
-        // take() runs exactly once per __drive call and cannot fail.
-        let resume_stmt = self.resume_bindings.get(&v.block).map(|rb| {
+        let resume_stmt = self.resume_stmt(v.block);
+        let body = self.block_code(v.block);
+        quote!(#pattern => { #resume_stmt #body })
+    }
+
+    /// The `let` re-binding the resume value at the head of a
+    /// resume-point arm. A resume-point variant's only predecessor is
+    /// its yield, so the take() runs exactly once per __drive call and
+    /// cannot fail.
+    fn resume_stmt(&self, b: BlockId) -> Option<TokenStream> {
+        self.resume_bindings.get(&b).map(|rb| {
             let mutability = &rb.mutability;
             let ident = &self.cfg.bindings[rb.binding.0].ident;
             let ty = rb.ty.as_ref().map(|ty| quote!(: #ty));
@@ -800,9 +847,7 @@ impl Codegen<'_> {
                 let #mutability #ident #ty =
                     __resume.take().expect("BUG: resume value already consumed");
             }
-        });
-        let body = self.block_code(v.block);
-        quote!(#pattern => { #resume_stmt #body })
+        })
     }
 
     /// A block's statements and transition, with crossed borrows
@@ -932,6 +977,342 @@ impl Codegen<'_> {
         let fp_init = &self.fp_init;
         quote!(State::#ident { #(#fields,)* #fp_init })
     }
+
+    // === In-place resume arms ===
+    //
+    // One arm per `analyze_cfg::InPlacePlan`, matched on `*self` before
+    // the placeholder swap: the variant's fields are bound `ref mut` as
+    // `__self_{name}` and uses of the stored names are rewritten to
+    // dereferences, so a resume that suspends at the same variant again
+    // touches only what the user code touches — no whole-enum moves.
+    // Edges into the plan's cold blocks (completion paths) first move
+    // the state back out (`rehydrate`) and continue with the standard
+    // by-value code. The trade-off is panic behavior: a panic inside
+    // the hot part of a fast arm leaves the partially updated suspended
+    // variant instead of `Poisoned`.
+
+    /// One in-place dispatch arm for a plan's resume-point variant.
+    fn fast_arm(&self, plan: &InPlacePlan) -> TokenStream {
+        let v = self
+            .analysis
+            .variant(plan.block)
+            .expect("BUG: in-place plan for a block without a variant");
+        let ident = &v.ident;
+        let pats = v.fields.iter().map(|f| {
+            let name = &f.ident;
+            let sf = self_field_ident(name);
+            quote!(#name: ref mut #sf)
+        });
+        let resume_stmt = self.resume_stmt(plan.block);
+        let mut path = FastPath::default();
+        let body = self.fast_block_code(plan, plan.block, &mut path);
+        quote!(State::#ident { #(#pats,)* .. } => { #resume_stmt #body })
+    }
+
+    /// The stored names currently reached through their `ref mut`
+    /// bindings: the plan's fields minus those re-bound to plain locals
+    /// on the current path.
+    fn active_names(&self, plan: &InPlacePlan, path: &FastPath) -> BTreeSet<String> {
+        plan.fields
+            .difference(&path.rebound)
+            .map(|id| self.cfg.bindings[id.0].ident.to_string())
+            .collect()
+    }
+
+    fn rewrite_expr(&self, e: &syn::Expr, plan: &InPlacePlan, path: &FastPath) -> syn::Expr {
+        let active = self.active_names(plan, path);
+        let mut e = e.clone();
+        InPlaceRewriter { active: &active }.visit_expr_mut(&mut e);
+        e
+    }
+
+    /// A hot region block's statements and transition in in-place mode.
+    /// `path` accumulates what this path has done so far: the stored
+    /// bindings re-bound to plain locals (`for`-head patterns,
+    /// re-binding `let`s; their uses stay un-rewritten and the yield
+    /// writes them back) and the variant blocks whose reborrows were
+    /// established (rebuilt from locals again after a rehydration).
+    fn fast_block_code(&self, plan: &InPlacePlan, b: BlockId, path: &mut FastPath) -> TokenStream {
+        debug_assert!(
+            plan.hot.contains(&b),
+            "BUG: fast codegen left the hot region"
+        );
+        debug_assert!(
+            self.cfg.blocks[b].jumps.is_empty(),
+            "BUG: opaque jump in a fast region"
+        );
+        let mut out = TokenStream::new();
+        // Reborrows, like `block_code`, but a stored source is reached
+        // through its `ref mut` binding.
+        let active = self.active_names(plan, path);
+        let reborrows = self.analysis.variant(b).map_or(&[][..], |v| &v.reborrows);
+        if !reborrows.is_empty() {
+            path.reborrow_blocks.push(b);
+        }
+        for rb in reborrows {
+            let target_mut = &rb.target_mut;
+            let target = &rb.target;
+            let source = &rb.source;
+            let mut_tok = rb.mutable.then(|| quote!(mut));
+            let src = if rb.source_is_local && active.contains(&source.to_string()) {
+                let sf = self_field_ident(source);
+                quote!((*#sf))
+            } else {
+                quote!(#source)
+            };
+            // `unused_variables`: a reborrow used only by this block's
+            // cold parts is shadowed by the rehydration's rebuild and
+            // never read here.
+            out.extend(quote! {
+                #[allow(unused_variables)]
+                let #target_mut #target = & #mut_tok #src;
+            });
+        }
+        for (i, stmt) in self.cfg.blocks[b].stmts.iter().enumerate() {
+            if !self.analysis.removed_stmts[b].contains(&i) {
+                let active = self.active_names(plan, path);
+                let mut stmt = stmt.clone();
+                InPlaceRewriter { active: &active }.visit_stmt_mut(&mut stmt);
+                out.extend(quote!(#stmt));
+            }
+            // A stored binding re-bound by this `let` is a plain local
+            // from here on (the `let`'s own initializer still saw the
+            // dereference); the yield writes the local back.
+            for &id in &self.cfg.blocks[b].defs {
+                if plan.fields.contains(&id) && self.cfg.bindings[id.0].def_stmt == Some(i) {
+                    path.rebound.insert(id);
+                }
+            }
+        }
+        out.extend(self.fast_terminator_code(plan, b, path));
+        out
+    }
+
+    /// The transition out of a hot region block in in-place mode.
+    /// Branch paths clone `path`: every path diverges (returns), so no
+    /// two paths' re-bindings can meet.
+    fn fast_terminator_code(
+        &self,
+        plan: &InPlacePlan,
+        b: BlockId,
+        path: &mut FastPath,
+    ) -> TokenStream {
+        match &self.cfg.blocks[b].terminator {
+            Terminator::Goto(t) => self.fast_edge(plan, *t, path),
+            Terminator::Branch { cond, then_, else_ } => {
+                let cond = self.rewrite_expr(cond, plan, path);
+                let t = self.fast_edge(plan, *then_, &mut path.clone());
+                let e = self.fast_edge(plan, *else_, &mut path.clone());
+                quote!(if #cond { #t } else { #e })
+            }
+            Terminator::Match { scrutinee, arms } => {
+                let scrutinee = self.rewrite_expr(scrutinee, plan, path);
+                let arms = arms.iter().map(|arm| {
+                    let pat = &arm.pat;
+                    let guard = arm.guard.as_ref().map(|g| {
+                        let g = self.rewrite_expr(g, plan, path);
+                        quote!(if #g)
+                    });
+                    let body = self.fast_edge(plan, arm.body, &mut path.clone());
+                    quote!(#pat #guard => { #body })
+                });
+                quote!(match #scrutinee { #(#arms)* })
+            }
+            Terminator::Yield { value, next, .. } => {
+                debug_assert_eq!(*next, plan.block, "BUG: in-place region yields elsewhere");
+                let yield_ty = self.yield_ty;
+                let value = self.rewrite_expr(value, plan, path);
+                // Stored bindings re-bound on this path live in plain
+                // locals; move them back into their fields. Everything
+                // else was updated in place, so the enum (tag included)
+                // needs no other write.
+                let writebacks = path.rebound.iter().map(|id| {
+                    let name = &self.cfg.bindings[id.0].ident;
+                    let sf = self_field_ident(name);
+                    quote!(*#sf = #name;)
+                });
+                quote! {
+                    let __yielded: #yield_ty = #value;
+                    #(#writebacks)*
+                    return ::diapause::CoroutineState::Yielded(__yielded);
+                }
+            }
+            // A hot block always reaches a yield through its successors.
+            Terminator::Return(_) | Terminator::Unreachable(_) => {
+                unreachable!("BUG: completion terminator in a hot in-place block")
+            }
+            Terminator::IterNext {
+                iter,
+                pat,
+                body,
+                exit,
+            } => {
+                let active = self.active_names(plan, path);
+                let iter_expr = if active.contains(&iter.to_string()) {
+                    let sf = self_field_ident(iter);
+                    quote!(&mut *#sf)
+                } else {
+                    quote!(&mut #iter)
+                };
+                // The head pattern may re-bind stored bindings (a loop
+                // variable that is used across the yield).
+                let mut body_path = path.clone();
+                let mut c = PatBindingCollector::default();
+                c.visit_pat(pat);
+                let pat_names: BTreeSet<String> =
+                    c.bindings.into_iter().map(|(i, _)| i.to_string()).collect();
+                for &id in &self.cfg.blocks[*body].defs {
+                    if plan.fields.contains(&id)
+                        && pat_names.contains(&self.cfg.bindings[id.0].ident.to_string())
+                    {
+                        body_path.rebound.insert(id);
+                    }
+                }
+                let some_edge = self.fast_edge(plan, *body, &mut body_path);
+                let none_edge = self.fast_edge(plan, *exit, &mut path.clone());
+                quote! {
+                    match ::core::iter::Iterator::next(#iter_expr) {
+                        ::core::option::Option::Some(#pat) => { #some_edge }
+                        ::core::option::Option::None => { #none_edge }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A region-internal edge. A hot target is inlined in in-place mode
+    /// (the region is a tree, so exactly once); a cold target is where
+    /// the fast path ends: the state is moved back out and the cold
+    /// subtree — all standard-inline blocks — is emitted by the
+    /// standard by-value codegen.
+    fn fast_edge(&self, plan: &InPlacePlan, t: BlockId, path: &mut FastPath) -> TokenStream {
+        if plan.hot.contains(&t) {
+            let code = self.fast_block_code(plan, t, path);
+            quote!({ #code })
+        } else {
+            let rehydrate = self.rehydrate(plan, path);
+            let code = self.block_code(t);
+            quote!({ #rehydrate #code })
+        }
+    }
+
+    /// Moves the state back out at a hot→cold edge: swaps in the
+    /// placeholder (restoring the poison-on-panic behavior for what
+    /// follows) and re-binds the fields as the by-value locals the
+    /// standard codegen would have. Fields already re-bound to plain
+    /// locals stay locals — binding them would shadow the fresh value
+    /// with the stale one — and their stale field values are dropped by
+    /// the `..`. Reborrows established on the fast path point into the
+    /// moved-out state; they are rebuilt from the fresh locals so cold
+    /// code sees valid references.
+    fn rehydrate(&self, plan: &InPlacePlan, path: &FastPath) -> TokenStream {
+        let v = self
+            .analysis
+            .variant(plan.block)
+            .expect("BUG: in-place plan for a block without a variant");
+        let rebound_names: BTreeSet<String> = path
+            .rebound
+            .iter()
+            .map(|id| self.cfg.bindings[id.0].ident.to_string())
+            .collect();
+        let ident = &v.ident;
+        let pats = v
+            .fields
+            .iter()
+            .filter(|f| !rebound_names.contains(&f.ident.to_string()))
+            .map(|f| bind_pat(&f.mutability, &f.ident));
+        let placeholder = &self.placeholder;
+        let reborrows = path
+            .reborrow_blocks
+            .iter()
+            .flat_map(|&b| self.analysis.variant(b).map_or(&[][..], |v| &v.reborrows))
+            .map(|rb| {
+                let target_mut = &rb.target_mut;
+                let target = &rb.target;
+                let source = &rb.source;
+                let mut_tok = rb.mutable.then(|| quote!(mut));
+                quote! {
+                    #[allow(unused_variables)]
+                    let #target_mut #target = & #mut_tok #source;
+                }
+            });
+        quote! {
+            #[allow(unused_variables)]
+            let State::#ident { #(#pats,)* .. } = ::core::mem::replace(self, #placeholder)
+            else {
+                ::core::unreachable!()
+            };
+            #(#reborrows)*
+        }
+    }
+}
+
+/// Per-path state of the in-place codegen walk (see
+/// `Codegen::fast_block_code`).
+#[derive(Clone, Default)]
+struct FastPath {
+    /// Stored bindings re-bound to plain locals on this path.
+    rebound: BTreeSet<BindingId>,
+    /// Variant blocks whose reborrows this path has established.
+    reborrow_blocks: Vec<BlockId>,
+}
+
+/// The `ref mut` binding holding the stored `ident` in an in-place arm.
+fn self_field_ident(ident: &syn::Ident) -> syn::Ident {
+    format_ident!("__self_{}", ident.unraw(), span = ident.span())
+}
+
+/// Rewrites uses of the in-place stored bindings into dereferences of
+/// their `ref mut` pattern bindings: `x` becomes `(*__self_x)`. Flat by
+/// construction: the analysis rejected every plan in which a stored
+/// name is shadowed inside a statement, so each occurrence of an active
+/// name refers to the stored binding. Patterns bind rather than read
+/// and are skipped; nested items are separate scopes; closures are
+/// visited (they capture the coroutine's locals).
+struct InPlaceRewriter<'a> {
+    active: &'a BTreeSet<String>,
+}
+
+impl InPlaceRewriter<'_> {
+    /// The ident of `e` when it is a bare use of an active stored name.
+    fn rewrite_target(&self, e: &syn::Expr) -> Option<syn::Ident> {
+        let syn::Expr::Path(p) = e else { return None };
+        if !p.attrs.is_empty()
+            || p.qself.is_some()
+            || p.path.leading_colon.is_some()
+            || p.path.segments.len() != 1
+            || !p.path.segments[0].arguments.is_none()
+        {
+            return None;
+        }
+        let ident = &p.path.segments[0].ident;
+        self.active
+            .contains(&ident.to_string())
+            .then(|| ident.clone())
+    }
+}
+
+impl VisitMut for InPlaceRewriter<'_> {
+    fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
+        if let Some(ident) = self.rewrite_target(e) {
+            let sf = self_field_ident(&ident);
+            *e = syn::parse_quote_spanned!(ident.span() => (*#sf));
+            return;
+        }
+        syn::visit_mut::visit_expr_mut(self, e);
+    }
+
+    /// `S { x }` shorthand: add the `:` so the member name survives the
+    /// value's rewrite into a dereference.
+    fn visit_field_value_mut(&mut self, fv: &mut syn::FieldValue) {
+        if fv.colon_token.is_none() && self.rewrite_target(&fv.expr).is_some() {
+            fv.colon_token = Some(Default::default());
+        }
+        syn::visit_mut::visit_field_value_mut(self, fv);
+    }
+
+    fn visit_pat_mut(&mut self, _: &mut syn::Pat) {}
+    fn visit_item_mut(&mut self, _: &mut syn::Item) {}
 }
 
 /// Replaces the `__diapause_jump!` markers lowering left for
@@ -1330,6 +1711,78 @@ mod tests {
         assert!(dbg.cfg_unsimplified.is_some());
         assert!(dbg.cfg.is_some());
         assert!(dbg.analysis.is_none());
+    }
+
+    #[test]
+    fn in_place_arm_generated_for_a_simple_loop() {
+        let item: syn::ItemFn = parse_quote! {
+            fn c(n: u64) {
+                for i in 0..n {
+                    yield_!(i);
+                }
+            }
+        };
+        let out = expand(quote!(yield = u64), item).unwrap().to_string();
+        // The fast arm binds the stored iterator by `ref mut` and never
+        // writes the enum on the yield-back path.
+        assert!(out.contains("ref mut __self___iter0"), "got: {out}");
+    }
+
+    #[test]
+    fn in_place_false_disables_fast_arms() {
+        let item: syn::ItemFn = parse_quote! {
+            fn c(n: u64) {
+                for i in 0..n {
+                    yield_!(i);
+                }
+            }
+        };
+        let out = expand(quote!(yield = u64, in_place = false), item)
+            .unwrap()
+            .to_string();
+        assert!(!out.contains("__self_"), "got: {out}");
+    }
+
+    #[test]
+    fn alternating_yields_have_no_in_place_arm() {
+        let item: syn::ItemFn = parse_quote! {
+            fn c() {
+                loop {
+                    yield_!(1u32);
+                    yield_!(2u32);
+                }
+            }
+        };
+        let out = expand(quote!(yield = u32), item).unwrap().to_string();
+        assert!(!out.contains("__self_"), "got: {out}");
+    }
+
+    #[test]
+    fn in_place_rewrites_stored_uses_and_writes_rebounds_back() {
+        // running_total shape: `sum` is updated through the reference,
+        // `i` (re-bound by the `for` head, used after resume) is written
+        // back at the yield.
+        let item: syn::ItemFn = parse_quote! {
+            fn c(n: u64) -> u64 {
+                let mut sum: u64 = 0;
+                for i in 0..n {
+                    let bonus = yield_!(sum);
+                    sum = sum.wrapping_add(i).wrapping_add(bonus);
+                }
+                sum
+            }
+        };
+        let out = expand(quote!(yield = u64, resume = u64), item)
+            .unwrap()
+            .to_string();
+        assert!(out.contains("(* __self_sum)"), "got: {out}");
+        assert!(out.contains("* __self_i = i ;"), "got: {out}");
+        // The completion path moves the state back out before the
+        // standard by-value epilogue.
+        assert!(
+            out.contains("# [allow (unused_variables)] let State :: S1"),
+            "got: {out}"
+        );
     }
 
     #[test]

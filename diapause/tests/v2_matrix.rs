@@ -7,7 +7,7 @@
 //! try_operator.rs; every coroutine here exercises a distinct structural
 //! interaction between at least two constructs.
 
-use diapause::{Coroutine, CoroutineState};
+use diapause::{Coroutine, CoroutineState, CoroutineStatus};
 
 // === Nesting matrix ===
 
@@ -308,7 +308,13 @@ fn labeled_continue_from_inner_loop_to_outer_for() {
     assert_eq!(c.resume(false), CoroutineState::Complete(2));
 }
 
-// === Poisoning inside control flow ===
+// === Panics inside control flow ===
+//
+// Two regimes (see tests/in_place.rs for the focused suite): a resume
+// arm generated in place leaves the suspended state behind on panic
+// (resuming it is safe but unspecified; these tests pin the current
+// behavior), while every other arm — and everything under
+// `in_place = false` — swaps in `Poisoned` first.
 
 fn assert_resume_panics_poisoned<C: Coroutine<R>, R>(c: &mut C, resume: R) {
     let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -318,7 +324,8 @@ fn assert_resume_panics_poisoned<C: Coroutine<R>, R>(c: &mut C, resume: R) {
     assert_eq!(msg, "Poisoned");
 }
 
-/// User code panicking in a for body after a yield.
+/// User code panicking in a for body after a yield: the loop arm runs
+/// in place, so the panic leaves the suspended state untouched.
 #[diapause::coroutine(yield = u32, resume = bool)]
 fn fragile_for() -> u32 {
     let mut done: u32 = 0;
@@ -333,13 +340,16 @@ fn fragile_for() -> u32 {
 }
 
 #[test]
-fn panic_in_for_body_poisons_the_state() {
+fn panic_in_for_body_leaves_the_state_suspended() {
     let mut c = fragile_for();
     assert_eq!(c.start(), CoroutineState::Yielded(0));
     assert_eq!(c.resume(false), CoroutineState::Yielded(1));
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.resume(true)));
     assert!(caught.is_err());
-    assert_resume_panics_poisoned(&mut c, false);
+    // The panic happened before the loop body mutated anything, so the
+    // (unspecified but safe) observed behavior is a clean re-run.
+    assert_eq!(c.status(), CoroutineStatus::Suspended);
+    assert_eq!(c.resume(false), CoroutineState::Yielded(2));
 }
 
 /// User code panicking inside a match arm of an expanded match.
@@ -364,7 +374,9 @@ fn panic_in_match_arm_poisons_the_state() {
     assert_resume_panics_poisoned(&mut c, 0);
 }
 
-/// User code panicking in a loop condition (an expanded while header).
+/// User code panicking in a loop condition (an expanded while header):
+/// also an in-place arm, so the mutations before the panic stay in the
+/// suspended state.
 #[diapause::coroutine(yield = u32, resume = u32)]
 fn fragile_while() -> u32 {
     let mut div: u32 = 2;
@@ -378,14 +390,19 @@ fn fragile_while() -> u32 {
 }
 
 #[test]
-fn panic_in_while_condition_poisons_the_state() {
+fn panic_in_while_condition_leaves_the_state_suspended() {
     let mut c = fragile_while();
     assert_eq!(c.start(), CoroutineState::Yielded(0));
     // Resuming with 2 zeroes the divisor; the next header evaluation
     // divides by zero.
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.resume(2)));
     assert!(caught.is_err());
-    assert_resume_panics_poisoned(&mut c, 1);
+    // The partial update (total = 1, div = 0) is still there: resuming
+    // re-runs the body and panics in the header again.
+    assert_eq!(c.status(), CoroutineStatus::Suspended);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.resume(0)));
+    assert!(caught.is_err());
+    assert_eq!(c.status(), CoroutineStatus::Suspended);
 }
 
 // === Regressions: derive / generics / reference args × control flow ===

@@ -1057,6 +1057,21 @@ fn simple_for_loop_yield_gets_an_in_place_plan() {
             .any(|&b| matches!(cfg.blocks[b].terminator, Terminator::Yield { .. })),
         "region must include the yield block"
     );
+    // The resume block and everything that can reach the yield are hot;
+    // the loop-exit (return) path is cold.
+    assert!(p.hot.contains(&s));
+    assert!(p.hot.iter().all(|b| p.region.contains(b)));
+    assert!(
+        p.region.iter().any(|b| !p.hot.contains(b)),
+        "the exit path must be cold"
+    );
+    assert!(
+        p.region
+            .iter()
+            .filter(|&&b| matches!(cfg.blocks[b].terminator, Terminator::Return(_)))
+            .all(|b| !p.hot.contains(b)),
+        "return blocks are never hot"
+    );
 }
 
 #[test]

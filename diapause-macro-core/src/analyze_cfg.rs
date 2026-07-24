@@ -88,6 +88,12 @@ pub struct InPlacePlan {
     /// `block` (every other member has exactly one region-internal
     /// predecessor), so codegen inlines each member exactly once.
     pub region: BTreeSet<BlockId>,
+    /// The region members from which an in-region yield is reachable,
+    /// `block` included: these run in in-place mode (uses of stored
+    /// names rewritten to dereferences). The remaining, cold members
+    /// (completion paths) run the standard by-value codegen after the
+    /// state is moved back out at the hot→cold edge.
+    pub hot: BTreeSet<BlockId>,
     /// The variant's fields as bindings: bound by `ref mut` in the fast
     /// arm, with their uses rewritten to dereferences.
     pub fields: BTreeSet<BindingId>,
@@ -184,7 +190,7 @@ impl<'a> Context<'a> {
         self.check_jump_shadowing(&variants);
         self.check_transfer_shadowing(&live_in, &removed_stmts, &mut collisions);
         let in_place = if in_place {
-            compute_in_place(self.cfg, &live_in, &variants)
+            compute_in_place(self.cfg, &live_in, &uses, &variants)
         } else {
             Vec::new()
         };
@@ -945,12 +951,13 @@ fn def_blocks(cfg: &Cfg) -> Vec<Option<BlockId>> {
 fn compute_in_place(
     cfg: &Cfg,
     live_in: &[BTreeSet<BindingId>],
+    uses: &[BTreeSet<BindingId>],
     variants: &[Variant],
 ) -> Vec<InPlacePlan> {
     variants
         .iter()
         .filter(|v| cfg.blocks[v.block].resume_point)
-        .filter_map(|v| in_place_plan(cfg, live_in, variants, v))
+        .filter_map(|v| in_place_plan(cfg, live_in, uses, variants, v))
         .collect()
 }
 
@@ -963,6 +970,7 @@ fn compute_in_place(
 fn in_place_plan(
     cfg: &Cfg,
     live_in: &[BTreeSet<BindingId>],
+    uses: &[BTreeSet<BindingId>],
     variants: &[Variant],
     v: &Variant,
 ) -> Option<InPlacePlan> {
@@ -1035,14 +1043,60 @@ fn in_place_plan(
         return None;
     }
 
-    // Definitions inside the region: a different binding shadowing a
-    // stored name would be captured by the name-based rewrite; the
+    // Hot blocks: those from which an in-region yield is reachable;
+    // they run in in-place mode. The remaining, cold blocks (completion
+    // paths) run the standard by-value codegen after a hot→cold edge
+    // moves the state back out, so the constraints below apply to hot
+    // blocks only. `s` is always hot (the region is discovered from it
+    // and contains a yield).
+    let mut hot: BTreeSet<BlockId> = region
+        .iter()
+        .copied()
+        .filter(|&b| matches!(cfg.blocks[b].terminator, Terminator::Yield { .. }))
+        .collect();
+    fixpoint(region.iter().copied(), |b| {
+        if !hot.contains(&b)
+            && cfg.blocks[b]
+                .terminator
+                .successors()
+                .any(|t| hot.contains(&t))
+        {
+            hot.insert(b);
+            true
+        } else {
+            false
+        }
+    });
+    for &b in &region {
+        if hot.contains(&b) {
+            continue;
+        }
+        // Cold code is emitted by the standard codegen, which can only
+        // reach blocks that standard inlining reaches (the fast arm has
+        // no `__state`/`'__dispatch` to transition through).
+        if !cfg.blocks[b].inline {
+            return None;
+        }
+        // A binding defined in a hot block and consumed cold would be
+        // read after the rehydration moved the state out; its rewritten
+        // definition may borrow the state (e.g. `let p = &buf[0];`), so
+        // keep such variants on the standard arm.
+        if uses[b]
+            .iter()
+            .any(|id| hot.iter().any(|&h| cfg.blocks[h].defs.contains(id)))
+        {
+            return None;
+        }
+    }
+
+    // Definitions inside the hot region: a different binding shadowing
+    // a stored name would be captured by the name-based rewrite; the
     // stored binding itself may be re-bound only at a known position (a
     // `let` statement or the head pattern of the region `for` that owns
     // it), so codegen can switch from dereferences to the fresh local
     // there and write the local back into the field at the yield.
     let head_pats = iter_head_pat_names(cfg, &region);
-    for &b in &region {
+    for &b in &hot {
         for &id in &cfg.blocks[b].defs {
             let name = cfg.bindings[id.0].ident.to_string();
             if name.starts_with("__self_") {
@@ -1070,9 +1124,10 @@ fn in_place_plan(
         }
     }
 
-    // Statement- and terminator-level scans for constructs the rewrite
-    // cannot see through.
-    for &b in &region {
+    // Statement- and terminator-level scans over the hot blocks for
+    // constructs the rewrite cannot see through. (Cold statements and
+    // terminators run standard, un-rewritten code.)
+    for &b in &hot {
         for stmt in &cfg.blocks[b].stmts {
             if !stmt_is_in_place_safe(stmt, &field_names) {
                 return None;
@@ -1085,17 +1140,21 @@ fn in_place_plan(
                 // (standard codegen matches on the unpacked local); the
                 // rewritten `match (*__self_x)` would not compile for
                 // non-`Copy` payloads, so keep such variants on the
-                // standard arm.
+                // standard arm. An arm binding values into a cold body
+                // would carry data derived from the rewritten scrutinee
+                // (possibly borrowing the state) past the rehydration.
                 !is_bare_field(scrutinee, &field_names)
                     && expr_is_in_place_safe(scrutinee, &field_names)
-                    && arms
-                        .iter()
-                        .filter_map(|a| a.guard.as_ref())
-                        .all(|g| expr_is_in_place_safe(g, &field_names))
+                    && arms.iter().all(|a| {
+                        (hot.contains(&a.body) || !pat_binds_anything(&a.pat))
+                            && a.guard
+                                .as_ref()
+                                .is_none_or(|g| expr_is_in_place_safe(g, &field_names))
+                    })
             }
             Terminator::Yield { value, .. } => expr_is_in_place_safe(value, &field_names),
-            // `Return`/`Unreachable` expressions run after the state is
-            // moved back out (rehydrated) and are not rewritten.
+            // A hot block never ends in `Return`/`Unreachable` (no
+            // yield would be reachable from it).
             Terminator::Goto(_)
             | Terminator::IterNext { .. }
             | Terminator::Return(_)
@@ -1109,8 +1168,16 @@ fn in_place_plan(
     Some(InPlacePlan {
         block: s,
         region,
+        hot,
         fields,
     })
+}
+
+/// Whether a pattern binds at least one identifier.
+fn pat_binds_anything(pat: &syn::Pat) -> bool {
+    let mut c = PatBindingCollector::default();
+    c.visit_pat(pat);
+    !c.bindings.is_empty()
 }
 
 /// The names bound by the head pattern of each region-internal

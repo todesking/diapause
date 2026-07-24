@@ -68,6 +68,7 @@ pub fn validate(cfg: &Cfg, analysis: &Analysis, n_args: usize) -> Result<(), Str
     v.check_definedness(&preds);
     v.check_variant_fields();
     v.check_transition_shadowing(&marker_pos);
+    v.check_in_place();
     v.finish()
 }
 
@@ -686,6 +687,94 @@ impl Validator<'_> {
                     .is_some_and(|i| self.analysis.removed_stmts[d].contains(&i))
             })
             .collect()
+    }
+
+    /// In-place plans (see `analyze_cfg::InPlacePlan`): each plan's
+    /// block is a resume-point variant contained in its own region; the
+    /// region's blocks exist, own no opaque jumps, are closed under
+    /// non-yield terminator successors, and every yield inside
+    /// re-enters the plan's block (the fast arm never writes another
+    /// variant without rehydrating first); the stored bindings are
+    /// live at the plan block's entry.
+    fn check_in_place(&mut self) {
+        let n = self.cfg.blocks.len();
+        for p in &self.analysis.in_place {
+            let mut violations = Vec::new();
+            if p.block >= n {
+                violations.push(format!(
+                    "in-place plan for nonexistent block {} ({n} blocks)",
+                    p.block
+                ));
+                self.violations.extend(violations);
+                continue;
+            }
+            if !self.cfg.blocks[p.block].resume_point || self.analysis.variant(p.block).is_none() {
+                violations.push(format!(
+                    "in-place plan for {}, which is not a resume-point variant",
+                    self.block_desc(p.block)
+                ));
+            }
+            if !p.region.contains(&p.block) {
+                violations.push(format!(
+                    "in-place region of {} does not contain its own block",
+                    self.block_desc(p.block)
+                ));
+            }
+            for &b in &p.region {
+                if b >= n {
+                    violations.push(format!(
+                        "in-place region of block {} contains nonexistent block {b}",
+                        p.block
+                    ));
+                    continue;
+                }
+                if !self.cfg.blocks[b].jumps.is_empty() {
+                    violations.push(format!(
+                        "in-place region of {} contains {}, which owns opaque jumps",
+                        self.block_desc(p.block),
+                        self.block_desc(b)
+                    ));
+                }
+                if let Terminator::Yield { next, .. } = self.cfg.blocks[b].terminator {
+                    if next != p.block {
+                        violations.push(format!(
+                            "the yield in {} of the in-place region of {} continues \
+                             into {} instead of re-entering the region's variant",
+                            self.block_desc(b),
+                            self.block_desc(p.block),
+                            self.block_desc(next)
+                        ));
+                    }
+                } else {
+                    for s in self.cfg.blocks[b].terminator.successors() {
+                        if !p.region.contains(&s) {
+                            violations.push(format!(
+                                "the in-place region of {} is not closed: {} \
+                                 transitions to {} outside it",
+                                self.block_desc(p.block),
+                                self.block_desc(b),
+                                self.block_desc(s)
+                            ));
+                        }
+                    }
+                }
+            }
+            for id in &p.fields {
+                if id.0 >= self.cfg.bindings.len() {
+                    violations.push(format!(
+                        "in-place plan of block {} stores nonexistent binding {}",
+                        p.block, id.0
+                    ));
+                } else if !self.analysis.live_in[p.block].contains(id) {
+                    violations.push(format!(
+                        "in-place plan of {} stores {}, which is not live at its entry",
+                        self.block_desc(p.block),
+                        self.binding_desc(*id)
+                    ));
+                }
+            }
+            self.violations.extend(violations);
+        }
     }
 
     /// One transfer edge into non-inline `t`: flags a live binding of
