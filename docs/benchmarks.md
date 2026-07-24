@@ -14,9 +14,10 @@ size, and compile time.
 
 ## Measurement conditions
 
-- Date: 2026-07-25 (runtime, code size); 2026-07-23/24 (compile time)
-- Code: diapause commit `703c73a` (runtime and code size; first commit
-  with the in-place resume arms), `ec10652` (compile time)
+- Date: 2026-07-25
+- Code: diapause commit `47b85a3` (all three axes; earlier rounds
+  referenced below: `ec10652` = before the in-place resume arms,
+  `703c73a` = the commit introducing them)
 - Machine: Apple M4 (10 cores: 4P + 6E), 16 GB RAM, macOS 26.5.2
   (`aarch64-apple-darwin`)
 - Toolchain: rustc 1.96.0 (ac68faa20 2026-05-25), stable
@@ -72,10 +73,10 @@ per drive from the workload table by these times for throughput):
 
 | workload | diapause | handwritten | genawaiter_rc | genawaiter_stack | corosensei | generator | next_gen |
 |---|---|---|---|---|---|---|---|
-| `counter` | **1.64 µs** | 1.69 µs | 2.27 µs | 1.84 µs | 4.60 µs | 15.6 µs | 2.17 µs |
-| `nested` | 3.59 µs | **2.15 µs** | 4.02 µs | 4.30 µs | 6.33 µs | 23.1 µs | 4.33 µs |
-| `running_total` | 1.98 µs | **1.95 µs** | 4.01 µs | 3.94 µs | 5.37 µs | 10.1 µs | 3.91 µs |
-| `large_state` | **1.84 µs** | 1.86 µs | 2.31 µs | 1.91 µs | 4.67 µs | 15.6 µs | 2.20 µs |
+| `counter` | **1.64 µs** | 1.69 µs | 2.26 µs | 1.84 µs | 6.13 µs | 15.6 µs | 2.16 µs |
+| `nested` | 3.62 µs | **2.16 µs** | 4.02 µs | 4.31 µs | 7.90 µs | 23.2 µs | 4.34 µs |
+| `running_total` | 1.99 µs | **1.96 µs** | 3.92 µs | 3.93 µs | 6.88 µs | 10.0 µs | 3.91 µs |
+| `large_state` | **1.84 µs** | 1.86 µs | 2.33 µs | 1.91 µs | 6.17 µs | 15.6 µs | 2.20 µs |
 
 Observations:
 
@@ -100,15 +101,17 @@ Observations:
   iterators from the source (the resume slice re-enters the inner loop
   header from the outer body — a join, so the in-place arm does not
   apply). diapause still beats every library there.
-- Between the two measurement rounds, corosensei moved −23…−29% and
-  genawaiter_rc's rows moved −14…+11% with no change to their code or
-  toolchain — binary-layout sensitivity (see "Scope and caveats"
-  below); the cross-implementation ordering is unaffected.
+- corosensei's rows keep swinging between measurement rounds with no
+  change to its code or toolchain: −23…−29% from `ec10652` to
+  `703c73a`, then +31…+46% back in this round (`counter`
+  4.60 µs → 6.13 µs); genawaiter_rc has moved −14…+11% the same way —
+  binary-layout sensitivity (see "Scope and caveats" below); the
+  cross-implementation ordering is unaffected.
 - The stackful crates are dominated by per-construction stack setup
   under this construct-and-drive protocol. Solving the fixed and
   per-yield components from `counter` (1024 yields) and `nested`
-  (2016 yields, same construction): corosensei ≈ 2.8 µs construction
-  + ≈1.7 ns/yield, generator ≈ 7.7 µs + ≈7.6 ns/yield. corosensei's
+  (2016 yields, same construction): corosensei ≈ 4.3 µs construction
+  + ≈1.8 ns/yield, generator ≈ 7.8 µs + ≈7.7 ns/yield. corosensei's
   steady-state resume cost is thus on par with diapause's; the table
   mostly shows its stack allocation, which stack reuse (`with_stack`,
   not measured) would amortize away for long-lived coroutines.
@@ -181,10 +184,10 @@ build`). Median of 3 rebuilds, wall-clock seconds:
 
 | N | mode | diapause | genawaiter | handwritten |
 |---|---|---|---|---|
-| 100 | dev | 0.20 | 0.06 | 0.05 |
-| 100 | release | 0.26 | 0.25 | 0.18 |
-| 500 | dev | 0.83 | 0.12 | 0.12 |
-| 500 | release | 1.21 | 1.01 | 0.81 |
+| 100 | dev | 0.23 | 0.07 | 0.05 |
+| 100 | release | 0.34 | 0.26 | 0.19 |
+| 500 | dev | 0.95 | 0.12 | 0.13 |
+| 500 | release | 1.55 | 1.04 | 0.83 |
 
 Observations:
 
@@ -193,17 +196,21 @@ Observations:
   incremental cache skips most type-checking and codegen for every
   style, but proc-macro expansion always re-runs, so the dev gap is
   dominated by diapause's expansion (CFG analysis + state-enum
-  generation) plus re-parsing/hashing the expanded output — ~1.4 ms
+  generation) plus re-parsing/hashing the expanded output — ~1.6 ms
   per coroutine per rebuild over the alternatives.
   This is what an editor-driven rebuild loop feels like, not the cost
   of compiling changed code: with `CARGO_INCREMENTAL=0` at N = 100
   the dev gap narrows to 0.23 s (diapause) vs 0.19 s (genawaiter) vs
-  0.12 s (handwritten) (measured 2026-07-24, same machine and
-  toolchain).
+  0.12 s (handwritten) (measured 2026-07-24 at `ec10652`, before the
+  in-place resume arms; same machine and toolchain).
 - In release builds (no incremental caching by default) codegen
-  dominates and the gap mostly closes: diapause is ~20 % slower than
-  genawaiter and ~50 % slower than handwritten code at N = 500 —
-  roughly 2.4 ms per coroutine end-to-end.
+  dominates and the gap narrows: diapause is ~50 % slower than
+  genawaiter and ~90 % slower than handwritten code at N = 500 —
+  roughly 3.1 ms per coroutine end-to-end. This is up from 1.21 s /
+  ~2.4 ms per coroutine at `ec10652`: the in-place resume arms
+  duplicate each eligible hot loop body into a fast arm, growing both
+  the expansion and the code handed to rustc (the runtime win on
+  `large_state` is what this compile-time cost buys).
 
 ## Scope and caveats
 
@@ -233,6 +240,10 @@ Observations:
 ## Reproducing
 
 ```sh
+# everything below in one shot; writes raw logs plus a summary.md whose
+# tables mirror this document (see --help for stage selection)
+python3 diapause-bench/scripts/run_all_benchmarks.py
+
 # runtime
 cargo bench -p diapause-bench
 
