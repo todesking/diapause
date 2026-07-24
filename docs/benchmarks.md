@@ -14,8 +14,9 @@ size, and compile time.
 
 ## Measurement conditions
 
-- Date: 2026-07-24 (runtime, code size); 2026-07-23/24 (compile time)
-- Code: diapause commit `ec10652`
+- Date: 2026-07-25 (runtime, code size); 2026-07-23/24 (compile time)
+- Code: diapause commit `703c73a` (runtime and code size; first commit
+  with the in-place resume arms), `ec10652` (compile time)
 - Machine: Apple M4 (10 cores: 4P + 6E), 16 GB RAM, macOS 26.5.2
   (`aarch64-apple-darwin`)
 - Toolchain: rustc 1.96.0 (ac68faa20 2026-05-25), stable
@@ -71,10 +72,10 @@ per drive from the workload table by these times for throughput):
 
 | workload | diapause | handwritten | genawaiter_rc | genawaiter_stack | corosensei | generator | next_gen |
 |---|---|---|---|---|---|---|---|
-| `counter` | **1.66 µs** | 1.71 µs | 2.29 µs | 1.86 µs | 6.43 µs | 15.5 µs | 2.17 µs |
-| `nested` | 3.64 µs | **2.19 µs** | 4.69 µs | 4.29 µs | 8.27 µs | 22.9 µs | 4.27 µs |
-| `running_total` | 2.01 µs | **1.98 µs** | 4.05 µs | 3.95 µs | 7.41 µs | 9.77 µs | 3.95 µs |
-| `large_state` | 9.95 µs | **1.88 µs** | 2.08 µs | 1.91 µs | 6.58 µs | 15.9 µs | 2.20 µs |
+| `counter` | **1.64 µs** | 1.69 µs | 2.27 µs | 1.84 µs | 4.60 µs | 15.6 µs | 2.17 µs |
+| `nested` | 3.59 µs | **2.15 µs** | 4.02 µs | 4.30 µs | 6.33 µs | 23.1 µs | 4.33 µs |
+| `running_total` | 1.98 µs | **1.95 µs** | 4.01 µs | 3.94 µs | 5.37 µs | 10.1 µs | 3.91 µs |
+| `large_state` | **1.84 µs** | 1.86 µs | 2.31 µs | 1.91 µs | 4.67 µs | 15.6 µs | 2.20 µs |
 
 Observations:
 
@@ -83,33 +84,42 @@ Observations:
   approach: 1.1–2× faster than genawaiter and 1.2–2× faster than
   next-gen. With resume values (`running_total`) the gap to both
   async-transform crates is ~2×.
-- `large_state` is diapause's worst case: 5.2× slower than the
-  handwritten machine and ~5× slower than genawaiter/next-gen. The
-  generated `resume` moves the live variables out of the state enum
-  and writes them back at every transition, so the 256-byte buffer is
-  copied twice per yield (\~9.7 ns per round trip vs \~1.8 ns
-  handwritten); every other approach keeps the buffer in place (async
-  frame, stackful stack, or struct field). This is a real cost of the
-  by-value state-enum design that also enables `Unpin`, `derive`, and
-  serde snapshots.
+- `large_state` — previously diapause's worst case (9.95 µs at commit
+  `ec10652`, 5.2× slower than handwritten: the generated `resume` moved
+  the live variables out of the state enum and wrote them back at every
+  transition, copying the 256-byte buffer twice per yield) — is now on
+  par with the handwritten machine. The in-place resume arms introduced
+  in `703c73a` bind the suspended variant's fields by `&mut` when every
+  reachable suspension re-enters the same variant, so the buffer is
+  updated in place exactly as a handwritten `step()` would
+  (−81.6% on this workload per criterion's change report; the
+  small-state workloads are unchanged within noise, −0.6…−1.5%).
 - `nested` is the one small-state case where a human wins: the
   handwritten machine collapses both loops into a single two-counter
   `step()`, while the generated dispatch loop keeps the two `Range`
-  iterators from the source. diapause still beats every library there.
+  iterators from the source (the resume slice re-enters the inner loop
+  header from the outer body — a join, so the in-place arm does not
+  apply). diapause still beats every library there.
+- Between the two measurement rounds, corosensei moved −23…−29% and
+  genawaiter_rc's rows moved −14…+11% with no change to their code or
+  toolchain — binary-layout sensitivity (see "Scope and caveats"
+  below); the cross-implementation ordering is unaffected.
 - The stackful crates are dominated by per-construction stack setup
   under this construct-and-drive protocol. Solving the fixed and
   per-yield components from `counter` (1024 yields) and `nested`
-  (2016 yields, same construction): corosensei ≈ 4.5 µs construction
-  + ≈1.9 ns/yield, generator ≈ 7.9 µs + ≈7.5 ns/yield. corosensei's
+  (2016 yields, same construction): corosensei ≈ 2.8 µs construction
+  + ≈1.7 ns/yield, generator ≈ 7.7 µs + ≈7.6 ns/yield. corosensei's
   steady-state resume cost is thus on par with diapause's; the table
   mostly shows its stack allocation, which stack reuse (`with_stack`,
   not measured) would amortize away for long-lived coroutines.
 - next_gen tracks genawaiter_stack closely on every workload (both
   drive a compiler-generated async state machine; next-gen passes
   values through a stack slot instead of an `Rc` cell).
-- ~1.6–2.0 ns per resume/yield round trip for diapause on the
-  small-state workloads: suspension is an enum tag write plus a
-  dispatch on resume, no allocation anywhere. (`rc::Gen` does
+- ~1.6–2.0 ns per resume/yield round trip for diapause on every
+  workload now that resuming no longer copies the state: suspension
+  is an enum tag write (or, on an in-place arm, no state write at
+  all beyond what the user code does) plus a dispatch on resume, no
+  allocation anywhere. (`rc::Gen` does
   allocate, but only once per construction, which is negligible
   amortized over 1024 yields; its gap over the `stack` flavor is
   per-yield overhead of the `Rc`-based value passing, not the
@@ -126,12 +136,12 @@ modules differ only by formatting):
 
 | module | source | expanded | notes |
 |---|---|---|---|
-| `dia` (diapause) | 37 lines / 0.9 kB | 575 lines / 25.7 kB | ~16× lines: 4 state enums + `Coroutine` impls with per-block dispatch |
+| `dia` (diapause) | 37 lines / 0.9 kB | 689 lines / 31.7 kB | ~19× lines: 4 state enums + `Coroutine` impls with per-block dispatch; the in-place resume arms (commit `703c73a`) duplicate the hot loop bodies, +114 lines over the previous measurement |
 | `hand` (handwritten) | 200 lines / 5.3 kB | 273 lines / 9.3 kB | no macros |
 | `ga` (genawaiter) | 45 lines / 1.2 kB | 41 lines / 1.3 kB | async blocks expand inside the compiler, not visibly |
 
-The generated source is ~2× the size of the handwritten equivalent of
-the same four coroutines; genawaiter's expansion cost exists but is
+The generated source is ~2.5× the size of the handwritten equivalent
+of the same four coroutines; genawaiter's expansion cost exists but is
 hidden in rustc's coroutine transform.
 
 ### Machine code (release `__text` section)
@@ -147,12 +157,12 @@ footprint:
 | binary | `__text` bytes | delta over baseline | stripped file size delta |
 |---|---|---|---|
 | `size_baseline` | 217 552 | — | — |
-| `size_diapause` | 218 684 | **+1 132** | +496 |
+| `size_diapause` | 218 676 | **+1 124** | +496 |
 | `size_handwritten` | 218 524 | +972 | +544 |
-| `size_genawaiter` | 221 072 | +3 520 | +17 008 |
+| `size_genawaiter` | 221 048 | +3 496 | +17 008 |
 
 The three diapause state machines compile to essentially the same
-amount of machine code as the handwritten ones (+160 bytes across all
+amount of machine code as the handwritten ones (+152 bytes across all
 three workloads); the genawaiter versions cost ~3.5× more text (the
 monomorphized `Rc`/future machinery). Note the stripped-file deltas
 are quantized by Mach-O page alignment: total section growth for the
