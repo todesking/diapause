@@ -8,6 +8,11 @@ machine enum: the body is analyzed as a control-flow graph and each
 `yield_!` suspension point becomes an enum variant holding the live
 variables.
 
+Try it in your browser: the
+[playground](https://todesking.github.io/diapause/) shows the expanded
+code and control-flow graph for any annotated function — no
+installation required.
+
 ```rust
 use diapause::{Coroutine, CoroutineState};
 

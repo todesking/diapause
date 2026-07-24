@@ -30,6 +30,10 @@
 //! suspension point, passing its argument as the value of the
 //! `let x = yield_!(..)` binding.
 //!
+//! The [playground](https://todesking.github.io/diapause/) runs the
+//! transform in the browser, showing the expanded code and control-flow
+//! graph for any annotated function.
+//!
 //! # Supported bodies
 //!
 //! `yield_!` works inside `if` / `match` / `loop` / `while` /
