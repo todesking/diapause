@@ -11,8 +11,13 @@ identical resume-value coroutines (only constants differ):
 For each crate the dependencies are built once to warm the target
 directory, then the leaf crate alone is rebuilt (``touch src/lib.rs``)
 ``--runs`` times in dev and release mode, and the wall-clock time of
-each rebuild is reported. This isolates the cost of macro expansion +
-codegen of the coroutine-heavy crate itself.
+each rebuild is reported. This isolates the rebuild cost of the
+coroutine-heavy leaf crate itself.
+
+Note that dev rebuilds use Cargo's default incremental compilation:
+the content is unchanged, so cached type-checking/codegen is largely
+reused while proc-macro expansion always re-runs. Set
+``CARGO_INCREMENTAL=0`` to measure non-incremental rebuilds instead.
 
 Usage::
 

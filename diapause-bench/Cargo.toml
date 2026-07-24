@@ -6,8 +6,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
+corosensei = "0.3.4"
 diapause = { path = "../diapause" }
 genawaiter = "0.99"
+generator = "0.8.9"
+next-gen = "0.1.1"
 
 [dev-dependencies]
 criterion = "0.7"
