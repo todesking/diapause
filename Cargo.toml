@@ -15,6 +15,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/todesking/diapause"
-# Determined by edition 2024; the crates use no library APIs newer
-# than `core::error::Error` (1.81).
-rust-version = "1.85"
+# Determined by let-chains (stabilized in 1.88); edition 2024 alone
+# would allow 1.85. Verified by building and testing on a real 1.88
+# toolchain.
+rust-version = "1.88"
