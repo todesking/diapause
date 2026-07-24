@@ -3,11 +3,17 @@ use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
 
 /// Arguments of `#[diapause::coroutine(yield = Type, resume = Type,
-/// fingerprint)]`. The types default to `()`.
+/// fingerprint, in_place = bool)]`. The types default to `()`.
 pub struct MacroArgs {
     pub yield_ty: syn::Type,
     pub resume_ty: syn::Type,
     pub fingerprint: Fingerprint,
+    /// The `in_place` argument (default `true`): whether eligible
+    /// resume arms may update the suspended state in place instead of
+    /// moving it out and back. `in_place = false` restores the
+    /// unconditional panics-leave-`Poisoned` guarantee (see
+    /// `analyze_cfg::InPlacePlan`).
+    pub in_place: bool,
 }
 
 /// The `fingerprint` argument: when given, the `__fp` field and its
@@ -32,6 +38,7 @@ impl Parse for MacroArgs {
         let mut yield_ty = None;
         let mut resume_ty = None;
         let mut fingerprint = None;
+        let mut in_place = None;
         while !input.is_empty() {
             // `yield` is a reserved keyword, so accept any identifier here.
             let name = input.call(syn::Ident::parse_any)?;
@@ -54,6 +61,24 @@ impl Parse for MacroArgs {
                 if fingerprint.replace(value).is_some() {
                     return Err(duplicate(&name));
                 }
+            } else if name == "in_place" {
+                input.parse::<Token![=]>().map_err(|e| {
+                    syn::Error::new(
+                        e.span(),
+                        "`in_place` takes a boolean: `in_place = false` disables \
+                         in-place resume arms",
+                    )
+                })?;
+                let lit = input.parse::<syn::LitBool>().map_err(|e| {
+                    syn::Error::new(
+                        e.span(),
+                        "`in_place` takes a boolean: `in_place = false` disables \
+                         in-place resume arms",
+                    )
+                })?;
+                if in_place.replace(lit.value).is_some() {
+                    return Err(duplicate(&name));
+                }
             } else {
                 input.parse::<Token![=]>()?;
                 let ty: syn::Type = input.parse()?;
@@ -63,7 +88,8 @@ impl Parse for MacroArgs {
                     _ => {
                         return Err(syn::Error::new(
                             name.span(),
-                            "unknown argument, expected `yield`, `resume`, or `fingerprint`",
+                            "unknown argument, expected `yield`, `resume`, `fingerprint`, \
+                             or `in_place`",
                         ));
                     }
                 };
@@ -80,6 +106,7 @@ impl Parse for MacroArgs {
             yield_ty: yield_ty.unwrap_or_else(unit),
             resume_ty: resume_ty.unwrap_or_else(unit),
             fingerprint: fingerprint.unwrap_or(Fingerprint::Off),
+            in_place: in_place.unwrap_or(true),
         })
     }
 }
@@ -104,9 +131,37 @@ mod tests {
     fn unknown_argument_is_rejected() {
         let msg = expand_err(quote!(banana = i32));
         assert!(
-            msg.contains("unknown argument, expected `yield`, `resume`, or `fingerprint`"),
+            msg.contains(
+                "unknown argument, expected `yield`, `resume`, `fingerprint`, or `in_place`"
+            ),
             "got: {msg}"
         );
+    }
+
+    #[test]
+    fn in_place_takes_a_boolean() {
+        let msg = expand_err(quote!(in_place));
+        assert!(msg.contains("`in_place` takes a boolean"), "got: {msg}");
+        let msg = expand_err(quote!(in_place = 1));
+        assert!(msg.contains("`in_place` takes a boolean"), "got: {msg}");
+    }
+
+    #[test]
+    fn duplicate_in_place_is_rejected() {
+        let msg = expand_err(quote!(in_place = false, in_place = true));
+        assert!(msg.contains("duplicate `in_place` argument"), "got: {msg}");
+    }
+
+    #[test]
+    fn in_place_parses() {
+        for (attr, expected) in [
+            (quote!(yield = u32), true),
+            (quote!(yield = u32, in_place = true), true),
+            (quote!(yield = u32, in_place = false), false),
+        ] {
+            let args: super::MacroArgs = syn::parse2(attr).unwrap();
+            assert_eq!(args.in_place, expected);
+        }
     }
 
     #[test]
