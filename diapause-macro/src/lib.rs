@@ -31,6 +31,8 @@ use proc_macro::TokenStream;
 /// flag stamps every state with a hash of the coroutine's source and
 /// validates it before resuming (see "State-variant naming and serde"
 /// below); `fingerprint = "tag"` hashes the tag instead.
+/// `in_place = false` disables the in-place resume optimization (see
+/// "In-place resume and panic behavior" below).
 ///
 /// `#[derive(...)]` attributes written **below** this attribute are
 /// moved onto the generated `State` enum; other attributes (doc
@@ -144,6 +146,39 @@ use proc_macro::TokenStream;
 /// - **Drop timing.** Variables not stored in the next state are
 ///   dropped at the transition, possibly before their lexical scope
 ///   ends.
+///
+/// # In-place resume and panic behavior
+///
+/// When every suspension reachable from a resume point re-enters the
+/// same state variant (the typical `loop { yield_!(..); .. }` hot
+/// path), the generated `resume` updates the stored variables through
+/// `&mut self` instead of moving the whole enum out and back, so the
+/// cost of resuming does not scale with the size of the state (a
+/// `[u64; 32]` buffer held across a yield resumes at handwritten
+/// speed). Ineligible shapes — several suspension points reachable
+/// from one resume, loops between two suspensions, shadowing of stored
+/// names, macro invocations mentioning stored variables — fall back to
+/// the always-correct move-out code automatically. The state enum's
+/// variants, fields, and serde representation are identical either
+/// way.
+///
+/// Two visible consequences, both removable with `in_place = false`:
+///
+/// - **Panic behavior.** Outside in-place resumes, a panic in user
+///   code leaves the state `Poisoned` (further use panics). Inside
+///   one, the panic leaves the partially updated `Suspended` state
+///   behind instead: `status()` still reports `Suspended`, and
+///   resuming is memory-safe but its behavior is unspecified
+///   (variables mutated before the panic keep their new values). Code
+///   that catches panics and must not observe a half-updated coroutine
+///   should set `in_place = false` or drop the coroutine after a
+///   caught panic.
+/// - **Moves of stored variables.** In-place resumes reach stored
+///   variables through references, so code that moves one out and
+///   re-initializes it before the next yield
+///   (`let old = s; s = rebuild(old);` on a non-`Copy` `s`) can fail
+///   with `E0507: cannot move out of ...`. Use
+///   `core::mem::take`/`core::mem::replace`, or `in_place = false`.
 ///
 /// # State-variant naming and serde
 ///

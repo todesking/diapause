@@ -96,6 +96,12 @@ pub enum CoroutineStatus {
     Done,
     /// A previous `start`/`resume` call panicked partway through a
     /// transition. Both `start` and `resume` panic.
+    ///
+    /// A panic inside an in-place resume arm does *not* poison: the
+    /// state stays [`Suspended`](Self::Suspended) with whatever partial
+    /// updates the code made before panicking, and resuming it is
+    /// memory-safe but unspecified. See the `in_place` argument of
+    /// [`macro@crate::coroutine`] for the trade-off and the opt-out.
     Poisoned,
 }
 

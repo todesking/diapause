@@ -94,8 +94,21 @@ any code. `start()` runs the body up to the first `yield_!`; each
   that is fundamentally impossible for async-based generator crates.
   An opt-in `fingerprint` flag detects a persisted state meeting
   edited source instead of resuming at a wrong program point.
-- **Panic safety**: a coroutine that panics mid-transition is left in a
-  `Poisoned` state and panics on further use.
+- **In-place resume**: when every suspension reachable from a resume
+  point leads back to the same state variant (the typical
+  `loop { yield_!(x); .. }` hot path), the generated `resume` mutates
+  the stored variables through `&mut self` instead of moving the whole
+  enum out and back — the cost of resuming does not scale with the
+  size of the state, and large buffers held across yields run at
+  handwritten speed (see [docs/benchmarks.md](docs/benchmarks.md)).
+  Ineligible shapes fall back to the move-out codegen automatically;
+  `in_place = false` opts a coroutine out entirely (see Panic safety).
+- **Panic safety**: a panicking coroutine is never left in a state that
+  is unsafe to touch. On an in-place resume path (see above) a panic
+  leaves the partially updated `Suspended` state behind — resuming it
+  is memory-safe but unspecified; everywhere else the state becomes
+  `Poisoned` and panics on further use. `in_place = false` restores
+  the unconditional `Poisoned` guarantee.
 - **`no_std` compatible**: the runtime crate has no `std` dependencies
   and works in `no_std` environments. No allocation, no unsafe code.
 
@@ -322,8 +335,16 @@ produces a dedicated compile error with the workaround in the message.
 - **Visibility**: the generated state enum is as public as the function,
   so argument and return types must be at least that visible or rustc
   reports `E0446` (private type in public interface).
+- **In-place resumes access stored variables through references** (see
+  Features): code on such a hot path that moves a stored variable out
+  and re-initializes it before the next yield (`let old = s;` on a
+  non-`Copy` `s` that is later re-assigned) can fail with `E0507`; use
+  `mem::take` / `mem::replace`, or opt out with `in_place = false`.
 - Variables not carried into the next state are dropped at the
   transition, which can be earlier than the end of their lexical scope.
+  On an in-place resume path, values that die on a completion path are
+  dropped at the state's move-out instead, which can be slightly later
+  within the same `resume` call.
 
 ## Comparison with existing crates
 
