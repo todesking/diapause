@@ -1,5 +1,11 @@
 # diapause
 
+[![crates.io](https://img.shields.io/crates/v/diapause.svg)](https://crates.io/crates/diapause)
+[![docs.rs](https://img.shields.io/docsrs/diapause)](https://docs.rs/diapause)
+[![CI](https://github.com/todesking/diapause/actions/workflows/ci.yml/badge.svg)](https://github.com/todesking/diapause/actions/workflows/ci.yml)
+![MSRV](https://img.shields.io/crates/msrv/diapause)
+![license](https://img.shields.io/crates/l/diapause.svg)
+
 Coroutines/generators for stable Rust via code transformation — no
 `async`, no `Pin`, no allocation, no unsafe code.
 
