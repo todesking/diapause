@@ -10,29 +10,7 @@ versioned and released together; this changelog covers all three.
 
 ## [Unreleased]
 
-### Added
-
-- In-place resume arms: when every suspension reachable from a resume
-  point re-enters the same state variant (the typical
-  `loop { yield_!(..); .. }` hot path), `resume` now updates the stored
-  variables through `&mut self` instead of moving the whole state enum
-  out and back. Resuming cost no longer scales with the size of the
-  state; the `large_state` benchmark (a `[u64; 32]` buffer live across
-  every yield) goes from ~5x slower than a handwritten state machine to
-  on par with it. Ineligible shapes fall back to the previous codegen
-  automatically, and the state enum's public shape and serde
-  representation are unchanged.
-- `in_place = false` attribute argument to disable the optimization per
-  coroutine.
-
-### Changed
-
-- Panic guarantee: a panic inside an in-place resume arm leaves the
-  partially updated `Suspended` state behind instead of `Poisoned`
-  (resuming it is memory-safe but unspecified). Everywhere else — and
-  everywhere under `in_place = false` — panics still poison.
-
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-07-25
 
 Initial release.
 
@@ -66,6 +44,21 @@ Initial release.
   attribute flag, the `Fingerprinted` trait, and `FingerprintMismatch`
   for validating persisted states against the coroutine source.
 - `no_std` support (no `alloc` required).
+- In-place resume arms: when every suspension reachable from a resume
+  point re-enters the same state variant (the typical
+  `loop { yield_!(..); .. }` hot path), `resume` updates the stored
+  variables through `&mut self` instead of moving the whole state enum
+  out and back, so resuming cost does not scale with the size of the
+  state; the `large_state` benchmark (a `[u64; 32]` buffer live across
+  every yield) performs on par with a handwritten state machine.
+  Ineligible shapes fall back to the general move-out codegen
+  automatically, and the state enum's public shape and serde
+  representation are identical either way. A panic inside an in-place
+  resume arm leaves the partially updated `Suspended` state behind
+  instead of `Poisoned` (resuming it is memory-safe but unspecified);
+  everywhere else panics poison.
+- `in_place = false` attribute argument to disable the optimization per
+  coroutine, restoring the poison-on-panic guarantee everywhere.
 
 [Unreleased]: https://github.com/todesking/diapause/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/todesking/diapause/releases/tag/v0.1.0
