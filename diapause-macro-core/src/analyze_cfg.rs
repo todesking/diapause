@@ -7,7 +7,7 @@
 //! the borrowed binding instead, and the borrow is re-established at the
 //! head of every arm (region) that uses it outside its defining region.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use quote::{ToTokens, format_ident};
 use syn::visit::Visit;
@@ -15,7 +15,9 @@ use syn::visit::Visit;
 use crate::cfg::{
     BindingId, BindingKind, BlockId, BorrowSource, Cfg, OpaqueJumpKind, Terminator, TySource,
 };
-use crate::lower::{ErrorSink, UseCollector, collect_markers};
+use crate::lower::{
+    ErrorSink, PatBindingCollector, UseCollector, collect_markers, collect_token_idents,
+};
 
 /// Signature-level information about one function argument, parallel to
 /// `BindingId(0)..BindingId(args.len())`. Built from `expand::ArgVar` (via
@@ -63,6 +65,34 @@ pub struct Variant {
     pub reborrows: Vec<Reborrow>,
 }
 
+/// A resume-point variant whose dispatch arm can be generated in place
+/// (see `expand`): every suspension reachable from the resume without
+/// crossing another variant's dispatch re-enters this same variant, so
+/// the arm can bind the fields by `ref mut` and skip both the
+/// whole-enum move-out at `__drive` entry and the whole-enum write-back
+/// at the yield. Paths that leave the cycle (completion, a yield into a
+/// different variant) first move the state out (`expand`'s rehydrate)
+/// and continue with the standard by-value codegen.
+///
+/// The cost of the in-place arm is the panic guarantee: a panic inside
+/// it leaves the partially updated `Suspended` variant behind instead
+/// of `Poisoned` (resuming such a state is memory-safe but its behavior
+/// is unspecified). The macro's `in_place = false` argument disables
+/// the plans entirely.
+#[derive(Debug)]
+pub struct InPlacePlan {
+    /// The resume-point block whose arm is generated in place.
+    pub block: BlockId,
+    /// Blocks emitted inside the fast arm, `block` included. Closed
+    /// under non-yield terminator successors, and a tree rooted at
+    /// `block` (every other member has exactly one region-internal
+    /// predecessor), so codegen inlines each member exactly once.
+    pub region: BTreeSet<BlockId>,
+    /// The variant's fields as bindings: bound by `ref mut` in the fast
+    /// arm, with their uses rewritten to dereferences.
+    pub fields: BTreeSet<BindingId>,
+}
+
 #[derive(Debug)]
 pub struct Analysis {
     /// One entry per non-inline block (including the entry block), in
@@ -79,6 +109,10 @@ pub struct Analysis {
     /// substitution — the `use` sets the liveness fixed point ran on.
     // Consumed by `validate`, which re-checks the dataflow equations.
     pub uses: Vec<BTreeSet<BindingId>>,
+    /// Resume-point variants whose dispatch arm is generated in place,
+    /// in ascending block order. Empty when the optimization is
+    /// disabled (`in_place = false`) or no variant qualifies.
+    pub in_place: Vec<InPlacePlan>,
 }
 
 impl Analysis {
@@ -96,8 +130,20 @@ impl Analysis {
 /// arguments (`BindingId(0)..`); `resume_ty` is the default type of
 /// resume bindings.
 pub fn analyze(cfg: &Cfg, args: &[ArgInfo], resume_ty: &syn::Type) -> syn::Result<Analysis> {
+    analyze_with(cfg, args, resume_ty, true)
+}
+
+/// [`analyze`] with the in-place optimization toggled by `in_place`
+/// (the macro's `in_place` argument): when `false`, no [`InPlacePlan`]s
+/// are computed and codegen always moves the state out and back.
+pub fn analyze_with(
+    cfg: &Cfg,
+    args: &[ArgInfo],
+    resume_ty: &syn::Type,
+    in_place: bool,
+) -> syn::Result<Analysis> {
     let cx = Context::new(cfg, args, resume_ty);
-    cx.run()
+    cx.run(in_place)
 }
 
 struct Context<'a> {
@@ -129,7 +175,7 @@ impl<'a> Context<'a> {
         self.errors.push(syn::Error::new(span, msg));
     }
 
-    fn run(mut self) -> syn::Result<Analysis> {
+    fn run(mut self, in_place: bool) -> syn::Result<Analysis> {
         let (uses, rebuilds) = self.substitute_borrows();
         let live_in = self.liveness(&uses);
         let removed_stmts = self.removed_statements(&rebuilds);
@@ -137,11 +183,17 @@ impl<'a> Context<'a> {
         let variants = self.build_variants(&live_in, &rebuilds, &mut collisions);
         self.check_jump_shadowing(&variants);
         self.check_transfer_shadowing(&live_in, &removed_stmts, &mut collisions);
+        let in_place = if in_place {
+            compute_in_place(self.cfg, &live_in, &variants)
+        } else {
+            Vec::new()
+        };
         self.errors.into_result(Analysis {
             variants,
             removed_stmts,
             live_in,
             uses,
+            in_place,
         })
     }
 }
@@ -884,6 +936,333 @@ fn def_blocks(cfg: &Cfg) -> Vec<Option<BlockId>> {
         }
     }
     out
+}
+
+// === In-place resume arms ===
+
+/// One [`InPlacePlan`] per qualifying resume-point variant, in
+/// ascending block order (inherited from `variants`).
+fn compute_in_place(
+    cfg: &Cfg,
+    live_in: &[BTreeSet<BindingId>],
+    variants: &[Variant],
+) -> Vec<InPlacePlan> {
+    variants
+        .iter()
+        .filter(|v| cfg.blocks[v.block].resume_point)
+        .filter_map(|v| in_place_plan(cfg, live_in, variants, v))
+        .collect()
+}
+
+/// Decides whether `v`'s dispatch arm can be generated in place, and
+/// over which region. Deliberately conservative: any construct the fast
+/// codegen cannot handle transparently (opaque jumps, region cycles or
+/// joins, shadowing of stored names, macros or early-exit rewrites that
+/// mention them, likely moves of stored bindings) makes the variant
+/// fall back to the standard move-out arm, which is always correct.
+fn in_place_plan(
+    cfg: &Cfg,
+    live_in: &[BTreeSet<BindingId>],
+    variants: &[Variant],
+    v: &Variant,
+) -> Option<InPlacePlan> {
+    let s = v.block;
+    // The bindings stored as fields: exactly the storable live-ins.
+    // (Bindings the analysis rejected — non-reconstructible borrows,
+    // unannotatable patterns — already produced an error, so the plan
+    // never reaches codegen in that case.)
+    let fields: BTreeSet<BindingId> = live_in[s]
+        .iter()
+        .copied()
+        .filter(|id| matches!(cfg.bindings[id.0].borrow, BorrowSource::NotABorrow))
+        .collect();
+    let field_names: BTreeSet<String> = fields
+        .iter()
+        .map(|id| cfg.bindings[id.0].ident.to_string())
+        .collect();
+
+    // Region discovery: follow terminator edges, stopping at yields
+    // (which must all re-enter `s`) and returns. Opaque jumps
+    // transition via `continue '__dispatch`, which does not exist on
+    // the fast path.
+    let mut region = BTreeSet::from([s]);
+    let mut queue = vec![s];
+    let mut has_yield_back = false;
+    while let Some(b) = queue.pop() {
+        let blk = &cfg.blocks[b];
+        if !blk.jumps.is_empty() {
+            return None;
+        }
+        if let Terminator::Yield { next, .. } = blk.terminator {
+            if next != s {
+                return None;
+            }
+            has_yield_back = true;
+            continue;
+        }
+        for t in blk.terminator.successors() {
+            // A non-yield edge into `s` or into another resume point
+            // cannot occur (resume points are entered only by their
+            // yield); the entry's statements assume the `Start` unpack.
+            if t == s || cfg.blocks[t].resume_point || t == cfg.entry {
+                return None;
+            }
+            if region.insert(t) {
+                queue.push(t);
+            }
+        }
+    }
+    // Without an in-region yield the fast arm would only add a state
+    // copy (rehydrate) to the standard exit path.
+    if !has_yield_back {
+        return None;
+    }
+
+    // The region must be a tree rooted at `s`: each member reached by
+    // exactly one region edge, so codegen inlines it exactly once.
+    // This also excludes intra-resume cycles, which need the dispatch
+    // loop, and joins, which would duplicate code.
+    let mut preds: BTreeMap<BlockId, usize> = BTreeMap::new();
+    for &b in &region {
+        if matches!(cfg.blocks[b].terminator, Terminator::Yield { .. }) {
+            continue;
+        }
+        for t in cfg.blocks[b].terminator.successors() {
+            *preds.entry(t).or_insert(0) += 1;
+        }
+    }
+    if region.iter().any(|&b| b != s && preds.get(&b) != Some(&1)) {
+        return None;
+    }
+
+    // Definitions inside the region: a different binding shadowing a
+    // stored name would be captured by the name-based rewrite; the
+    // stored binding itself may be re-bound only at a known position (a
+    // `let` statement or the head pattern of the region `for` that owns
+    // it), so codegen can switch from dereferences to the fresh local
+    // there and write the local back into the field at the yield.
+    let head_pats = iter_head_pat_names(cfg, &region);
+    for &b in &region {
+        for &id in &cfg.blocks[b].defs {
+            let name = cfg.bindings[id.0].ident.to_string();
+            if name.starts_with("__self_") {
+                return None;
+            }
+            if fields.contains(&id) {
+                let at_head = head_pats.get(&b).is_some_and(|p| p.contains(&name));
+                if cfg.bindings[id.0].def_stmt.is_none() && !at_head {
+                    return None;
+                }
+            } else if field_names.contains(&name) {
+                return None;
+            }
+        }
+        // Reborrows are rebuilt as locals at the head of a variant
+        // block's code; one named like a field would shadow the
+        // rewrite's dereference targets.
+        if let Ok(i) = variants.binary_search_by_key(&b, |v| v.block)
+            && variants[i]
+                .reborrows
+                .iter()
+                .any(|rb| field_names.contains(&rb.target.to_string()))
+        {
+            return None;
+        }
+    }
+
+    // Statement- and terminator-level scans for constructs the rewrite
+    // cannot see through.
+    for &b in &region {
+        for stmt in &cfg.blocks[b].stmts {
+            if !stmt_is_in_place_safe(stmt, &field_names) {
+                return None;
+            }
+        }
+        let safe = match &cfg.blocks[b].terminator {
+            Terminator::Branch { cond, .. } => expr_is_in_place_safe(cond, &field_names),
+            Terminator::Match { scrutinee, arms } => {
+                // A match on a bare stored binding usually moves it
+                // (standard codegen matches on the unpacked local); the
+                // rewritten `match (*__self_x)` would not compile for
+                // non-`Copy` payloads, so keep such variants on the
+                // standard arm.
+                !is_bare_field(scrutinee, &field_names)
+                    && expr_is_in_place_safe(scrutinee, &field_names)
+                    && arms
+                        .iter()
+                        .filter_map(|a| a.guard.as_ref())
+                        .all(|g| expr_is_in_place_safe(g, &field_names))
+            }
+            Terminator::Yield { value, .. } => expr_is_in_place_safe(value, &field_names),
+            // `Return`/`Unreachable` expressions run after the state is
+            // moved back out (rehydrated) and are not rewritten.
+            Terminator::Goto(_)
+            | Terminator::IterNext { .. }
+            | Terminator::Return(_)
+            | Terminator::Unreachable(_) => true,
+        };
+        if !safe {
+            return None;
+        }
+    }
+
+    Some(InPlacePlan {
+        block: s,
+        region,
+        fields,
+    })
+}
+
+/// The names bound by the head pattern of each region-internal
+/// `IterNext` body: the only place a stored binding may be re-bound
+/// without a statement index.
+fn iter_head_pat_names(
+    cfg: &Cfg,
+    region: &BTreeSet<BlockId>,
+) -> BTreeMap<BlockId, BTreeSet<String>> {
+    let mut out = BTreeMap::new();
+    for &b in region {
+        if let Terminator::IterNext { pat, body, .. } = &cfg.blocks[b].terminator {
+            let mut c = PatBindingCollector::default();
+            c.visit_pat(pat);
+            out.insert(
+                *body,
+                c.bindings.into_iter().map(|(i, _)| i.to_string()).collect(),
+            );
+        }
+    }
+    out
+}
+
+/// Whether `e` is a bare single-segment path naming a stored binding —
+/// the shape whose evaluation in value position is (potentially) a
+/// move.
+fn is_bare_field(e: &syn::Expr, field_names: &BTreeSet<String>) -> bool {
+    matches!(e, syn::Expr::Path(p)
+        if p.qself.is_none()
+            && p.path.leading_colon.is_none()
+            && p.path.segments.len() == 1
+            && p.path.segments[0].arguments.is_none()
+            && field_names.contains(&p.path.segments[0].ident.to_string()))
+}
+
+/// Statement-level in-place safety. A `let`'s own top-level pattern is
+/// exempt from the binding scan (its bindings are block defs, checked
+/// against the plan separately); everything else — including patterns
+/// nested inside expressions — goes through [`InPlaceScan`].
+fn stmt_is_in_place_safe(stmt: &syn::Stmt, field_names: &BTreeSet<String>) -> bool {
+    match stmt {
+        syn::Stmt::Local(l) => {
+            let Some(init) = &l.init else { return true };
+            // `let y = x;` of a stored `x` usually moves it; the
+            // rewritten `let y = (*__self_x);` would not compile for
+            // non-`Copy` types.
+            if is_bare_field(&init.expr, field_names) {
+                return false;
+            }
+            expr_is_in_place_safe(&init.expr, field_names)
+                && init
+                    .diverge
+                    .as_ref()
+                    .is_none_or(|(_, e)| expr_is_in_place_safe(e, field_names))
+        }
+        // Nested items are separate scopes: not rewritten, and unable
+        // to capture locals, so whatever they contain is safe.
+        syn::Stmt::Item(_) => true,
+        syn::Stmt::Expr(e, _) => expr_is_in_place_safe(e, field_names),
+        syn::Stmt::Macro(m) => macro_is_in_place_safe(&m.mac, field_names),
+    }
+}
+
+fn expr_is_in_place_safe(e: &syn::Expr, field_names: &BTreeSet<String>) -> bool {
+    let mut scan = InPlaceScan {
+        field_names,
+        ok: true,
+    };
+    scan.visit_expr(e);
+    scan.ok
+}
+
+/// A macro's tokens are spliced verbatim, invisible to the rewrite: any
+/// mention of a stored name (or of the generated `self`/`__self_*`
+/// names) inside disqualifies the variant.
+fn macro_is_in_place_safe(mac: &syn::Macro, field_names: &BTreeSet<String>) -> bool {
+    let mut idents = HashSet::new();
+    collect_token_idents(mac.tokens.clone(), &mut idents);
+    !idents
+        .iter()
+        .any(|i| field_names.contains(i) || i == "self" || i.starts_with("__self_"))
+}
+
+/// Syntactic conditions the in-place rewrite cannot handle, collected
+/// in one pass over an expression:
+///
+/// - a pattern binding a stored name (or `__self_*`): the binding would
+///   shadow the name mid-statement, which the flat rewrite cannot see;
+/// - any path mentioning `self` or `__self_*`: `self` appears only in
+///   the early-exit rewrites (`return`/`?`), which assign `*self` and
+///   would conflict with the arm's field borrows;
+/// - a macro invocation mentioning a stored name (tokens are spliced
+///   verbatim);
+/// - `match`/`for`/`if let`/`while let` consuming a bare stored
+///   binding: usually a move, which dereferencing breaks for non-`Copy`
+///   types.
+///
+/// Nested items are skipped: separate scopes that cannot capture
+/// locals. Closures are scanned (they capture and are rewritten).
+struct InPlaceScan<'a> {
+    field_names: &'a BTreeSet<String>,
+    ok: bool,
+}
+
+impl<'ast> Visit<'ast> for InPlaceScan<'_> {
+    fn visit_pat_ident(&mut self, pi: &'ast syn::PatIdent) {
+        let name = pi.ident.to_string();
+        if self.field_names.contains(&name) || name.starts_with("__self_") {
+            self.ok = false;
+        }
+        syn::visit::visit_pat_ident(self, pi);
+    }
+
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        for seg in &path.segments {
+            if seg.ident == "self" || seg.ident.to_string().starts_with("__self_") {
+                self.ok = false;
+            }
+        }
+        syn::visit::visit_path(self, path);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if !macro_is_in_place_safe(mac, self.field_names) {
+            self.ok = false;
+        }
+        syn::visit::visit_macro(self, mac);
+    }
+
+    fn visit_expr(&mut self, e: &'ast syn::Expr) {
+        let scrutinee = match e {
+            syn::Expr::Match(m) => Some(&*m.expr),
+            syn::Expr::ForLoop(f) => Some(&*f.expr),
+            syn::Expr::Let(l) => Some(&*l.expr),
+            _ => None,
+        };
+        if scrutinee.is_some_and(|s| is_bare_field(s, self.field_names)) {
+            self.ok = false;
+        }
+        syn::visit::visit_expr(self, e);
+    }
+
+    fn visit_local(&mut self, l: &'ast syn::Local) {
+        if let Some(init) = &l.init
+            && is_bare_field(&init.expr, self.field_names)
+        {
+            self.ok = false;
+        }
+        syn::visit::visit_local(self, l);
+    }
+
+    fn visit_item(&mut self, _: &'ast syn::Item) {}
 }
 
 // === Variant naming ===

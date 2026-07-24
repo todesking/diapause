@@ -1014,3 +1014,258 @@ fn arg_pattern_binding_across_yield_is_rejected() {
     assert!(msg.contains("destructuring argument pattern"), "got: {msg}");
     assert!(msg.contains("let b2: Type = b;"), "got: {msg}");
 }
+
+// === In-place resume arms ===
+
+fn plan_for(a: &Analysis, block: BlockId) -> &InPlacePlan {
+    a.in_place
+        .iter()
+        .find(|p| p.block == block)
+        .unwrap_or_else(|| panic!("no in-place plan for block {block}"))
+}
+
+fn plan_field_names(cfg: &Cfg, p: &InPlacePlan) -> Vec<String> {
+    p.fields
+        .iter()
+        .map(|id| cfg.bindings[id.0].ident.to_string())
+        .collect()
+}
+
+#[test]
+fn simple_for_loop_yield_gets_an_in_place_plan() {
+    let block: syn::Block = parse_quote!({
+        for i in 0..n {
+            yield_!(i);
+        }
+    });
+    let (cfg, a) = run_args(&[("n", "u64")], &block, &unit());
+    let s = resume_ids(&cfg)[0];
+    let p = plan_for(&a, s);
+    assert_eq!(plan_field_names(&cfg, p), ["__iter0"]);
+    assert!(p.region.contains(&s));
+    // The region covers the whole resume slice: the loop header
+    // (IterNext), its body (the yield), and the exit (return).
+    assert!(
+        p.region
+            .iter()
+            .any(|&b| matches!(cfg.blocks[b].terminator, Terminator::IterNext { .. })),
+        "region must include the loop header"
+    );
+    assert!(
+        p.region
+            .iter()
+            .any(|&b| matches!(cfg.blocks[b].terminator, Terminator::Yield { .. })),
+        "region must include the yield block"
+    );
+}
+
+#[test]
+fn while_loop_yield_gets_an_in_place_plan() {
+    let block: syn::Block = parse_quote!({
+        let mut i: u64 = 0;
+        while i < n {
+            yield_!(i);
+            i += 1;
+        }
+    });
+    let (cfg, a) = run_args(&[("n", "u64")], &block, &unit());
+    let s = resume_ids(&cfg)[0];
+    let p = plan_for(&a, s);
+    let mut names = plan_field_names(&cfg, p);
+    names.sort();
+    assert_eq!(names, ["i", "n"]);
+}
+
+#[test]
+fn loop_variable_stored_across_yield_is_rebindable_at_the_for_head() {
+    // `i` is live across the yield (used after resume) and re-bound by
+    // the `for` head pattern each iteration: allowed, with a write-back
+    // at the yield.
+    let block: syn::Block = parse_quote!({
+        let mut sum: u64 = 0;
+        for i in 0..n {
+            let bonus = yield_!(sum);
+            sum = sum.wrapping_add(i).wrapping_add(bonus);
+        }
+        sum
+    });
+    let (cfg, a) = run_args(&[("n", "u64")], &block, &parse_quote!(u64));
+    let s = resume_ids(&cfg)[0];
+    let p = plan_for(&a, s);
+    let mut names = plan_field_names(&cfg, p);
+    names.sort();
+    assert_eq!(names, ["__iter0", "i", "sum"]);
+}
+
+#[test]
+fn yield_into_a_different_state_has_no_plan() {
+    let block: syn::Block = parse_quote!({
+        loop {
+            yield_!(1);
+            yield_!(2);
+        }
+    });
+    let (_, a) = run(&block);
+    assert!(a.in_place.is_empty());
+}
+
+#[test]
+fn resume_without_a_yield_back_has_no_plan() {
+    let block: syn::Block = parse_quote!({
+        yield_!(1);
+    });
+    let (_, a) = run(&block);
+    assert!(a.in_place.is_empty());
+}
+
+#[test]
+fn nested_loops_have_no_plan() {
+    // The resume slice re-enters the inner loop header from the outer
+    // body (a join), which needs the dispatch loop.
+    let block: syn::Block = parse_quote!({
+        for i in 0..n {
+            for j in 0..i {
+                yield_!(i ^ j);
+            }
+        }
+    });
+    let (_, a) = run_args(&[("n", "u64")], &block, &unit());
+    assert!(a.in_place.is_empty());
+}
+
+#[test]
+fn opaque_break_in_region_has_no_plan() {
+    let block: syn::Block = parse_quote!({
+        let mut x: u64 = 0;
+        loop {
+            yield_!(x);
+            if x > 3 {
+                break;
+            }
+            x += 1;
+        }
+    });
+    let (_, a) = run(&block);
+    assert!(a.in_place.is_empty());
+}
+
+#[test]
+fn shadowing_binding_inside_a_statement_has_no_plan() {
+    let block: syn::Block = parse_quote!({
+        let mut x: u64 = 0;
+        loop {
+            yield_!(x);
+            {
+                let x: u64 = 9;
+                f(x);
+            }
+            x += 1;
+        }
+    });
+    let (_, a) = run(&block);
+    assert!(a.in_place.is_empty());
+}
+
+#[test]
+fn macro_mentioning_a_stored_name_has_no_plan() {
+    let block: syn::Block = parse_quote!({
+        let mut x: u64 = 0;
+        loop {
+            yield_!(x);
+            dbg!(x);
+        }
+    });
+    let (_, a) = run(&block);
+    assert!(a.in_place.is_empty());
+}
+
+#[test]
+fn macro_not_mentioning_stored_names_keeps_the_plan() {
+    let block: syn::Block = parse_quote!({
+        let mut x: u64 = 0;
+        loop {
+            let r: u64 = yield_!(x);
+            dbg!(r);
+            x += r;
+        }
+    });
+    let (cfg, a) = run_args(&[], &block, &parse_quote!(u64));
+    let s = resume_ids(&cfg)[0];
+    assert_eq!(plan_field_names(&cfg, plan_for(&a, s)), ["x"]);
+}
+
+#[test]
+fn match_on_a_stored_binding_has_no_plan() {
+    // `match x` in value position usually moves `x`; the dereferencing
+    // rewrite would break non-Copy payloads, so no plan.
+    let block: syn::Block = parse_quote!({
+        let mut x: u64 = 0;
+        loop {
+            yield_!(x);
+            x = match x {
+                0 => 1,
+                _ => 0,
+            };
+        }
+    });
+    let (_, a) = run(&block);
+    assert!(a.in_place.is_empty());
+}
+
+#[test]
+fn let_of_a_bare_stored_binding_has_no_plan() {
+    let block: syn::Block = parse_quote!({
+        let mut x: u64 = 0;
+        loop {
+            yield_!(x);
+            let y: u64 = x;
+            x = y + 1;
+        }
+    });
+    let (_, a) = run(&block);
+    assert!(a.in_place.is_empty());
+}
+
+#[test]
+fn statement_mentioning_self_has_no_plan() {
+    // `self` only occurs in the early-exit rewrites (`return` / `?`),
+    // which assign `*self` and conflict with the in-place borrows.
+    let block: syn::Block = parse_quote!({
+        let mut x: u64 = 0;
+        loop {
+            yield_!(x);
+            f(self);
+        }
+    });
+    let (_, a) = run(&block);
+    assert!(a.in_place.is_empty());
+}
+
+#[test]
+fn generated_name_prefix_has_no_plan() {
+    let block: syn::Block = parse_quote!({
+        let mut x: u64 = 0;
+        loop {
+            yield_!(x);
+            __self_x();
+        }
+    });
+    let (_, a) = run(&block);
+    assert!(a.in_place.is_empty());
+}
+
+#[test]
+fn analyze_with_disabled_computes_no_plans() {
+    let block: syn::Block = parse_quote!({
+        for i in 0..n {
+            yield_!(i);
+        }
+    });
+    let cfg = lower_args(&["n"], &block);
+    let infos = [ArgInfo {
+        mutability: None,
+        ty: parse_quote!(u64),
+    }];
+    let a = analyze_with(&cfg, &infos, &unit(), false).unwrap();
+    assert!(a.in_place.is_empty());
+}
