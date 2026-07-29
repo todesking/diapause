@@ -6,4 +6,4 @@ license.workspace = true
 publish = false
 
 [dependencies]
-diapause = { path = "../diapause" }
+diapause = { path = "../diapause", default-features = false }

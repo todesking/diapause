@@ -804,6 +804,10 @@ impl Context<'_> {
                     syn::parse_quote!(::core::ops::Range<#t>)
                 })
             }
+            TySource::Boxed(inner) => {
+                let t = self.resolve_ty_source(inner)?;
+                Some(syn::parse_quote!(::diapause::__private::Box<#t>))
+            }
             TySource::IntoIter(inner) => {
                 let t = self.resolve_ty_source(inner)?;
                 Some(syn::parse_quote!(<#t as ::core::iter::IntoIterator>::IntoIter))

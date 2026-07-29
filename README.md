@@ -83,7 +83,11 @@ any code. `start()` runs the body up to the first `yield_!`; each
   serde derives compose across arbitrary nesting depth.
   `yield_all_resume!(sub, rv)` delegates to a coroutine that is already
   started (e.g. one deserialized mid-run), entering with `resume(rv)`
-  instead of `start()`.
+  instead of `start()`. The `box` modifier (`yield_all!(box sub)`)
+  stores the delegate boxed instead, enabling *recursive* delegation;
+  boxing is lazy — a delegate that completes on entry never
+  allocates — and requires the `alloc` feature (on by default, the only
+  part of the crate that can allocate).
 - **Generics, where clauses, reference arguments, and `impl Trait`
   arguments** are carried over to the generated state enum. Elided
   lifetimes are named automatically.

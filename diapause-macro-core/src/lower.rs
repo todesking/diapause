@@ -195,6 +195,10 @@ pub(crate) struct Lowerer {
     /// internal `__rv{k} = yield_!(..);` rebind form, which is not part
     /// of the user-facing syntax.
     yield_all_depth: usize,
+    /// Set while lowering a boxed delegation expansion: the name of the
+    /// synthetic `let mut __dg{k} = Box::new(__co{k});` binding that the
+    /// `Yielded` arm opens with, and the type source to record for it.
+    pending_boxed_delegate: Option<(String, TySource)>,
 }
 
 impl Lowerer {
@@ -210,6 +214,7 @@ impl Lowerer {
             for_count: 0,
             yield_all_count: 0,
             yield_all_depth: 0,
+            pending_boxed_delegate: None,
         };
         for arg in args {
             let id = BindingId(lw.bindings.len());
@@ -661,6 +666,20 @@ impl Lowerer {
             {
                 self.lower_rebind_yield(assign);
             }
+            // `let mut __dg{k} = Box::new(__co{k});` — only synthesized
+            // inside a boxed delegation expansion, likewise.
+            syn::Stmt::Local(local)
+                if self.yield_all_depth > 0
+                    && self
+                        .pending_boxed_delegate
+                        .as_ref()
+                        .is_some_and(|(name, _)| {
+                            matches!(&local.pat,
+                            syn::Pat::Ident(pi) if pi.ident == name.as_str())
+                        }) =>
+            {
+                self.lower_boxed_delegate_let(local);
+            }
             syn::Stmt::Expr(syn::Expr::Break(b), _) => self.lower_break(b),
             syn::Stmt::Expr(syn::Expr::Continue(c), _) => self.lower_continue(c),
             _ if !contains_yield_stmt(stmt) => self.push_opaque(stmt),
@@ -916,6 +935,31 @@ impl Lowerer {
     /// may be an arbitrary yield-free expression and is never stored in
     /// the state.
     ///
+    /// The `box` modifier (`yield_all!(box g)`) stores the delegate
+    /// boxed, which is what makes recursive delegation representable
+    /// (an unboxed recursive state would be infinitely sized). Boxing is
+    /// lazy: the operand first moves into an unboxed `__co{k}`, the
+    /// entry transition runs on that, and only the `Yielded` arm boxes —
+    /// so a delegate that completes on entry never allocates:
+    ///
+    /// ```text
+    /// let mut __co0 = g;
+    /// match ::diapause::Coroutine::start(&mut __co0) {
+    ///     Complete(__v0) => __v0,
+    ///     Yielded(__y0) => {
+    ///         // consumes __co0 before the first suspension; typed
+    ///         // Box<T> via TySource::Boxed (see lower_boxed_delegate_let)
+    ///         let mut __dg0 = ::diapause::__private::Box::new(__co0);
+    ///         let __rv0 = yield_!(__y0);
+    ///         loop {
+    ///             match ::diapause::Coroutine::resume(&mut *__dg0, __rv0) {
+    ///                 ...
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
     /// Only `__dg{k}` and `__rv{k}` are live at the delegation loop's
     /// header: the coroutine's type follows the operand variable (the
     /// usual known-variable move rule — hence the variable-only operand
@@ -925,14 +969,28 @@ impl Lowerer {
     /// type mismatch between the inner and outer coroutine surfaces as
     /// an ordinary type error in the generated code.
     fn lower_yield_all(&mut self, mac: &syn::Macro, ctx: TailCtx) {
+        /// An optional leading `box` modifier, then the comma-separated
+        /// argument expressions.
+        struct DelegateArgs {
+            boxed: bool,
+            args: syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>,
+        }
+        impl syn::parse::Parse for DelegateArgs {
+            fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+                Ok(DelegateArgs {
+                    boxed: input.parse::<Option<syn::Token![box]>>()?.is_some(),
+                    args: syn::punctuated::Punctuated::parse_terminated(input)?,
+                })
+            }
+        }
+
         let resume_form = is_yield_all_resume_macro(mac);
         let operand_err = if resume_form {
             ERR_YIELD_ALL_RESUME_OPERAND
         } else {
             ERR_YIELD_ALL_OPERAND
         };
-        type Args = syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>;
-        let Ok(args) = mac.parse_body_with(Args::parse_terminated) else {
+        let Ok(DelegateArgs { boxed, args }) = mac.parse_body::<DelegateArgs>() else {
             return self.err(syn::Error::new(mac.span(), operand_err));
         };
         let expected_args = if resume_form { 2 } else { 1 };
@@ -954,17 +1012,37 @@ impl Lowerer {
         let k = self.yield_all_count;
         self.yield_all_count += 1;
         let dg = syn::Ident::new(&format!("__dg{k}"), span);
+        let co = syn::Ident::new(&format!("__co{k}"), span);
         let y = syn::Ident::new(&format!("__y{k}"), span);
         let rv = syn::Ident::new(&format!("__rv{k}"), span);
         let v = syn::Ident::new(&format!("__v{k}"), span);
+
+        // A plain delegation drives `__dg{k}` throughout. A boxed one
+        // drives the unboxed `__co{k}` through the entry transition and
+        // boxes it into `__dg{k}` only in the `Yielded` arm, so the
+        // completion path never allocates.
+        let entry_target: syn::Expr = if boxed {
+            syn::parse_quote_spanned!(span => &mut #co)
+        } else {
+            syn::parse_quote_spanned!(span => &mut #dg)
+        };
+        let loop_target: syn::Expr = if boxed {
+            syn::parse_quote_spanned!(span => &mut *#dg)
+        } else {
+            syn::parse_quote_spanned!(span => &mut #dg)
+        };
+        let boxed_let: Option<syn::Stmt> = boxed.then(|| {
+            syn::parse_quote_spanned!(span =>
+                let mut #dg = ::diapause::__private::Box::new(#co);)
+        });
 
         // The entry transition is the one point where the two macros
         // differ: `yield_all!` starts the coroutine, `yield_all_resume!`
         // resumes it with the caller-supplied value.
         let entry: syn::Expr = match &entry_rv {
             Some(rv0) => syn::parse_quote_spanned!(span =>
-                ::diapause::Coroutine::resume(&mut #dg, #rv0)),
-            None => syn::parse_quote_spanned!(span => ::diapause::Coroutine::start(&mut #dg)),
+                ::diapause::Coroutine::resume(#entry_target, #rv0)),
+            None => syn::parse_quote_spanned!(span => ::diapause::Coroutine::start(#entry_target)),
         };
 
         // In `Discard` context the completion values are dropped and the
@@ -974,9 +1052,10 @@ impl Lowerer {
             syn::parse_quote_spanned!(span => match #entry {
                 ::diapause::CoroutineState::Complete(_) => {}
                 ::diapause::CoroutineState::Yielded(#y) => {
+                    #boxed_let
                     let #rv = yield_!(#y);
                     loop {
-                        match ::diapause::Coroutine::resume(&mut #dg, #rv) {
+                        match ::diapause::Coroutine::resume(#loop_target, #rv) {
                             ::diapause::CoroutineState::Complete(_) => break,
                             ::diapause::CoroutineState::Yielded(#y) => {
                                 #rv = yield_!(#y);
@@ -989,9 +1068,10 @@ impl Lowerer {
             syn::parse_quote_spanned!(span => match #entry {
                 ::diapause::CoroutineState::Complete(#v) => #v,
                 ::diapause::CoroutineState::Yielded(#y) => {
+                    #boxed_let
                     let #rv = yield_!(#y);
                     loop {
-                        match ::diapause::Coroutine::resume(&mut #dg, #rv) {
+                        match ::diapause::Coroutine::resume(#loop_target, #rv) {
                             ::diapause::CoroutineState::Complete(#v) => break #v,
                             ::diapause::CoroutineState::Yielded(#y) => {
                                 #rv = yield_!(#y);
@@ -1005,22 +1085,67 @@ impl Lowerer {
         // The synthetic bindings get their own scope so the enclosing
         // code never sees them.
         self.in_scope(|lw| {
-            // `let mut __dg{k} = <operand>;` — the coroutine moves into
-            // the state under a fresh name; its type follows the operand.
+            // `let mut __dg{k} = <operand>;` (`__co{k}` for a boxed
+            // delegation) — the coroutine moves out of the enclosing
+            // scope under a fresh name; its type follows the operand.
+            let driver = if boxed { &co } else { &dg };
+            let kind = if boxed {
+                // `__co{k}` is consumed by the boxed let before the
+                // first suspension and never becomes a state field.
+                BindingKind::Local
+            } else {
+                BindingKind::Delegate
+            };
             let ty = lw.infer_ty_source(inner);
-            let stmt: syn::Stmt = syn::parse_quote_spanned!(span => let mut #dg = #inner;);
+            let stmt: syn::Stmt = syn::parse_quote_spanned!(span => let mut #driver = #inner;);
             lw.record_stmt_uses(&stmt);
             let stmt_idx = lw.blocks[lw.current].stmts.len();
-            let id = lw.define(&dg, lw.current, BindingKind::Delegate, Some(stmt_idx));
+            let id = lw.define(driver, lw.current, kind, Some(stmt_idx));
             let b = &mut lw.bindings[id.0];
             b.mutability = Some(syn::Token![mut](span));
             b.ty = ty;
             lw.blocks[lw.current].stmts.push(stmt);
+            if boxed {
+                lw.pending_boxed_delegate = Some((
+                    dg.to_string(),
+                    TySource::Boxed(Box::new(TySource::Moved(id))),
+                ));
+            }
 
             lw.yield_all_depth += 1;
             lw.lower_match(&em, ctx);
             lw.yield_all_depth -= 1;
+            lw.pending_boxed_delegate = None;
         });
+    }
+
+    /// The `let mut __dg{k} = Box::new(__co{k});` statement a boxed
+    /// delegation's `Yielded` arm opens with (see `lower_yield_all`):
+    /// defines the delegate binding with the pre-computed `Boxed` type
+    /// source and stores the statement verbatim. Routed here (rather
+    /// than through the opaque-`let` path) so the binding is typed and
+    /// becomes a state field.
+    fn lower_boxed_delegate_let(&mut self, local: &syn::Local) {
+        let (_, ty) = self
+            .pending_boxed_delegate
+            .take()
+            .expect("BUG: checked by caller");
+        let syn::Pat::Ident(pi) = &local.pat else {
+            unreachable!("BUG: only synthesized with an ident pattern")
+        };
+        let stmt = syn::Stmt::Local(local.clone());
+        self.record_stmt_uses(&stmt);
+        let stmt_idx = self.blocks[self.current].stmts.len();
+        let id = self.define(
+            &pi.ident,
+            self.current,
+            BindingKind::Delegate,
+            Some(stmt_idx),
+        );
+        let b = &mut self.bindings[id.0];
+        b.mutability = pi.mutability;
+        b.ty = ty;
+        self.blocks[self.current].stmts.push(stmt);
     }
 
     /// `let x: T = yield_all!(g);` — the let-initializer form. The value

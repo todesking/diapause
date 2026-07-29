@@ -41,7 +41,8 @@
 //! `continue`, early `return`, and the `?` operator on `Result` and
 //! `Option`. [`yield_all!`] delegates to another coroutine, forwarding
 //! its yields and resume values ([`yield_all_resume!`] does the same
-//! for one that is already started). Because the state enum stores only
+//! for one that is already started, and the `box` modifier stores the
+//! delegate boxed, enabling recursion). Because the state enum stores only
 //! concrete types, serde derives work with their ordinary semantics and
 //! a suspended coroutine can be serialized, deserialized elsewhere, and
 //! resumed — nested delegation states included.
@@ -62,7 +63,17 @@
 //! inspectable state enum that supports `#[derive(Clone)]` snapshots
 //! and serde persistence — at the price of the syntactic rules above.
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 pub use diapause_macro::coroutine;
+
+/// Support items for the code `#[coroutine]` generates; not public API.
+#[cfg(feature = "alloc")]
+#[doc(hidden)]
+pub mod __private {
+    pub use alloc::boxed::Box;
+}
 
 /// Runs the README's code examples as doctests.
 #[cfg(doctest)]
@@ -201,6 +212,30 @@ pub trait Coroutine<R = ()> {
 /// mutable reference, and a coroutine can be partially iterated without
 /// being consumed (`for x in Iter::new(&mut c)`).
 impl<C, R> Coroutine<R> for &mut C
+where
+    C: Coroutine<R> + ?Sized,
+{
+    type Yield = C::Yield;
+    type Return = C::Return;
+
+    fn resume(&mut self, resume: R) -> CoroutineState<C::Yield, C::Return> {
+        (**self).resume(resume)
+    }
+
+    fn start(&mut self) -> CoroutineState<C::Yield, C::Return> {
+        (**self).start()
+    }
+
+    fn status(&self) -> CoroutineStatus {
+        (**self).status()
+    }
+}
+
+/// Forwarding impl so a boxed coroutine can be driven directly, e.g.
+/// one stored boxed to break a recursive type. Requires the `alloc`
+/// feature (enabled by default).
+#[cfg(feature = "alloc")]
+impl<C, R> Coroutine<R> for alloc::boxed::Box<C>
 where
     C: Coroutine<R> + ?Sized,
 {
@@ -509,6 +544,36 @@ macro_rules! yield_ {
 /// one, so `Clone` and serde derives compose: a coroutine suspended
 /// inside a delegation serializes with the nested state included.
 ///
+/// # Boxed delegation
+///
+/// `yield_all!(box sub)` stores the delegate boxed instead, which is
+/// what makes *recursive* delegation representable — by-value storage
+/// of a state inside itself would be infinitely sized. Boxing is lazy:
+/// the delegate is started unboxed and boxed only if it actually
+/// suspends, so a delegate that completes on entry never allocates.
+/// Requires the `alloc` feature (enabled by default); the contract and
+/// supported positions are otherwise identical to the unboxed form.
+///
+/// ```
+/// use diapause::{Coroutine, CoroutineState};
+///
+/// #[diapause::coroutine(yield = u32)]
+/// fn countdown(n: u32) {
+///     yield_!(n);
+///     if n > 0 {
+///         let sub: countdown::State = countdown(n - 1);
+///         yield_all!(box sub);
+///     }
+/// }
+///
+/// # fn main() {
+/// let mut c = countdown(1);
+/// assert_eq!(c.start(), CoroutineState::Yielded(1));
+/// assert_eq!(c.resume(()), CoroutineState::Yielded(0));
+/// assert_eq!(c.resume(()), CoroutineState::Complete(()));
+/// # }
+/// ```
+///
 /// Like [`yield_!`], this macro is consumed by the `#[coroutine]`
 /// transformation and never expands on its own; using it outside a
 /// `#[diapause::coroutine]` function is a compile error.
@@ -566,7 +631,10 @@ macro_rules! yield_all {
 /// supported positions are the same three: a statement
 /// (`yield_all_resume!(sub, rv);`, completion value discarded), a whole
 /// `let` initializer with a type annotation, and the function's
-/// trailing expression.
+/// trailing expression. The `box` modifier
+/// (`yield_all_resume!(box sub, rv)`) stores the delegate boxed with
+/// the same lazy-boxing behavior as [`yield_all!`]'s (see *Boxed
+/// delegation* there; requires the `alloc` feature).
 ///
 /// Like [`yield_!`], this macro is consumed by the `#[coroutine]`
 /// transformation and never expands on its own; using it outside a

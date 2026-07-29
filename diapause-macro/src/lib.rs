@@ -73,7 +73,12 @@ use proc_macro::TokenStream;
 /// function's trailing expression (see the constraint below).
 /// `yield_all_resume!(sub, rv)` is the same delegation for a coroutine
 /// that is already started: it enters with `resume(rv)` instead of
-/// `start()` and forwards from there.
+/// `start()` and forwards from there. Both macros accept a `box`
+/// modifier (`yield_all!(box sub)`) that stores the delegate boxed —
+/// required for recursive delegation, where by-value storage would be
+/// infinitely sized. Boxing is lazy (a delegate that completes on entry
+/// never allocates) and needs diapause's `alloc` feature (a default
+/// feature).
 ///
 /// # Constraints
 ///

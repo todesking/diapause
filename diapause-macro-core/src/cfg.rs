@@ -67,6 +67,12 @@ pub enum TySource {
     Known(syn::Type),
     /// `let y = x;`: the type follows the moved binding.
     Moved(BindingId),
+    /// The synthetic `__dg{k}` binding of a boxed delegation
+    /// (`yield_all!(box sub)`): `Box<T>` where the inner source is the
+    /// type of the unboxed coroutine moved into `Box::new`. Spelled as
+    /// `::diapause::__private::Box`, so it resolves in `no_std` crates;
+    /// the re-export requires diapause's `alloc` feature.
+    Boxed(Box<TySource>),
     /// `a..b` / `a..=b`: `Range<T>` / `RangeInclusive<T>` where `T` is
     /// the first endpoint whose type is known.
     Range {

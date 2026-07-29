@@ -10,6 +10,13 @@ readme = "../README.md"
 keywords = ["coroutine", "generator", "yield", "state-machine", "no-std"]
 categories = ["rust-patterns", "no-std", "no-std::no-alloc"]
 
+[features]
+default = ["alloc"]
+# Enables `yield_all!(box sub)` / `yield_all_resume!(box sub, rv)` boxed
+# delegation and the `Coroutine` forwarding impl for `Box<C>`. Disable
+# for no-alloc targets; nothing else in the crate allocates.
+alloc = []
+
 [dependencies]
 diapause-macro = { path = "../diapause-macro", version = "0.1.0" }
 

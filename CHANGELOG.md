@@ -17,6 +17,13 @@ versioned and released together; this changelog covers all three.
   forwards yields and resume values exactly like `yield_all!`. The
   resume value may be any yield-free expression; it is consumed before
   the first suspension and never stored in the state.
+- Boxed delegation: a `box` modifier on both delegation macros
+  (`yield_all!(box sub)`, `yield_all_resume!(box sub, rv)`) stores the
+  delegate boxed in the state, making recursive delegation
+  representable. Boxing is lazy — the delegate is started unboxed and
+  boxed only if it actually suspends, so completing on entry never
+  allocates. Gated behind a new `alloc` feature (enabled by default),
+  which also adds a `Coroutine` forwarding impl for `Box<C>`.
 
 ## [0.1.0] - 2026-07-25
 
