@@ -1,0 +1,5 @@
+error: yield_! in the resume value of yield_all_resume! is not supported; bind it first: `let rv = yield_!(..);` and pass `rv`
+ --> tests/compile_fail/yield_all_resume_yield_in_value.rs:9:39
+  |
+9 |     let v: u32 = yield_all_resume!(g, yield_!(1));
+  |                                       ^^^^^^^^^^

@@ -10,6 +10,14 @@ versioned and released together; this changelog covers all three.
 
 ## [Unreleased]
 
+### Added
+
+- `yield_all_resume!(sub, rv)` delegation to an already-started
+  coroutine: enters via `resume(rv)` instead of `start()` and then
+  forwards yields and resume values exactly like `yield_all!`. The
+  resume value may be any yield-free expression; it is consumed before
+  the first suspension and never stored in the state.
+
 ## [0.1.0] - 2026-07-25
 
 Initial release.

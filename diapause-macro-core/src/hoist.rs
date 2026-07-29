@@ -30,7 +30,7 @@ use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit_mut::VisitMut;
 
-use crate::lower::{is_yield_all_macro, is_yield_macro, skip_nested_scopes};
+use crate::lower::{is_delegate_macro, is_yield_macro, skip_nested_scopes};
 
 /// Rewrites hoistable expression-position yields in `body` (see the
 /// module docs). Runs before `rewrite_early_exits`, so `?` operators
@@ -84,12 +84,12 @@ impl Hoister {
             syn::Stmt::Local(local) => {
                 if let Some(init) = &mut local.init {
                     // `let x = yield_!(..);` / `let x = yield_all!(..);`
-                    // are the natively supported forms; `let ... else`
-                    // is not, so its initializer is hoisted like any
-                    // other expression.
+                    // (and `yield_all_resume!`) are the natively
+                    // supported forms; `let ... else` is not, so its
+                    // initializer is hoisted like any other expression.
                     let native = init.diverge.is_none()
                         && matches!(&*init.expr, syn::Expr::Macro(m)
-                            if is_yield_macro(&m.mac) || is_yield_all_macro(&m.mac));
+                            if is_yield_macro(&m.mac) || is_delegate_macro(&m.mac));
                     if !native {
                         self.head(&mut init.expr);
                     }

@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-use super::{ERR_FOREIGN_MACRO, ERR_YIELD_ALL_POSITION, ErrorSink};
+use super::{ERR_FOREIGN_MACRO, ERR_YIELD_ALL_POSITION, ERR_YIELD_ALL_RESUME_POSITION, ErrorSink};
 
 pub fn is_yield_macro(mac: &syn::Macro) -> bool {
     mac.path
@@ -21,6 +21,19 @@ pub fn is_yield_all_macro(mac: &syn::Macro) -> bool {
         .segments
         .last()
         .is_some_and(|seg| seg.ident == "yield_all")
+}
+
+pub fn is_yield_all_resume_macro(mac: &syn::Macro) -> bool {
+    mac.path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "yield_all_resume")
+}
+
+/// `yield_all!` or `yield_all_resume!` — the two delegation macros,
+/// which share their supported positions and lowering.
+pub fn is_delegate_macro(mac: &syn::Macro) -> bool {
+    is_yield_all_macro(mac) || is_yield_all_resume_macro(mac)
 }
 
 /// The internal marker macro `rewrite_opaque_jumps` leaves where an
@@ -65,12 +78,15 @@ pub(crate) fn collect_markers(tokens: proc_macro2::TokenStream, out: &mut Vec<us
     }
 }
 
-/// Textually scans a foreign macro's tokens for `yield_ !` / `yield_all !`.
+/// Textually scans a foreign macro's tokens for `yield_ !` /
+/// `yield_all !` / `yield_all_resume !`.
 pub(super) fn tokens_contain_yield(tokens: proc_macro2::TokenStream) -> bool {
     let mut iter = tokens.into_iter().peekable();
     while let Some(tt) = iter.next() {
         match tt {
-            proc_macro2::TokenTree::Ident(id) if id == "yield_" || id == "yield_all" => {
+            proc_macro2::TokenTree::Ident(id)
+                if id == "yield_" || id == "yield_all" || id == "yield_all_resume" =>
+            {
                 if matches!(
                     iter.peek(),
                     Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == '!'
@@ -106,11 +122,11 @@ macro_rules! skip_nested_scopes {
 }
 pub(crate) use skip_nested_scopes;
 
-/// Finds genuine `yield_!` / `yield_all!` invocations (the latter
-/// desugars into yields). Closures, async blocks, and nested items are
-/// separate scopes and pass through. Foreign macros whose tokens mention
-/// yield_! do not count as containing a yield; they are rejected
-/// separately.
+/// Finds genuine `yield_!` / `yield_all!` / `yield_all_resume!`
+/// invocations (the latter two desugar into yields). Closures, async
+/// blocks, and nested items are separate scopes and pass through.
+/// Foreign macros whose tokens mention yield_! do not count as
+/// containing a yield; they are rejected separately.
 #[derive(Default)]
 struct ContainsYield {
     found: bool,
@@ -118,7 +134,7 @@ struct ContainsYield {
 
 impl<'ast> Visit<'ast> for ContainsYield {
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        if is_yield_macro(mac) || is_yield_all_macro(mac) {
+        if is_yield_macro(mac) || is_delegate_macro(mac) {
             self.found = true;
         }
     }
@@ -156,9 +172,12 @@ impl<'ast> Visit<'ast> for YieldBan<'_> {
         if is_yield_macro(mac) {
             self.record(syn::Error::new_spanned(mac, self.msg));
         } else if is_yield_all_macro(mac) {
-            // yield_all! is never hoisted, so the position-specific
-            // hoisting advice does not apply; name its own rules.
+            // Delegation macros are never hoisted, so the
+            // position-specific hoisting advice does not apply; name
+            // their own rules.
             self.record(syn::Error::new_spanned(mac, ERR_YIELD_ALL_POSITION));
+        } else if is_yield_all_resume_macro(mac) {
+            self.record(syn::Error::new_spanned(mac, ERR_YIELD_ALL_RESUME_POSITION));
         } else if tokens_contain_yield(mac.tokens.clone()) {
             self.record(syn::Error::new(mac.span(), ERR_FOREIGN_MACRO));
         }

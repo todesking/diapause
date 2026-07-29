@@ -1,0 +1,5 @@
+error: yield_all_resume! takes a variable holding the started coroutine to delegate to and the resume value to enter it with: `yield_all_resume!(sub, rv)`; bind the coroutine first: `let sub: SubTy = ..;`
+ --> tests/compile_fail/yield_all_resume_missing_value.rs:9:18
+  |
+9 |     let v: u32 = yield_all_resume!(g);
+  |                  ^^^^^^^^^^^^^^^^

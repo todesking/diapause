@@ -81,6 +81,9 @@ any code. `start()` runs the body up to the first `yield_!`; each
   its completion value (Python's `yield from`). The inner state enum is
   stored by value inside the outer one — no boxing — so `Clone` and
   serde derives compose across arbitrary nesting depth.
+  `yield_all_resume!(sub, rv)` delegates to a coroutine that is already
+  started (e.g. one deserialized mid-run), entering with `resume(rv)`
+  instead of `start()`.
 - **Generics, where clauses, reference arguments, and `impl Trait`
   arguments** are carried over to the generated state enum. Elided
   lifetimes are named automatically.
@@ -293,8 +296,10 @@ produces a dedicated compile error with the workaround in the message.
   stores the inner coroutine, so its type must be spellable). Its yield
   and resume types must match the outer coroutine's; mismatches surface
   as ordinary type errors. The inner coroutine must not have been
-  started yet (`start()` panics otherwise). Supported positions are the
-  same as for value-producing control flow: a statement
+  started yet (`start()` panics otherwise; use
+  `yield_all_resume!(sub, rv)` for a started one — its resume value may
+  be any expression not containing `yield_!`). Supported positions are
+  the same as for value-producing control flow: a statement
   (`yield_all!(sub);`, completion value discarded), a whole `let`
   initializer with a type annotation, or the function's trailing
   expression.

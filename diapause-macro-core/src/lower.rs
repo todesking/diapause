@@ -24,7 +24,10 @@ pub(crate) use visitors::{
     PatBindingCollector, UseCollector, collect_markers, collect_token_idents, skip_nested_scopes,
 };
 use visitors::{YieldBan, contains_yield_expr, contains_yield_stmt};
-pub use visitors::{is_jump_marker, is_yield_all_macro, is_yield_macro};
+pub use visitors::{
+    is_delegate_macro, is_jump_marker, is_yield_all_macro, is_yield_all_resume_macro,
+    is_yield_macro,
+};
 
 /// The syntactic form of a `yield_!` resume binding, before it has been
 /// assigned a `BindingId`.
@@ -443,6 +446,15 @@ const ERR_YIELD_ALL_OPERAND: &str = "yield_all! takes a single variable holding 
 const ERR_YIELD_ALL_POSITION: &str = "yield_all! is only supported in statement \
      position (`yield_all!(sub);`), as a whole `let` initializer, or as the function's \
      trailing expression";
+const ERR_YIELD_ALL_RESUME_OPERAND: &str = "yield_all_resume! takes a variable holding \
+     the started coroutine to delegate to and the resume value to enter it with: \
+     `yield_all_resume!(sub, rv)`; bind the coroutine first: `let sub: SubTy = ..;`";
+const ERR_YIELD_ALL_RESUME_POSITION: &str = "yield_all_resume! is only supported in \
+     statement position (`yield_all_resume!(sub, rv);`), as a whole `let` initializer, \
+     or as the function's trailing expression";
+const ERR_YIELD_ALL_RESUME_VALUE: &str = "yield_! in the resume value of \
+     yield_all_resume! is not supported; bind it first: `let rv = yield_!(..);` and \
+     pass `rv`";
 
 fn for_local_borrow_err(name: &syn::Ident) -> String {
     format!(
@@ -473,10 +485,10 @@ impl Lowerer {
                 // parses as `Stmt::Macro` without a semicolon; paren and
                 // bracket invocations parse as a trailing expression
                 // (`Stmt::Expr(Expr::Macro, None)`) and take the arm
-                // above. `yield_all!` is the one macro that produces a
-                // value here.
+                // above. The delegation macros are the only macros that
+                // produce a value here.
                 syn::Stmt::Macro(sm)
-                    if i + 1 == n && sm.semi_token.is_none() && is_yield_all_macro(&sm.mac) =>
+                    if i + 1 == n && sm.semi_token.is_none() && is_delegate_macro(&sm.mac) =>
                 {
                     has_value_tail = true;
                     self.lower_yield_all(&sm.mac, ctx);
@@ -542,7 +554,7 @@ impl Lowerer {
             syn::Expr::Match(em) => self.lower_match(em, ctx),
             syn::Expr::Loop(el) => self.lower_loop(el, ctx),
             syn::Expr::Block(eb) => self.lower_block_stmt(eb, ctx),
-            syn::Expr::Macro(em) if is_yield_all_macro(&em.mac) => {
+            syn::Expr::Macro(em) if is_delegate_macro(&em.mac) => {
                 self.lower_yield_all(&em.mac, ctx);
             }
             // `while` and `for` loops always evaluate to `()`: lower as
@@ -606,9 +618,10 @@ impl Lowerer {
                 }
                 self.lower_yield(&sm.mac, ResumeTarget::Discard);
             }
-            // `yield_all!(g);` in statement position (a trailing
-            // `yield_all!(g)` is routed by `lower_stmt_list` instead).
-            syn::Stmt::Macro(sm) if is_yield_all_macro(&sm.mac) => {
+            // `yield_all!(g);` / `yield_all_resume!(g, rv);` in
+            // statement position (a trailing invocation is routed by
+            // `lower_stmt_list` instead).
+            syn::Stmt::Macro(sm) if is_delegate_macro(&sm.mac) => {
                 self.lower_yield_all(&sm.mac, TailCtx::Discard);
             }
             // The same, reconstructed as an expression statement (arm
@@ -619,7 +632,7 @@ impl Lowerer {
                 }
                 self.lower_yield(&em.mac, ResumeTarget::Discard);
             }
-            syn::Stmt::Expr(syn::Expr::Macro(em), _) if is_yield_all_macro(&em.mac) => {
+            syn::Stmt::Expr(syn::Expr::Macro(em), _) if is_delegate_macro(&em.mac) => {
                 self.lower_yield_all(&em.mac, TailCtx::Discard);
             }
             // `let r = yield_!(expr);`
@@ -631,11 +644,11 @@ impl Lowerer {
             {
                 self.lower_let_yield(local);
             }
-            // `let x: T = yield_all!(g);`
+            // `let x: T = yield_all!(g);` (or `yield_all_resume!`)
             syn::Stmt::Local(local)
                 if matches!(
                     local.init.as_ref().map(|i| &*i.expr),
-                    Some(syn::Expr::Macro(m)) if is_yield_all_macro(&m.mac)
+                    Some(syn::Expr::Macro(m)) if is_delegate_macro(&m.mac)
                 ) =>
             {
                 self.lower_let_yield_all(local);
@@ -872,11 +885,11 @@ impl Lowerer {
         self.current = next;
     }
 
-    /// `yield_all!(g)` — delegates to the coroutine held by the variable
-    /// `g`: each inner yield is forwarded to the caller, each resume
-    /// value is forwarded back in, and the inner completion value is the
-    /// expansion's value. Desugared into source that the ordinary
-    /// machinery lowers:
+    /// `yield_all!(g)` / `yield_all_resume!(g, rv)` — delegates to the
+    /// coroutine held by the variable `g`: each inner yield is forwarded
+    /// to the caller, each resume value is forwarded back in, and the
+    /// inner completion value is the expansion's value. Desugared into
+    /// source that the ordinary machinery lowers:
     ///
     /// ```text
     /// let mut __dg0 = g;
@@ -896,6 +909,13 @@ impl Lowerer {
     /// }
     /// ```
     ///
+    /// `yield_all_resume!` differs only in the entry transition:
+    /// `resume(&mut __dg0, rv)` instead of `start(&mut __dg0)`, entering
+    /// a coroutine that is already suspended at a yield. Its resume
+    /// value is consumed by that first call before any suspension, so it
+    /// may be an arbitrary yield-free expression and is never stored in
+    /// the state.
+    ///
     /// Only `__dg{k}` and `__rv{k}` are live at the delegation loop's
     /// header: the coroutine's type follows the operand variable (the
     /// usual known-variable move rule — hence the variable-only operand
@@ -905,18 +925,30 @@ impl Lowerer {
     /// type mismatch between the inner and outer coroutine surfaces as
     /// an ordinary type error in the generated code.
     fn lower_yield_all(&mut self, mac: &syn::Macro, ctx: TailCtx) {
-        let operand: Option<syn::Expr> = if mac.tokens.is_empty() {
-            None
+        let resume_form = is_yield_all_resume_macro(mac);
+        let operand_err = if resume_form {
+            ERR_YIELD_ALL_RESUME_OPERAND
         } else {
-            mac.parse_body().ok()
+            ERR_YIELD_ALL_OPERAND
         };
-        let Some(operand) = operand else {
-            return self.err(syn::Error::new(mac.span(), ERR_YIELD_ALL_OPERAND));
+        type Args = syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>;
+        let Ok(args) = mac.parse_body_with(Args::parse_terminated) else {
+            return self.err(syn::Error::new(mac.span(), operand_err));
         };
-        let inner = strip_parens(&operand);
+        let expected_args = if resume_form { 2 } else { 1 };
+        if args.len() != expected_args {
+            return self.err(syn::Error::new(mac.span(), operand_err));
+        }
+        let inner = strip_parens(&args[0]);
         if !matches!(inner, syn::Expr::Path(p) if p.qself.is_none() && p.path.get_ident().is_some())
         {
-            return self.err(syn::Error::new_spanned(inner, ERR_YIELD_ALL_OPERAND));
+            return self.err(syn::Error::new_spanned(inner, operand_err));
+        }
+        let entry_rv = resume_form.then(|| args[1].clone());
+        if let Some(rv0) = &entry_rv
+            && contains_yield_expr(rv0)
+        {
+            return self.err(syn::Error::new_spanned(rv0, ERR_YIELD_ALL_RESUME_VALUE));
         }
         let span = inner.span();
         let k = self.yield_all_count;
@@ -926,11 +958,20 @@ impl Lowerer {
         let rv = syn::Ident::new(&format!("__rv{k}"), span);
         let v = syn::Ident::new(&format!("__v{k}"), span);
 
+        // The entry transition is the one point where the two macros
+        // differ: `yield_all!` starts the coroutine, `yield_all_resume!`
+        // resumes it with the caller-supplied value.
+        let entry: syn::Expr = match &entry_rv {
+            Some(rv0) => syn::parse_quote_spanned!(span =>
+                ::diapause::Coroutine::resume(&mut #dg, #rv0)),
+            None => syn::parse_quote_spanned!(span => ::diapause::Coroutine::start(&mut #dg)),
+        };
+
         // In `Discard` context the completion values are dropped and the
         // loop breaks without a value (a valued `break` may not target a
         // statement-position loop).
         let em: syn::ExprMatch = if matches!(ctx, TailCtx::Discard) {
-            syn::parse_quote_spanned!(span => match ::diapause::Coroutine::start(&mut #dg) {
+            syn::parse_quote_spanned!(span => match #entry {
                 ::diapause::CoroutineState::Complete(_) => {}
                 ::diapause::CoroutineState::Yielded(#y) => {
                     let #rv = yield_!(#y);
@@ -945,7 +986,7 @@ impl Lowerer {
                 }
             })
         } else {
-            syn::parse_quote_spanned!(span => match ::diapause::Coroutine::start(&mut #dg) {
+            syn::parse_quote_spanned!(span => match #entry {
                 ::diapause::CoroutineState::Complete(#v) => #v,
                 ::diapause::CoroutineState::Yielded(#y) => {
                     let #rv = yield_!(#y);
@@ -1284,7 +1325,7 @@ impl Lowerer {
             syn::Expr::Block(eb) => self.lower_block_stmt(eb, TailCtx::Discard),
             // Reached only parenthesized: a bare `yield_all!(..);`
             // statement is routed by `lower_stmt` before it gets here.
-            syn::Expr::Macro(em) if is_yield_all_macro(&em.mac) => {
+            syn::Expr::Macro(em) if is_delegate_macro(&em.mac) => {
                 self.lower_yield_all(&em.mac, TailCtx::Discard);
             }
             syn::Expr::Unsafe(eu) => {

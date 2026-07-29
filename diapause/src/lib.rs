@@ -40,7 +40,8 @@
 //! `while let` / `for` at any nesting depth, mixed with `break`,
 //! `continue`, early `return`, and the `?` operator on `Result` and
 //! `Option`. [`yield_all!`] delegates to another coroutine, forwarding
-//! its yields and resume values. Because the state enum stores only
+//! its yields and resume values ([`yield_all_resume!`] does the same
+//! for one that is already started). Because the state enum stores only
 //! concrete types, serde derives work with their ordinary semantics and
 //! a suspended coroutine can be serialized, deserialized elsewhere, and
 //! resumed — nested delegation states included.
@@ -493,7 +494,8 @@ macro_rules! yield_ {
 /// resume value is forwarded back into it, and the whole expression
 /// evaluates to its completion value. The inner coroutine's yield and
 /// resume types must match the outer ones, and it must not have been
-/// started yet (`start` panics otherwise).
+/// started yet (`start` panics otherwise) — delegate to an
+/// already-started coroutine with [`yield_all_resume!`].
 ///
 /// The operand must be a variable whose type is syntactically known
 /// (bind the coroutine with a type annotation first); passing an
@@ -515,6 +517,65 @@ macro_rules! yield_all {
     ($($tt:tt)*) => {
         ::core::compile_error!(
             "yield_all! may only be used inside a #[diapause::coroutine] function"
+        )
+    };
+}
+
+/// Delegates to an already-started coroutine inside a
+/// `#[diapause::coroutine]` function.
+///
+/// `yield_all_resume!(sub, rv)` resumes the suspended coroutine held by
+/// the variable `sub` with the resume value `rv`, then runs it to
+/// completion exactly like [`yield_all!`]: every value it yields is
+/// yielded to the caller, every resume value is forwarded back into it,
+/// and the whole expression evaluates to its completion value. Where
+/// `yield_all!` enters via [`Coroutine::start`] and requires a coroutine
+/// that has not been started, `yield_all_resume!` enters via
+/// [`Coroutine::resume`] and requires one that is suspended at a
+/// `yield_!` (`resume` panics otherwise).
+///
+/// ```
+/// use diapause::{Coroutine, CoroutineState};
+///
+/// #[diapause::coroutine(yield = u32, resume = u32)]
+/// fn running_total(start: u32) -> u32 {
+///     let a = yield_!(start);
+///     let b = yield_!(start + a);
+///     start + a + b
+/// }
+///
+/// #[diapause::coroutine(yield = u32, resume = u32)]
+/// fn outer(sub: running_total::State, rv: u32) -> u32 {
+///     yield_all_resume!(sub, rv)
+/// }
+///
+/// # fn main() {
+/// let mut sub = running_total(100);
+/// // The first yield is consumed here, before delegation begins.
+/// assert_eq!(sub.start(), CoroutineState::Yielded(100));
+/// let mut c = outer(sub, 1);
+/// assert_eq!(c.start(), CoroutineState::Yielded(101));
+/// assert_eq!(c.resume(2), CoroutineState::Complete(103));
+/// # }
+/// ```
+///
+/// The first operand follows [`yield_all!`]'s rule: a variable whose
+/// type is syntactically known. The resume value may be any expression
+/// not containing `yield_!`; it is consumed by the first `resume` call
+/// before any suspension and is never stored in the state. The
+/// supported positions are the same three: a statement
+/// (`yield_all_resume!(sub, rv);`, completion value discarded), a whole
+/// `let` initializer with a type annotation, and the function's
+/// trailing expression.
+///
+/// Like [`yield_!`], this macro is consumed by the `#[coroutine]`
+/// transformation and never expands on its own; using it outside a
+/// `#[diapause::coroutine]` function is a compile error.
+#[macro_export]
+macro_rules! yield_all_resume {
+    ($($tt:tt)*) => {
+        ::core::compile_error!(
+            "yield_all_resume! may only be used inside a #[diapause::coroutine] function"
         )
     };
 }

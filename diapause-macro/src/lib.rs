@@ -71,6 +71,9 @@ use proc_macro::TokenStream;
 /// `Clone` and serde derives compose across the nesting. Supported in
 /// statement position, as a whole `let` initializer, and as the
 /// function's trailing expression (see the constraint below).
+/// `yield_all_resume!(sub, rv)` is the same delegation for a coroutine
+/// that is already started: it enters with `resume(rv)` instead of
+/// `start()` and forwards from there.
 ///
 /// # Constraints
 ///
@@ -101,7 +104,9 @@ use proc_macro::TokenStream;
 ///   (`let sub: Ty = make_sub(..);`). Its yield and resume types must
 ///   match the outer coroutine's (mismatches are ordinary type errors)
 ///   and it must not have been started yet (`start()` panics
-///   otherwise).
+///   otherwise; delegate to a started coroutine with
+///   `yield_all_resume!(sub, rv)`, whose resume value may be any
+///   expression not containing `yield_!`).
 /// - **`break` with a value** may target a yield-containing loop only
 ///   when the loop is a `let` initializer or the function's trailing
 ///   expression.
