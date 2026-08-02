@@ -47,6 +47,12 @@ versioned and released together; this changelog covers all three.
   of loop-state variables that plain Rust accepts. A `yield_!` in a
   `return` value with a pure prefix (`return yield_!(x);`) now hoists
   like other expression positions.
+- A deliberately diverging completion expression — `unreachable!()` as
+  the tail after a yield that is never resumed, a call to a `-> !`
+  helper, the same inside a `return` — no longer trips
+  `clippy::diverging_sub_expression` on the user's own span, which broke
+  `-D warnings` builds. The lint is suppressed only on the generated
+  completion binding.
 - A body whose every reachable path ends in an explicit `return` (with
   the diverging paths containing yields) no longer produces the
   documented `E0308: expected <ret>, found ()` on the unreachable
