@@ -25,6 +25,20 @@ versioned and released together; this changelog covers all three.
   allocates. Gated behind a new `alloc` feature (enabled by default),
   which also adds a `Coroutine` forwarding impl for `Box<C>`.
 
+### Fixed
+
+- Statement-position `return` now ends its basic block in the control
+  flow graph instead of leaving a false fall-through edge behind.
+  Previously, code like `if cond { yield_!(..); return v; }` followed by
+  more statements kept variables that are dead on the returning path
+  alive across the false edge, storing them in state variants and
+  triggering unused-variable warnings in the generated resume arms
+  (breaking `-D warnings` builds); the stale loop backedge after a
+  `return` out of a yielding loop could likewise make rustc reject moves
+  of loop-state variables that plain Rust accepts. A `yield_!` in a
+  `return` value with a pure prefix (`return yield_!(x);`) now hoists
+  like other expression positions.
+
 ## [0.1.0] - 2026-07-25
 
 Initial release.
