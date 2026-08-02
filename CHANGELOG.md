@@ -57,6 +57,15 @@ versioned and released together; this changelog covers all three.
   the diverging paths containing yields) no longer produces the
   documented `E0308: expected <ret>, found ()` on the unreachable
   implicit tail; the `unreachable!()` workaround is no longer needed.
+- A `?` inside the value of an expression-position `return` — typically
+  an unbraced match-arm body such as
+  `CoroutineState::Complete(result) => return Ok(result?)` in a manual
+  driver loop — no longer produces an E0308
+  (`expected <ret>, found CoroutineState<..>`) in the generated code.
+  The `?`'s synthesized exit was re-parsed while the enclosing return
+  was rewritten and then wrapped in a second completion; such returns
+  are now handed to lowering like statement-position ones and terminate
+  their block (no false fall-through edge) instead.
 
 ## [0.1.0] - 2026-07-25
 
