@@ -268,6 +268,17 @@ impl Hoister {
                 self.walk(&mut t.expr);
                 self.pure = false;
             }
+            // The value of a `return` is evaluated before control
+            // transfers, so a yield inside it hoists like any other
+            // prefix position (`return yield_!(x);` becomes
+            // `let __tmp0 = yield_!(x); return __tmp0;`, which lowering
+            // then terminates the block with).
+            syn::Expr::Return(r) => {
+                if let Some(v) = &mut r.expr {
+                    self.walk(v);
+                }
+                self.pure = false;
+            }
             syn::Expr::Reference(r) => {
                 self.walk(&mut r.expr);
                 self.pure = false;
@@ -694,6 +705,43 @@ mod tests {
                 g(__tmp0, __tmp1);
             }),
         );
+    }
+
+    #[test]
+    fn return_value() {
+        assert_hoists(
+            parse_quote!({
+                if c {
+                    return yield_!(1);
+                }
+            }),
+            parse_quote!({
+                if c {
+                    let __tmp0 = yield_!(1);
+                    return __tmp0;
+                }
+            }),
+        );
+    }
+
+    #[test]
+    fn return_value_with_a_yield_prefix() {
+        assert_hoists(
+            parse_quote!({
+                return f(yield_!(1));
+            }),
+            parse_quote!({
+                let __tmp0 = yield_!(1);
+                return f(__tmp0);
+            }),
+        );
+    }
+
+    #[test]
+    fn impure_prefix_in_a_return_value_blocks_hoisting() {
+        assert_unchanged(parse_quote!({
+            return g() + yield_!(1);
+        }));
     }
 
     #[test]
