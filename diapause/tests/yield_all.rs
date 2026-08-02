@@ -31,6 +31,25 @@ fn delegation_forwards_yields_and_resume_values() {
     assert_eq!(c.resume(0), CoroutineState::Complete(16)); // sub + n
 }
 
+/// The completion binding needs no annotation: its type is derived from
+/// the operand as `<inner_sum::State as Coroutine<u32>>::Return`.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn unannotated_completion(n: u32) -> u32 {
+    let g: inner_sum::State = inner_sum(n);
+    let sub = yield_all!(g);
+    yield_!(sub);
+    sub + n
+}
+
+#[test]
+fn unannotated_completion_binding_follows_the_delegate() {
+    let mut c = unannotated_completion(10);
+    assert_eq!(c.start(), CoroutineState::Yielded(10));
+    assert_eq!(c.resume(2), CoroutineState::Yielded(12));
+    assert_eq!(c.resume(3), CoroutineState::Yielded(15)); // inner completes with 10+2+3
+    assert_eq!(c.resume(0), CoroutineState::Complete(25)); // sub + n
+}
+
 #[diapause::coroutine(yield = u32)]
 #[derive(Clone)]
 fn count_to(n: u32) {

@@ -93,6 +93,11 @@ pub enum TySource {
     /// A `for` loop's variable: `<I as Iterator>::Item` where `I` is
     /// the type of the loop's `__iter{k}` binding.
     IterItem(BindingId),
+    /// The completion value of a delegation stored without an
+    /// annotation (`let r = yield_all!(sub);`):
+    /// `<C as Coroutine<R>>::Return` where the inner source is the
+    /// delegate coroutine's type and `R` is the outer resume type.
+    DelegateReturn(Box<TySource>),
 }
 
 /// Classification of a binding's initializer as a borrow.

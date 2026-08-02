@@ -493,8 +493,13 @@ impl Context<'_> {
                              an explicit type annotation: \
                              `let items: Type = ...; for x in items { ... }`"
                                 .to_string()
-                        } else if binding.kind == BindingKind::Delegate {
-                            // The span points at the yield_all! operand.
+                        } else if binding.kind == BindingKind::Delegate
+                            || matches!(binding.ty, TySource::DelegateReturn(_))
+                        {
+                            // The span points at the yield_all! operand
+                            // (or, for a completion value whose
+                            // `DelegateReturn` type follows it, at the
+                            // binding fed by the delegation).
                             "cannot determine the type of the coroutine delegated to by \
                              yield_all!, which is stored in the state while it runs; bind \
                              it to a variable with an explicit type annotation: \
@@ -824,6 +829,11 @@ impl Context<'_> {
             TySource::IterItem(iter) => {
                 let t = self.resolve_binding_ty(*iter)?;
                 Some(syn::parse_quote!(<#t as ::core::iter::Iterator>::Item))
+            }
+            TySource::DelegateReturn(inner) => {
+                let t = self.resolve_ty_source(inner)?;
+                let r = self.resume_ty;
+                Some(syn::parse_quote!(<#t as ::diapause::Coroutine<#r>>::Return))
             }
         }
     }

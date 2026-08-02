@@ -1182,6 +1182,15 @@ impl Lowerer {
                 BindingKind::Delegate
             };
             let ty = lw.infer_ty_source(inner);
+            // An unannotated destination binding gets the delegation's
+            // completion type, `<C as Coroutine<R>>::Return` (an
+            // explicit annotation wins). This is what lets the value
+            // cross the join after the delegation loop without one.
+            if let TailCtx::Store(dest) = ctx
+                && matches!(lw.bindings[dest.0].ty, TySource::Unknown)
+            {
+                lw.bindings[dest.0].ty = TySource::DelegateReturn(Box::new(ty.clone()));
+            }
             let stmt: syn::Stmt = syn::parse_quote_spanned!(span => let mut #driver = #inner;);
             lw.record_stmt_uses(&stmt);
             let stmt_idx = lw.blocks[lw.current].stmts.len();
@@ -1235,7 +1244,9 @@ impl Lowerer {
 
     /// `let x: T = yield_all!(g);` — the let-initializer form. The value
     /// crosses the join after the delegation loop into a state variant,
-    /// so the annotation is required by the usual value-`let` rule.
+    /// so it needs a known type: the annotation when present, otherwise
+    /// the `DelegateReturn` source derived from the operand (see
+    /// `lower_yield_all`).
     fn lower_let_yield_all(&mut self, local: &syn::Local) {
         let init = local.init.as_ref().expect("BUG: checked by caller");
         if init.diverge.is_some() {

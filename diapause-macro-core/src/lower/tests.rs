@@ -2065,6 +2065,29 @@ fn yield_all_synthetic_names_are_numbered_per_expansion() {
 }
 
 #[test]
+fn unannotated_delegation_destination_follows_the_operand() {
+    let block: syn::Block = parse_quote!({
+        let g: G = mk();
+        let r = yield_all!(g);
+        f(r);
+    });
+    let cfg = lower_ok(&block);
+    let r = binding(&cfg, "r");
+    assert!(matches!(&cfg.bindings[r.0].ty,
+        TySource::DelegateReturn(inner)
+            if matches!(**inner, TySource::Moved(id) if id == binding(&cfg, "g"))));
+    // An explicit annotation wins over the derived completion type.
+    let block: syn::Block = parse_quote!({
+        let g: G = mk();
+        let r: u32 = yield_all!(g);
+        f(r);
+    });
+    let cfg = lower_ok(&block);
+    let r = binding(&cfg, "r");
+    assert!(matches!(&cfg.bindings[r.0].ty, TySource::Known(_)));
+}
+
+#[test]
 fn yield_all_direct_expression_is_rejected() {
     let block: syn::Block = parse_quote!({
         yield_all!(mk());
