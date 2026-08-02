@@ -70,7 +70,8 @@ use proc_macro::TokenStream;
 /// value. Its state enum is stored by value inside the outer one, so
 /// `Clone` and serde derives compose across the nesting. Supported in
 /// statement position, as a whole `let` initializer, and as the
-/// function's trailing expression (see the constraint below).
+/// function's trailing expression, each optionally followed by `?`
+/// (`let v: T = yield_all!(sub)?;` — see the constraint below).
 /// `yield_all_resume!(sub, rv)` is the same delegation for a coroutine
 /// that is already started: it enters with `resume(rv)` instead of
 /// `start()` and forwards from there. Both macros accept a `box`

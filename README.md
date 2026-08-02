@@ -83,7 +83,9 @@ any code. `start()` runs the body up to the first `yield_!`; each
   serde derives compose across arbitrary nesting depth.
   `yield_all_resume!(sub, rv)` delegates to a coroutine that is already
   started (e.g. one deserialized mid-run), entering with `resume(rv)`
-  instead of `start()`. The `box` modifier (`yield_all!(box sub)`)
+  instead of `start()`. A `?` applied to the delegation
+  (`let v: T = yield_all!(sub)?;`) unwraps the completion value and
+  exits early on Err. The `box` modifier (`yield_all!(box sub)`)
   stores the delegate boxed instead, enabling *recursive* delegation;
   boxing is lazy — a delegate that completes on entry never
   allocates — and requires the `alloc` feature (on by default, the only
@@ -305,8 +307,11 @@ produces a dedicated compile error with the workaround in the message.
   be any expression not containing `yield_!`). Supported positions are
   the same as for value-producing control flow: a statement
   (`yield_all!(sub);`, completion value discarded), a whole `let`
-  initializer with a type annotation, or the function's trailing
-  expression.
+  initializer, or the function's trailing expression — in each case
+  optionally followed by `?` (`let v: T = yield_all!(sub)?;` unwraps
+  the completion value, exiting early on Err). The completion binding
+  needs no annotation: its type is derived from the operand as
+  `<SubTy as Coroutine<R>>::Return`.
 - **Value bindings crossing the join need an annotation**: in
   `let x = if c { yield_!(1); a } else { b };` the join is a state
   variant storing `x`, so write `let x: T = ...` (the usual

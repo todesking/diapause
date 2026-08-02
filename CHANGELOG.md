@@ -24,6 +24,15 @@ versioned and released together; this changelog covers all three.
   boxed only if it actually suspends, so completing on entry never
   allocates. Gated behind a new `alloc` feature (enabled by default),
   which also adds a `Coroutine` forwarding impl for `Box<C>`.
+- The `?` operator can now be applied directly to a delegation
+  (`let v: T = yield_all!(sub)?;`, `yield_all_resume!(sub, rv)?;`,
+  `box` modifier included) in every position the macros support: a
+  whole `let` initializer, an expression statement (Ok value
+  discarded), and the function's trailing expression.
+- The completion value of a delegation no longer needs a type
+  annotation: `let r = yield_all!(sub);` derives the binding's type
+  from the operand as `<SubTy as Coroutine<R>>::Return`. An explicit
+  annotation still wins.
 
 ### Fixed
 

@@ -536,9 +536,11 @@ macro_rules! yield_ {
 /// (bind the coroutine with a type annotation first); passing an
 /// arbitrary expression is a compile error. Supported positions are a
 /// statement (`yield_all!(sub);`, completion value discarded), a whole
-/// `let` initializer with a type annotation
-/// (`let x: T = yield_all!(sub);`), and the function's trailing
-/// expression.
+/// `let` initializer (`let x = yield_all!(sub);` — the binding's type
+/// is derived from the operand, an explicit annotation wins), and the
+/// function's trailing expression. In each position the delegation may
+/// be followed by `?` (`let v: T = yield_all!(sub)?;`), unwrapping the
+/// completion value and exiting early on Err.
 ///
 /// The inner coroutine's state enum is stored by value inside the outer
 /// one, so `Clone` and serde derives compose: a coroutine suspended
@@ -630,8 +632,8 @@ macro_rules! yield_all {
 /// before any suspension and is never stored in the state. The
 /// supported positions are the same three: a statement
 /// (`yield_all_resume!(sub, rv);`, completion value discarded), a whole
-/// `let` initializer with a type annotation, and the function's
-/// trailing expression. The `box` modifier
+/// `let` initializer, and the function's trailing expression, each
+/// optionally followed by `?`. The `box` modifier
 /// (`yield_all_resume!(box sub, rv)`) stores the delegate boxed with
 /// the same lazy-boxing behavior as [`yield_all!`]'s (see *Boxed
 /// delegation* there; requires the `alloc` feature).
