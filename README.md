@@ -307,8 +307,11 @@ produces a dedicated compile error with the workaround in the message.
   be any expression not containing `yield_!`). Supported positions are
   the same as for value-producing control flow: a statement
   (`yield_all!(sub);`, completion value discarded), a whole `let`
-  initializer, or the function's trailing expression — in each case
-  optionally followed by `?` (`let v: T = yield_all!(sub)?;` unwraps
+  initializer, or a trailing expression — of the function body, or of
+  a block, `if`/`else` branch, or match arm that is itself in one of
+  these positions, recursively
+  (`let v: u32 = match x { A => yield_all!(sub), _ => 0 };`) — in each
+  case optionally followed by `?` (`let v: T = yield_all!(sub)?;` unwraps
   the completion value, exiting early on Err). The completion binding
   needs no annotation: its type is derived from the operand as
   `<SubTy as Coroutine<R>>::Return`.

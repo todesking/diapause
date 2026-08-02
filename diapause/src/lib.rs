@@ -537,10 +537,14 @@ macro_rules! yield_ {
 /// arbitrary expression is a compile error. Supported positions are a
 /// statement (`yield_all!(sub);`, completion value discarded), a whole
 /// `let` initializer (`let x = yield_all!(sub);` — the binding's type
-/// is derived from the operand, an explicit annotation wins), and the
-/// function's trailing expression. In each position the delegation may
-/// be followed by `?` (`let v: T = yield_all!(sub)?;`), unwrapping the
-/// completion value and exiting early on Err.
+/// is derived from the operand, an explicit annotation wins), and a
+/// trailing expression: the function body's, or that of a block,
+/// `if`/`else` branch, or match arm that is itself in one of these
+/// positions, recursively
+/// (`let v: u32 = match x { A => yield_all!(sub), _ => 0 };`). In each
+/// position the delegation may be followed by `?`
+/// (`let v: T = yield_all!(sub)?;`), unwrapping the completion value
+/// and exiting early on Err.
 ///
 /// The inner coroutine's state enum is stored by value inside the outer
 /// one, so `Clone` and serde derives compose: a coroutine suspended
@@ -630,10 +634,11 @@ macro_rules! yield_all {
 /// type is syntactically known. The resume value may be any expression
 /// not containing `yield_!`; it is consumed by the first `resume` call
 /// before any suspension and is never stored in the state. The
-/// supported positions are the same three: a statement
+/// supported positions are the same: a statement
 /// (`yield_all_resume!(sub, rv);`, completion value discarded), a whole
-/// `let` initializer, and the function's trailing expression, each
-/// optionally followed by `?`. The `box` modifier
+/// `let` initializer, and a trailing expression (of the function body,
+/// or of a block, `if`/`else` branch, or match arm in one of these
+/// positions), each optionally followed by `?`. The `box` modifier
 /// (`yield_all_resume!(box sub, rv)`) stores the delegate boxed with
 /// the same lazy-boxing behavior as [`yield_all!`]'s (see *Boxed
 /// delegation* there; requires the `alloc` feature).

@@ -33,6 +33,13 @@ versioned and released together; this changelog covers all three.
   annotation: `let r = yield_all!(sub);` derives the binding's type
   from the operand as `<SubTy as Coroutine<R>>::Return`. An explicit
   annotation still wins.
+- Delegation at expression tails is now part of the documented
+  contract: `yield_all!` / `yield_all_resume!` may be the trailing
+  expression of a block, an `if`/`else` branch, or a match arm that is
+  itself in a supported position (recursively), optionally followed by
+  `?` — including the unbraced arm form `pat => yield_all!(sub)?`,
+  which previously failed with the position error. The position errors
+  name the tail positions.
 
 ### Fixed
 
