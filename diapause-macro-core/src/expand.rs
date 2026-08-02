@@ -1452,6 +1452,12 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
 /// completion transitions. Valid at any expression position; the exit
 /// value is evaluated before the state write so a panic inside it (or
 /// inside a `From` conversion) still poisons.
+///
+/// Statement-position `return`s are the exception: they are left in
+/// place for lowering, which terminates their block with a CFG `Return`
+/// (no false fall-through edge) or, in statements that stay opaque,
+/// rewrites them into completion jump markers. Both forms generate the
+/// same value-before-state-write transition as the rewrite here.
 fn rewrite_early_exits(body: &mut syn::Block, ret_ty: &syn::Type) {
     /// The completion transition `{ let __ret: T = value; *self =
     /// State::Done; return Complete(__ret); }`. The `return` is emitted
@@ -1530,6 +1536,20 @@ fn rewrite_early_exits(body: &mut syn::Block, ret_ty: &syn::Type) {
                 _ => {}
             }
         }
+        // A statement-position `return` (with or without a trailing
+        // semicolon) becomes a CFG terminator in lowering instead of
+        // being rewritten here; only its value is visited (for `?`s and
+        // expression-position returns inside it).
+        fn visit_stmt_mut(&mut self, s: &mut syn::Stmt) {
+            if let syn::Stmt::Expr(syn::Expr::Return(r), _) = s {
+                if let Some(v) = &mut r.expr {
+                    self.visit_expr_mut(v);
+                }
+                return;
+            }
+            syn::visit_mut::visit_stmt_mut(self, s);
+        }
+
         // syn does not parse macro token streams, so a `yield_!` value
         // expression must be rewritten explicitly; foreign macro tokens
         // stay untouched (as with `?` outside coroutines, `?` inside
@@ -1585,6 +1605,78 @@ mod tests {
             let x = yield_!(f()?);
         }));
         assert!(out.contains("yield_ ! (match :: diapause :: Try :: branch (f ())"));
+    }
+
+    #[test]
+    fn statement_return_is_left_for_lowering() {
+        // Statement-position returns become CFG terminators in lowering;
+        // the rewriter must leave them alone (at any block depth).
+        let out = rewritten(parse_quote!({
+            if c {
+                return f();
+            }
+            return;
+        }));
+        assert!(out.contains("return f () ;"), "{out}");
+        assert!(out.contains("return ;"), "{out}");
+        assert!(!out.contains("State :: Done"), "{out}");
+    }
+
+    #[test]
+    fn try_inside_a_statement_return_value_is_rewritten() {
+        let out = rewritten(parse_quote!({
+            return f()?;
+        }));
+        assert!(
+            out.starts_with("{ return match :: diapause :: Try :: branch"),
+            "{out}"
+        );
+        // Only the `?`'s exit transition is synthesized; the statement
+        // return itself stays.
+        assert_eq!(out.matches("State :: Done").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn expression_position_return_is_still_rewritten() {
+        let out = rewritten(parse_quote!({
+            let x = f().unwrap_or_else(|| return g());
+        }));
+        // The closure is a separate scope; its return stays.
+        assert!(out.contains("return g ()"), "{out}");
+        let out = rewritten(parse_quote!({
+            let x: u32 = if c { return 1 } else { 2 };
+            h(x);
+        }));
+        // An arm-tail return is statement position (a block statement);
+        // it stays for lowering.
+        assert!(out.contains("return 1"), "{out}");
+        assert!(!out.contains("State :: Done"), "{out}");
+    }
+
+    #[test]
+    fn synthesized_exits_never_parse_as_return_nodes() {
+        // The opaque-statement rewriter in lowering rewrites every
+        // `Expr::Return` it sees into a completion jump marker; the
+        // exits synthesized here must therefore never round-trip into
+        // `Expr::Return` nodes, even when nested inside another `?`'s
+        // operand.
+        struct FindReturn {
+            found: bool,
+        }
+        impl<'ast> syn::visit::Visit<'ast> for FindReturn {
+            fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
+                self.found = true;
+            }
+        }
+        let ret_ty: syn::Type = parse_quote!(Result<u32, E>);
+        let mut block: syn::Block = parse_quote!({
+            let x = g(f()?)?;
+            let y = h()?;
+        });
+        rewrite_early_exits(&mut block, &ret_ty);
+        let mut f = FindReturn { found: false };
+        syn::visit::visit_block(&mut f, &block);
+        assert!(!f.found, "synthesized exits must stay verbatim");
     }
 
     #[test]
