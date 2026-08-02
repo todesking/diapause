@@ -1467,8 +1467,12 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
 /// (`yield_all!(sub)?` / `yield_all_resume!(sub, rv)?`, with or without
 /// the `box` modifier) in the statement positions the macros support: a
 /// whole `let` initializer, an expression statement, and a block's
-/// trailing expression. The completion value is bound to a synthetic
-/// `__dt{k}` temporary and the `?` re-applied to that:
+/// trailing expression. An unbraced match-arm body applying `?` to a
+/// delegation (`pat => yield_all!(sub)?`) is first wrapped in a block —
+/// the form the user's own braces (which rustfmt removes around a lone
+/// expression) would produce — so its `?` desugars as a trailing
+/// expression like any other. The completion value is bound to a
+/// synthetic `__dt{k}` temporary and the `?` re-applied to that:
 ///
 /// ```text
 /// let v: T = yield_all!(sub)?;  // let __dt0 = yield_all!(sub);
@@ -1547,6 +1551,23 @@ fn rewrite_delegate_try(body: &mut syn::Block) {
                 out.push(stmt);
             }
             block.stmts = out;
+        }
+
+        // An unbraced arm body has no statement list to hold the
+        // temporary; give it one (dropping the now-redundant comma, as
+        // written braces would), and the recursion below desugars the
+        // block's trailing `?` through `visit_block_mut` as usual.
+        fn visit_arm_mut(&mut self, arm: &mut syn::Arm) {
+            if let syn::Expr::Try(t) = &*arm.body
+                && delegate_macro(&t.expr).is_some()
+            {
+                let span = t.question_token.span();
+                let body =
+                    std::mem::replace(&mut *arm.body, syn::Expr::Verbatim(TokenStream::new()));
+                *arm.body = syn::parse_quote_spanned!(span => { #body });
+                arm.comma = None;
+            }
+            syn::visit_mut::visit_arm_mut(self, arm);
         }
         skip_nested_scopes!(VisitMut);
     }
@@ -1918,6 +1939,60 @@ mod tests {
                 }
             }),
         );
+    }
+
+    #[test]
+    fn unbraced_arm_delegate_try_body_gains_a_block() {
+        assert_delegate_rewrites(
+            parse_quote!({
+                let v: u32 = match n {
+                    0 => 0,
+                    _ => yield_all!(sub)?,
+                };
+            }),
+            parse_quote!({
+                let v: u32 = match n {
+                    0 => 0,
+                    _ => {
+                        let __dt0 = yield_all!(sub);
+                        __dt0?
+                    }
+                };
+            }),
+        );
+    }
+
+    #[test]
+    fn unbraced_arm_boxed_and_resume_delegate_try_bodies_desugar_too() {
+        assert_delegate_rewrites(
+            parse_quote!({
+                match n {
+                    0 => yield_all!(box sub)?,
+                    _ => yield_all_resume!(sub2, rv)?,
+                };
+            }),
+            parse_quote!({
+                match n {
+                    0 => {
+                        let __dt0 = yield_all!(box sub);
+                        __dt0?
+                    }
+                    _ => {
+                        let __dt1 = yield_all_resume!(sub2, rv);
+                        __dt1?
+                    }
+                };
+            }),
+        );
+    }
+
+    #[test]
+    fn unbraced_arm_try_on_a_non_delegate_is_untouched() {
+        assert_delegate_unchanged(parse_quote!({
+            let v: u32 = match n {
+                _ => f()?,
+            };
+        }));
     }
 
     #[test]
