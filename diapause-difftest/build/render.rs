@@ -751,6 +751,7 @@ fn ret_expr(r: &RetExpr) -> String {
         RetExpr::OptVar(n) => n.clone(),
         RetExpr::OkWrapped(e) => format!("Ok({})", expr(e)),
         RetExpr::ErrWrapped(e) => format!("Err(diapause_difftest::Err1({}))", expr(e)),
+        RetExpr::OkTry(n) => format!("Ok({n}?)"),
         RetExpr::Unit => "()".to_string(),
     }
 }

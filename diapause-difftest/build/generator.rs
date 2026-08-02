@@ -1218,7 +1218,20 @@ impl<'a> Gen<'a> {
                 }
             }
             Flavor::ResultU32 => {
-                if self.rng.chance(1, 5) {
+                // `RetExpr::OkTry` renders as `Ok(name?)`, using a `res`
+                // variable as the `?` operand. This is only reachable
+                // from `gen_jump` (`Stmt::Return`, a block-local
+                // statement position): `gen_tail` and
+                // `gen_tail_break_loop` call `gen_ret_expr` after the
+                // top-level `gen_block` has already `scope.truncate`d
+                // block-local bindings, leaving only the u32 arguments
+                // in scope, so `has_res_var()` is always false there.
+                // If that invariant ever changes, this variant would
+                // also start appearing in `break 'l Ok(res?)` (the
+                // `fuel` of `Tail::BreakLoop`), which is untested.
+                if self.has_res_var() && self.rng.chance(1, 4) {
+                    RetExpr::OkTry(self.pick_res_var())
+                } else if self.rng.chance(1, 5) {
                     RetExpr::ErrWrapped(self.gen_expr(2))
                 } else {
                     RetExpr::OkWrapped(self.gen_expr(2))

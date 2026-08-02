@@ -139,6 +139,8 @@ pub enum RetExpr {
     OkWrapped(Expr),
     /// `Err(Err1(expr))` (ResultU32 flavor).
     ErrWrapped(Expr),
+    /// `Ok(name?)` (ResultU32 flavor): a `?` inside the return value.
+    OkTry(String),
     /// `()` (Unit flavor); a `return` statement renders it as a bare
     /// `return;`.
     Unit,
