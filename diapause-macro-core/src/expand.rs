@@ -158,6 +158,11 @@ impl Prepared {
         // native statement forms. Runs first: `?` must still be visible as
         // `Expr::Try` (an effect ending the prefix).
         let mut body = (*item.block).clone();
+        // A `?` applied directly to a delegation macro splits into
+        // binding the completion value first; runs before the passes
+        // below so they only see the native forms (a plain `?` and a
+        // statement-position delegation).
+        rewrite_delegate_try(&mut body);
         crate::hoist::hoist_yields(&mut body);
         // Early `return e` and `e?` become completion transitions everywhere
         // in the body, including inside opaque statements; the rewritten form
@@ -1444,6 +1449,98 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+// === Delegation `?` desugaring ===
+
+/// Desugars a `?` applied directly to a delegation macro
+/// (`yield_all!(sub)?` / `yield_all_resume!(sub, rv)?`, with or without
+/// the `box` modifier) in the statement positions the macros support: a
+/// whole `let` initializer, an expression statement, and a block's
+/// trailing expression. The completion value is bound to a synthetic
+/// `__dt{k}` temporary and the `?` re-applied to that:
+///
+/// ```text
+/// let v: T = yield_all!(sub)?;  // let __dt0 = yield_all!(sub);
+///                               // let v: T = __dt0?;
+/// yield_all!(sub)?;             // let __dt1 = yield_all!(sub);
+///                               // let _ = __dt1?;
+/// yield_all!(sub)?              // let __dt2 = yield_all!(sub);
+///                               // __dt2?
+/// ```
+///
+/// Runs before the other body rewrites: `rewrite_early_exits` then
+/// turns the plain `?` on the temporary into a completion transition
+/// like any other, and lowering sees a native delegation `let` whose
+/// destination type follows the operand (`TySource::DelegateReturn`),
+/// which is what lets the temporary cross the join after the delegation
+/// loop without an annotation. The discarding statement form binds the
+/// rewritten `?` to `_` so a non-`()` Ok value typechecks. A `?` on a
+/// delegation in any other position is left alone for lowering to
+/// reject with the usual position error.
+fn rewrite_delegate_try(body: &mut syn::Block) {
+    /// The delegation-macro expression under a `?`'s operand, seen
+    /// through parentheses and macro-expansion groups.
+    fn delegate_macro(e: &syn::Expr) -> Option<&syn::ExprMacro> {
+        match e {
+            syn::Expr::Paren(p) => delegate_macro(&p.expr),
+            syn::Expr::Group(g) => delegate_macro(&g.expr),
+            syn::Expr::Macro(em) if lower::is_delegate_macro(&em.mac) => Some(em),
+            _ => None,
+        }
+    }
+
+    struct Rewriter {
+        /// Number of `__dt{k}` temporaries created so far (per body).
+        count: usize,
+    }
+
+    impl Rewriter {
+        /// Desugars one statement, returning the `let __dt{k} = ..;` to
+        /// insert in front of it.
+        fn rewrite_stmt(&mut self, stmt: &mut syn::Stmt) -> Option<syn::Stmt> {
+            let try_expr = match stmt {
+                // A `let ... else` initializer is not a supported
+                // delegation position; leave it for lowering to reject.
+                syn::Stmt::Local(local) => {
+                    let init = local.init.as_mut().filter(|i| i.diverge.is_none())?;
+                    match &mut *init.expr {
+                        syn::Expr::Try(t) => t,
+                        _ => return None,
+                    }
+                }
+                syn::Stmt::Expr(syn::Expr::Try(t), _) => t,
+                _ => return None,
+            };
+            let mac = delegate_macro(&try_expr.expr)?.clone();
+            let span = mac.mac.span();
+            let ident = syn::Ident::new(&format!("__dt{}", self.count), span);
+            self.count += 1;
+            *try_expr.expr = syn::parse_quote_spanned!(span => #ident);
+            // An expression statement discards the Ok value: bind the
+            // rewritten `?` to `_` (a bare match statement — which the
+            // `?` becomes — would demand a `()` value instead).
+            if let syn::Stmt::Expr(e, Some(_)) = stmt {
+                let e = std::mem::replace(e, syn::Expr::Verbatim(TokenStream::new()));
+                *stmt = syn::parse_quote_spanned!(span => let _ = #e;);
+            }
+            Some(syn::parse_quote_spanned!(span => let #ident = #mac;))
+        }
+    }
+
+    impl VisitMut for Rewriter {
+        fn visit_block_mut(&mut self, block: &mut syn::Block) {
+            let mut out = Vec::with_capacity(block.stmts.len());
+            for mut stmt in std::mem::take(&mut block.stmts) {
+                out.extend(self.rewrite_stmt(&mut stmt));
+                syn::visit_mut::visit_stmt_mut(self, &mut stmt);
+                out.push(stmt);
+            }
+            block.stmts = out;
+        }
+        skip_nested_scopes!(VisitMut);
+    }
+    Rewriter { count: 0 }.visit_block_mut(body);
+}
+
 // === Early-exit rewriting (`return` and `?`) ===
 
 /// Rewrites `return e` and `e?` anywhere in the body (inside opaque
@@ -1677,6 +1774,142 @@ mod tests {
         let mut f = FindReturn { found: false };
         syn::visit::visit_block(&mut f, &block);
         assert!(!f.found, "synthesized exits must stay verbatim");
+    }
+
+    fn delegate_rewritten(mut block: syn::Block) -> String {
+        rewrite_delegate_try(&mut block);
+        quote!(#block).to_string()
+    }
+
+    fn assert_delegate_rewrites(input: syn::Block, expected: syn::Block) {
+        assert_eq!(delegate_rewritten(input), quote!(#expected).to_string());
+    }
+
+    fn assert_delegate_unchanged(block: syn::Block) {
+        let before = quote!(#block).to_string();
+        assert_eq!(delegate_rewritten(block), before);
+    }
+
+    #[test]
+    fn delegate_try_in_a_let_initializer_binds_a_temporary() {
+        assert_delegate_rewrites(
+            parse_quote!({
+                let v: u32 = yield_all!(sub)?;
+            }),
+            parse_quote!({
+                let __dt0 = yield_all!(sub);
+                let v: u32 = __dt0?;
+            }),
+        );
+    }
+
+    #[test]
+    fn delegate_try_statement_discards_through_a_wildcard_let() {
+        assert_delegate_rewrites(
+            parse_quote!({
+                yield_all!(sub)?;
+                f();
+            }),
+            parse_quote!({
+                let __dt0 = yield_all!(sub);
+                let _ = __dt0?;
+                f();
+            }),
+        );
+    }
+
+    #[test]
+    fn delegate_try_tail_stays_a_tail() {
+        assert_delegate_rewrites(
+            parse_quote!({ yield_all!(sub)? }),
+            parse_quote!({
+                let __dt0 = yield_all!(sub);
+                __dt0?
+            }),
+        );
+    }
+
+    #[test]
+    fn boxed_and_resume_delegate_try_forms_desugar_too() {
+        assert_delegate_rewrites(
+            parse_quote!({
+                let v: u32 = yield_all!(box sub)?;
+                yield_all_resume!(sub2, rv)?;
+            }),
+            parse_quote!({
+                let __dt0 = yield_all!(box sub);
+                let v: u32 = __dt0?;
+                let __dt1 = yield_all_resume!(sub2, rv);
+                let _ = __dt1?;
+            }),
+        );
+    }
+
+    #[test]
+    fn parenthesized_delegate_try_operand_desugars_bare() {
+        assert_delegate_rewrites(
+            parse_quote!({
+                let v: u32 = (yield_all!(sub))?;
+            }),
+            parse_quote!({
+                let __dt0 = yield_all!(sub);
+                let v: u32 = __dt0?;
+            }),
+        );
+    }
+
+    #[test]
+    fn nested_block_delegate_try_desugars_recursively() {
+        assert_delegate_rewrites(
+            parse_quote!({
+                if c {
+                    yield_all!(sub)?;
+                }
+            }),
+            parse_quote!({
+                if c {
+                    let __dt0 = yield_all!(sub);
+                    let _ = __dt0?;
+                }
+            }),
+        );
+    }
+
+    #[test]
+    fn expression_position_delegate_try_is_untouched() {
+        // Unsupported positions keep the macro in place for lowering's
+        // position error.
+        assert_delegate_unchanged(parse_quote!({
+            f(yield_all!(sub)?);
+        }));
+        assert_delegate_unchanged(parse_quote!({
+            let v: u32 = 1 + yield_all!(sub)?;
+        }));
+    }
+
+    #[test]
+    fn plain_try_and_plain_delegation_are_untouched() {
+        assert_delegate_unchanged(parse_quote!({
+            let x = f()?;
+            let v: u32 = yield_all!(sub);
+            yield_all!(sub);
+        }));
+    }
+
+    #[test]
+    fn let_else_delegate_try_initializer_is_untouched() {
+        assert_delegate_unchanged(parse_quote!({
+            let Some(x) = yield_all!(sub)? else {
+                return;
+            };
+        }));
+    }
+
+    #[test]
+    fn closure_bodies_are_untouched_by_delegate_try() {
+        assert_delegate_unchanged(parse_quote!({
+            let f = || yield_all!(sub)?;
+        }));
     }
 
     #[test]

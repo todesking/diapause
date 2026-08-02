@@ -530,13 +530,15 @@ const ERR_YIELD_ALL_OPERAND: &str = "yield_all! takes a single variable holding 
      `yield_all!(sub)`";
 const ERR_YIELD_ALL_POSITION: &str = "yield_all! is only supported in statement \
      position (`yield_all!(sub);`), as a whole `let` initializer, or as the function's \
-     trailing expression";
+     trailing expression, in each case optionally followed by `?` \
+     (`let v: T = yield_all!(sub)?;`)";
 const ERR_YIELD_ALL_RESUME_OPERAND: &str = "yield_all_resume! takes a variable holding \
      the started coroutine to delegate to and the resume value to enter it with: \
      `yield_all_resume!(sub, rv)`; bind the coroutine first: `let sub: SubTy = ..;`";
 const ERR_YIELD_ALL_RESUME_POSITION: &str = "yield_all_resume! is only supported in \
      statement position (`yield_all_resume!(sub, rv);`), as a whole `let` initializer, \
-     or as the function's trailing expression";
+     or as the function's trailing expression, in each case optionally followed by `?` \
+     (`let v: T = yield_all_resume!(sub, rv)?;`)";
 const ERR_YIELD_ALL_RESUME_VALUE: &str = "yield_! in the resume value of \
      yield_all_resume! is not supported; bind it first: `let rv = yield_!(..);` and \
      pass `rv`";
