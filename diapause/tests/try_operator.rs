@@ -329,6 +329,93 @@ fn resume_delegation_try() {
     assert_eq!(c.start(), CoroutineState::Complete(Ok(80)));
 }
 
+// === `?` inside a `return` value ===
+
+/// The manual-driver shape (a `loop { match sub.start()/resume() }`
+/// forwarding yields) with `?` applied inside an unbraced match-arm
+/// `return`. Regression: the expression-position return used to be
+/// pre-rewritten into a completion block whose construction re-parsed
+/// the `?`'s synthesized exit; the opaque rewriter then wrapped it in a
+/// second completion and the generated code failed with E0308.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn drive(mut sub: try_sub::State) -> Result<u32, ParseError> {
+    let mut step: CoroutineState<u32, Result<u32, ParseError>> = sub.start();
+    loop {
+        match step {
+            CoroutineState::Complete(result) => return Ok(result? + 100),
+            CoroutineState::Yielded(y) => {
+                let r: u32 = yield_!(y);
+                step = sub.resume(r);
+            }
+        }
+    }
+}
+
+#[test]
+fn try_in_a_match_arm_return() {
+    let mut c = drive(try_sub("7"));
+    assert_eq!(c.start(), CoroutineState::Yielded(7)); // sub yields x
+    assert_eq!(c.resume(1), CoroutineState::Complete(Ok(108))); // Ok(7+1)? + 100
+
+    let mut c = drive(try_sub("x"));
+    assert_eq!(c.start(), CoroutineState::Complete(Err(ParseError)));
+}
+
+/// The braced form of the same arm goes through the statement-return
+/// path (a `Return` terminator inside the arm's block).
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn drive_braced(mut sub: try_sub::State) -> Result<u32, ParseError> {
+    let mut step: CoroutineState<u32, Result<u32, ParseError>> = sub.start();
+    loop {
+        match step {
+            CoroutineState::Complete(result) => {
+                return Ok(result? + 100);
+            }
+            CoroutineState::Yielded(y) => {
+                let r: u32 = yield_!(y);
+                step = sub.resume(r);
+            }
+        }
+    }
+}
+
+#[test]
+fn try_in_a_braced_match_arm_return() {
+    let mut c = drive_braced(try_sub("7"));
+    assert_eq!(c.start(), CoroutineState::Yielded(7));
+    assert_eq!(c.resume(1), CoroutineState::Complete(Ok(108)));
+
+    let mut c = drive_braced(try_sub("x"));
+    assert_eq!(c.start(), CoroutineState::Complete(Err(ParseError)));
+}
+
+/// The same arm return with `?` where the match is a `let` initializer:
+/// the returning arm diverges, the yielding arm produces the value.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn try_in_stored_arm_return(r: Result<u32, ParseError>, flag: bool) -> Result<u32, ParseError> {
+    let x: u32 = match flag {
+        true => return Ok(r? + 1),
+        false => {
+            let v = yield_!(9);
+            v
+        }
+    };
+    Ok(x * 2)
+}
+
+#[test]
+fn try_in_a_stored_arm_return() {
+    let mut c = try_in_stored_arm_return(Ok(4), true);
+    assert_eq!(c.start(), CoroutineState::Complete(Ok(5)));
+
+    let mut c = try_in_stored_arm_return(Err(ParseError), true);
+    assert_eq!(c.start(), CoroutineState::Complete(Err(ParseError)));
+
+    let mut c = try_in_stored_arm_return(Ok(4), false);
+    assert_eq!(c.start(), CoroutineState::Yielded(9));
+    assert_eq!(c.resume(3), CoroutineState::Complete(Ok(6)));
+}
+
 /// `?` inside a closure belongs to the closure, not the coroutine.
 #[diapause::coroutine(yield = u32)]
 fn closure_try(s: &'static str) -> u32 {
