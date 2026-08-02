@@ -1,5 +1,5 @@
 error: yield_all! is only supported in statement position (`yield_all!(sub);`), as a whole `let` initializer, or as a trailing expression — of the function body, or of a block, `if`/`else` branch, or match arm that is itself in one of these positions — in each case optionally followed by `?` (`let v: T = yield_all!(sub)?;`)
-  --> tests/compile_fail/yield_all_try_in_expression.rs:16:7
+  --> tests/compile_fail/yield_all_in_break_value.rs:14:15
    |
-16 |     f(yield_all!(g)?);
-   |       ^^^^^^^^^^^^^
+14 |         break yield_all!(g);
+   |               ^^^^^^^^^^^^^
