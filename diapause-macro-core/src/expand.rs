@@ -1553,20 +1553,27 @@ fn rewrite_delegate_try(body: &mut syn::Block) {
     Rewriter { count: 0 }.visit_block_mut(body);
 }
 
-// === Early-exit rewriting (`return` and `?`) ===
+// === Early-exit rewriting (`?`) ===
 
-/// Rewrites `return e` and `e?` anywhere in the body (inside opaque
-/// statements and `yield_!` value expressions too; closures, async
-/// blocks, and nested items are separate scopes and excluded) into
-/// completion transitions. Valid at any expression position; the exit
-/// value is evaluated before the state write so a panic inside it (or
-/// inside a `From` conversion) still poisons.
+/// Rewrites `e?` anywhere in the body (inside opaque statements and
+/// `yield_!` value expressions too; closures, async blocks, and nested
+/// items are separate scopes and excluded) into a `Try::branch` match
+/// whose Break arm is a completion transition. Valid at any expression
+/// position; the exit value is evaluated before the state write so a
+/// panic inside it (or inside a `From` conversion) still poisons.
 ///
-/// Statement-position `return`s are the exception: they are left in
-/// place for lowering, which terminates their block with a CFG `Return`
-/// (no false fall-through edge) or, in statements that stay opaque,
-/// rewrites them into completion jump markers. Both forms generate the
-/// same value-before-state-write transition as the rewrite here.
+/// `return`s are left in place — statement- and expression-position
+/// alike. Lowering terminates statement-position ones (a statement, a
+/// match-arm body, a branch or function tail) with a CFG `Return` (no
+/// false fall-through edge), rewrites those inside opaque statements
+/// into completion jump markers, and `rewrite_leftover_returns`
+/// finalizes any that survive in embedded expressions; every form
+/// generates the same value-before-state-write transition as the `?`
+/// exit here. Rewriting expression-position returns here instead used
+/// to interpolate the value tokens into a fresh `parse_quote!`, which
+/// re-parsed a nested `?`'s verbatim exit back into an `Expr::Return`
+/// node; the opaque rewriter then wrapped that synthesized exit in a
+/// second completion, an E0308 in the generated code.
 fn rewrite_early_exits(body: &mut syn::Block, ret_ty: &syn::Type) {
     /// The completion transition `{ let __ret: T = value; *self =
     /// State::Done; return Complete(__ret); }`. The `return` is emitted
@@ -1574,7 +1581,10 @@ fn rewrite_early_exits(body: &mut syn::Block, ret_ty: &syn::Type) {
     /// passes can tell synthesized early exits apart from the user's own
     /// `return`s (lowering's opaque-statement rewriter turns the latter
     /// into completion jump markers and must leave these alone). The
-    /// printed tokens are identical either way.
+    /// printed tokens are identical either way. `value` is interpolated
+    /// into a `parse_quote!` and so must not itself carry a synthesized
+    /// exit — the re-parse would strip that verbatim marking; the only
+    /// caller passes freshly built `from_residual` tokens.
     fn completion_transition(
         ret_ty: &syn::Type,
         value: TokenStream,
@@ -1604,59 +1614,38 @@ fn rewrite_early_exits(body: &mut syn::Block, ret_ty: &syn::Type) {
         fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
             syn::visit_mut::visit_expr_mut(self, e);
             let ret_ty = self.ret_ty;
-            match e {
-                syn::Expr::Return(r) => {
-                    let span = r.return_token.span();
-                    let value = r.expr.take().map_or_else(|| quote!(()), |v| quote!(#v));
-                    *e = completion_transition(ret_ty, value, span);
-                }
-                syn::Expr::Try(t) => {
-                    // Spanning the generated tokens to the `?` makes a
-                    // trait-bound error (unsupported operand type, or a
-                    // Result/Option mismatch) point at the offending `?`
-                    // instead of the whole attribute.
-                    let span = t.question_token.span();
-                    let exit = completion_transition(
-                        ret_ty,
-                        quote::quote_spanned!(span =>
-                            ::diapause::FromResidual::from_residual(__r)
-                        ),
-                        span,
-                    );
-                    // The exit arm and the operand are grafted in as AST
-                    // nodes rather than interpolated: `parse_quote!`
-                    // would re-parse the verbatim `return`s inside them
-                    // (the exit's own, or a nested `?`'s) into
-                    // `Expr::Return` nodes, losing the synthesized-exit
-                    // marking.
-                    let mut em: syn::ExprMatch = syn::parse_quote_spanned!(span =>
-                        match ::diapause::Try::branch(__operand) {
-                            ::core::ops::ControlFlow::Continue(__v) => __v,
-                            ::core::ops::ControlFlow::Break(__r) => __exit,
-                        }
-                    );
-                    let syn::Expr::Call(branch) = &mut *em.expr else {
-                        unreachable!("BUG: the scrutinee is a call by construction")
-                    };
-                    branch.args[0] = (*t.expr).clone();
-                    *em.arms[1].body = exit;
-                    *e = syn::Expr::Match(em);
-                }
-                _ => {}
+            if let syn::Expr::Try(t) = e {
+                // Spanning the generated tokens to the `?` makes a
+                // trait-bound error (unsupported operand type, or a
+                // Result/Option mismatch) point at the offending `?`
+                // instead of the whole attribute.
+                let span = t.question_token.span();
+                let exit = completion_transition(
+                    ret_ty,
+                    quote::quote_spanned!(span =>
+                        ::diapause::FromResidual::from_residual(__r)
+                    ),
+                    span,
+                );
+                // The exit arm and the operand are grafted in as AST
+                // nodes rather than interpolated: `parse_quote!`
+                // would re-parse the verbatim `return`s inside them
+                // (the exit's own, or a nested `?`'s) into
+                // `Expr::Return` nodes, losing the synthesized-exit
+                // marking.
+                let mut em: syn::ExprMatch = syn::parse_quote_spanned!(span =>
+                    match ::diapause::Try::branch(__operand) {
+                        ::core::ops::ControlFlow::Continue(__v) => __v,
+                        ::core::ops::ControlFlow::Break(__r) => __exit,
+                    }
+                );
+                let syn::Expr::Call(branch) = &mut *em.expr else {
+                    unreachable!("BUG: the scrutinee is a call by construction")
+                };
+                branch.args[0] = (*t.expr).clone();
+                *em.arms[1].body = exit;
+                *e = syn::Expr::Match(em);
             }
-        }
-        // A statement-position `return` (with or without a trailing
-        // semicolon) becomes a CFG terminator in lowering instead of
-        // being rewritten here; only its value is visited (for `?`s and
-        // expression-position returns inside it).
-        fn visit_stmt_mut(&mut self, s: &mut syn::Stmt) {
-            if let syn::Stmt::Expr(syn::Expr::Return(r), _) = s {
-                if let Some(v) = &mut r.expr {
-                    self.visit_expr_mut(v);
-                }
-                return;
-            }
-            syn::visit_mut::visit_stmt_mut(self, s);
         }
 
         // syn does not parse macro token streams, so a `yield_!` value
@@ -1746,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    fn expression_position_return_is_still_rewritten() {
+    fn expression_position_returns_are_left_for_lowering() {
         let out = rewritten(parse_quote!({
             let x = f().unwrap_or_else(|| return g());
         }));
@@ -1760,6 +1749,50 @@ mod tests {
         // it stays for lowering.
         assert!(out.contains("return 1"), "{out}");
         assert!(!out.contains("State :: Done"), "{out}");
+        // An unbraced match-arm return and a return embedded in a
+        // larger expression stay too: lowering terminates the former
+        // (or the opaque rewriter marks it), and the CFG-finalization
+        // pass rewrites whatever survives embedded.
+        let out = rewritten(parse_quote!({
+            match s {
+                A(v) => return Ok(v),
+                B => f(return 2),
+            }
+        }));
+        assert!(out.contains("return Ok (v)"), "{out}");
+        assert!(out.contains("f (return 2)"), "{out}");
+        assert!(!out.contains("State :: Done"), "{out}");
+    }
+
+    /// Regression: a `?` inside an expression-position `return`'s value
+    /// (the conteff driver shape, `=> return Ok(result?)`). Rewriting
+    /// the return here used to re-parse the `?`'s verbatim exit into an
+    /// `Expr::Return` node, which the opaque rewriter wrapped in a
+    /// second completion — an E0308 in the generated code. The return
+    /// must survive untouched with exactly the `?`'s one exit inside.
+    #[test]
+    fn try_inside_an_arm_return_value_is_rewritten_once() {
+        let out = rewritten(parse_quote!({
+            match step {
+                Complete(result) => return Ok(result?),
+                Yielded(y) => {
+                    let _r = yield_!(y);
+                }
+            }
+        }));
+        assert!(
+            out.contains("return Ok (match :: diapause :: Try :: branch"),
+            "{out}"
+        );
+        // Exactly one completion: the `?`'s own exit. The doubled
+        // rewrite added a second `State :: Done` / `Complete` pair.
+        assert_eq!(out.matches("State :: Done").count(), 1, "{out}");
+        assert_eq!(
+            out.matches(":: diapause :: CoroutineState :: Complete")
+                .count(),
+            1,
+            "{out}"
+        );
     }
 
     #[test]

@@ -1323,9 +1323,10 @@ impl Lowerer {
         self.current = self.new_block(false);
     }
 
-    /// A statement-position `return` ends the block with a `Return`
-    /// terminator, like a valued `break` out of a tail-position loop.
-    /// The early-exit rewriter leaves these in place (see
+    /// A statement-position `return` — including an unbraced match-arm
+    /// body and a branch or function tail — ends the block with a
+    /// `Return` terminator, like a valued `break` out of a tail-position
+    /// loop. The early-exit rewriter leaves every `return` in place (see
     /// `rewrite_early_exits` in `expand.rs`) precisely so the CFG knows
     /// the path ends here: rewriting them into opaque completion code
     /// would leave a false fall-through edge behind, keeping dead
