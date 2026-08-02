@@ -343,10 +343,6 @@ produces a dedicated compile error with the workaround in the message.
   calls on the internal `Try` / `FromResidual` traits (visible
   in error messages when `?` is used on other types); implementing them
   for custom types is not supported.
-- **A body whose every reachable path ends in an explicit `return`** —
-  with the diverging paths containing yields — produces a puzzling
-  `E0308: expected <ret>, found ()` on the unreachable implicit tail.
-  Append `unreachable!()` as the tail expression.
 - **Visibility**: the generated state enum is as public as the function,
   so argument and return types must be at least that visible or rustc
   reports `E0446` (private type in public interface).

@@ -38,6 +38,10 @@ versioned and released together; this changelog covers all three.
   of loop-state variables that plain Rust accepts. A `yield_!` in a
   `return` value with a pure prefix (`return yield_!(x);`) now hoists
   like other expression positions.
+- A body whose every reachable path ends in an explicit `return` (with
+  the diverging paths containing yields) no longer produces the
+  documented `E0308: expected <ret>, found ()` on the unreachable
+  implicit tail; the `unreachable!()` workaround is no longer needed.
 
 ## [0.1.0] - 2026-07-25
 

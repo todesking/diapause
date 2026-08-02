@@ -170,6 +170,78 @@ fn try_inside_a_return_value() {
     assert_eq!(c.resume(0), CoroutineState::Complete(Ok(0)));
 }
 
+/// Every reachable path ends in an explicit `return` (with yields on
+/// the diverging paths). This used to hit the documented E0308
+/// limitation: the open fall-through block was terminated with a
+/// `()`-return that rustc rejected against the declared type; now each
+/// arm's `return` terminates its block and the fall-through block is
+/// unreachable and dropped.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn every_path_returns(flag: bool) -> u32 {
+    if flag {
+        yield_!(1);
+        return 1;
+    } else {
+        yield_!(2);
+        return 2;
+    }
+}
+
+#[test]
+fn all_paths_ending_in_return_need_no_unreachable_tail() {
+    let mut c = every_path_returns(true);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(0), CoroutineState::Complete(1));
+
+    let mut c = every_path_returns(false);
+    assert_eq!(c.start(), CoroutineState::Yielded(2));
+    assert_eq!(c.resume(0), CoroutineState::Complete(2));
+}
+
+/// A yield-free trailing `if` whose arms both `return`: the returns
+/// ride inside the `Return` terminator's value expression and are
+/// rewritten into completion transitions at CFG finalization.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn tail_if_all_return(flag: bool) -> u32 {
+    let r = yield_!(1);
+    if flag {
+        return r;
+    } else {
+        return r + 1;
+    }
+}
+
+#[test]
+fn returns_inside_a_yield_free_tail_expression() {
+    let mut c = tail_if_all_return(true);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(5), CoroutineState::Complete(5));
+
+    let mut c = tail_if_all_return(false);
+    assert_eq!(c.start(), CoroutineState::Yielded(1));
+    assert_eq!(c.resume(5), CoroutineState::Complete(6));
+}
+
+/// A `return` inside a yield value's control flow: the value expression
+/// round-trips through the macro tokens, and the surviving return is
+/// rewritten into a completion at CFG finalization — the coroutine
+/// completes without suspending when that arm is taken.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn return_inside_a_yield_value(flag: bool) -> u32 {
+    let r = yield_!(if flag { return 9 } else { 3 });
+    r + 1
+}
+
+#[test]
+fn yield_value_return_completes_before_suspending() {
+    let mut c = return_inside_a_yield_value(true);
+    assert_eq!(c.start(), CoroutineState::Complete(9));
+
+    let mut c = return_inside_a_yield_value(false);
+    assert_eq!(c.start(), CoroutineState::Yielded(3));
+    assert_eq!(c.resume(5), CoroutineState::Complete(6));
+}
+
 /// A bare `return;` in a unit coroutine terminates the path.
 #[diapause::coroutine(yield = u32, resume = u32)]
 fn bare_return(stop: bool) {

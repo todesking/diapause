@@ -1354,6 +1354,37 @@ fn opaque_return_becomes_a_completion_jump() {
 }
 
 #[test]
+fn leftover_returns_in_an_embedded_expression_are_rewritten() {
+    // A yield-free trailing `if` whose arms both return rides whole
+    // inside the `Return` terminator's value; its `return`s cannot
+    // become terminators or jump markers, so CFG finalization rewrites
+    // them into completion transitions directly.
+    let block: syn::Block = parse_quote!({
+        let r = yield_!(1);
+        if flag {
+            return r;
+        } else {
+            return r + 1;
+        }
+    });
+    let cfg = lower_args(&["flag"], &block);
+    let resume = cfg.blocks.iter().find(|b| b.resume_point).unwrap();
+    let Terminator::Return(e) = &resume.terminator else {
+        panic!(
+            "the tail if should be the return value: {:?}",
+            resume.terminator
+        );
+    };
+    let printed = quote::quote!(#e).to_string();
+    assert_eq!(printed.matches("State :: Done").count(), 2, "{printed}");
+    assert!(printed.contains("let __ret = r ;"), "{printed}");
+    assert!(
+        !printed.contains("return r"),
+        "no raw user return may survive: {printed}"
+    );
+}
+
+#[test]
 fn fn_tail_loop_break_value_returns() {
     let block: syn::Block = parse_quote!({
         loop {

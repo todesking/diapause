@@ -118,7 +118,87 @@ pub fn lower_unsimplified(
         lw.push_arg_pat_let(pat, source);
     }
     lw.lower_fn_body(body);
-    lw.finish()
+    let mut cfg = lw.finish()?;
+    rewrite_leftover_returns(&mut cfg);
+    Ok(cfg)
+}
+
+/// Rewrites `return`s that survived into expressions the lowering embeds
+/// into the CFG verbatim — a decomposed `if`'s condition, a `match`
+/// scrutinee or guard, a yield value, a stored arm value, or the
+/// function's yield-free trailing expression — into the completion
+/// transition directly. Statement-position returns in decomposed
+/// statement lists become `Return` terminators and those inside opaque
+/// statements become completion jump markers before this runs, so only
+/// these embedded expression positions remain; they get the same
+/// final-form transition the early-exit rewriter emits (`__ret` is
+/// unannotated here — lowering does not know the return type — but the
+/// `Complete` constructor pins its type all the same).
+///
+/// The early-exit rewriter's own synthesized exits are skipped: they are
+/// emitted as verbatim statements, but a value that round-trips through
+/// `yield_!` macro tokens (or a `parse_quote!` reconstruction such as a
+/// stored `let`) is re-parsed, turning them back into `Expr::Return`
+/// nodes; those are recognized by their exact
+/// `return ::diapause::CoroutineState::Complete(__ret)` shape (the
+/// `__`-prefixed namespace is reserved by the macro).
+fn rewrite_leftover_returns(cfg: &mut Cfg) {
+    fn is_synthesized_exit(r: &syn::ExprReturn) -> bool {
+        let Some(syn::Expr::Call(c)) = r.expr.as_deref() else {
+            return false;
+        };
+        let syn::Expr::Path(f) = &*c.func else {
+            return false;
+        };
+        f.path.leading_colon.is_some()
+            && f.path.segments.len() == 3
+            && ["diapause", "CoroutineState", "Complete"]
+                .iter()
+                .zip(&f.path.segments)
+                .all(|(name, seg)| seg.ident == name && seg.arguments.is_none())
+            && c.args.len() == 1
+            && matches!(&c.args[0], syn::Expr::Path(a) if a.path.is_ident("__ret"))
+    }
+
+    struct LeftoverReturns;
+    impl syn::visit_mut::VisitMut for LeftoverReturns {
+        fn visit_expr_mut(&mut self, e: &mut syn::Expr) {
+            syn::visit_mut::visit_expr_mut(self, e);
+            if let syn::Expr::Return(r) = e
+                && !is_synthesized_exit(r)
+            {
+                let span = r.return_token.span();
+                let v = r.expr.take().map_or_else(|| unit_expr(span), |b| *b);
+                *e = syn::parse_quote_spanned!(span => {
+                    let __ret = #v;
+                    *self = State::Done;
+                    return ::diapause::CoroutineState::Complete(__ret);
+                });
+            }
+        }
+        skip_nested_scopes!(VisitMut);
+    }
+    use syn::visit_mut::VisitMut;
+    let mut r = LeftoverReturns;
+    for b in &mut cfg.blocks {
+        for s in &mut b.stmts {
+            r.visit_stmt_mut(s);
+        }
+        match &mut b.terminator {
+            Terminator::Branch { cond, .. } => r.visit_expr_mut(cond),
+            Terminator::Match { scrutinee, arms } => {
+                r.visit_expr_mut(scrutinee);
+                for arm in arms {
+                    if let Some(g) = &mut arm.guard {
+                        r.visit_expr_mut(g);
+                    }
+                }
+            }
+            Terminator::Yield { value, .. } => r.visit_expr_mut(value),
+            Terminator::Return(e) | Terminator::Unreachable(e) => r.visit_expr_mut(e),
+            Terminator::Goto(_) | Terminator::IterNext { .. } => {}
+        }
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
