@@ -1,6 +1,7 @@
 //! Opaque statement validation and jump rewriting: `break`/`continue`
-//! escaping an opaque statement into an expanded loop or labeled block
-//! are rewritten into `__diapause_jump!` markers.
+//! escaping an opaque statement into an expanded loop or labeled block,
+//! and `return` (which always escapes, completing the coroutine), are
+//! rewritten into `__diapause_jump!` markers.
 
 use syn::spanned::Spanned;
 use syn::visit::Visit;
@@ -201,6 +202,24 @@ impl OpaqueRewriter<'_> {
         }
     }
 
+    /// The replacement for a `return`: like a valued `break` out of a
+    /// tail-position loop, the value completes the coroutine. A `return`
+    /// always escapes (it targets the function itself), and every
+    /// `Expr::Return` reaching lowering is the user's own — the
+    /// early-exit rewriter emits its synthesized early returns as
+    /// verbatim statements precisely so they cannot be re-rewritten
+    /// here.
+    fn rewrite_return(&mut self, r: &syn::ExprReturn) -> syn::Expr {
+        let span = r.return_token.span();
+        let v = r
+            .expr
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| unit_expr(span));
+        let k = self.new_jump(OpaqueJumpKind::Complete, span);
+        syn::parse_quote_spanned!(span => __diapause_jump!(#k, #v))
+    }
+
     /// The replacement for an escaping `continue`, or `None` to keep it.
     fn rewrite_continue(&mut self, c: &syn::ExprContinue) -> Option<syn::Expr> {
         let (header, _) = self.escaping_frame(&c.label, "continue", c)?;
@@ -223,6 +242,7 @@ impl VisitMut for OpaqueRewriter<'_> {
         let replacement = match e {
             syn::Expr::Break(b) => self.rewrite_break(b),
             syn::Expr::Continue(c) => self.rewrite_continue(c),
+            syn::Expr::Return(r) => Some(self.rewrite_return(r)),
             _ => None,
         };
         if let Some(r) = replacement {

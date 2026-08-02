@@ -620,14 +620,20 @@ fn let_else_becomes_a_refutable_match() {
     let cont = &cfg.blocks[arms[0].body];
     assert_eq!(cont.defs, ids(&[binding(&cfg, "x2")]));
     assert!(matches!(cont.terminator, Terminator::Return(_)));
-    // The `_` arm yields; its resume block ends in the synthetic
-    // unreachable fall-through (the `return;` stays opaque).
+    // The `_` arm yields; its resume block ends in the `return`'s
+    // terminator (the synthetic unreachable fall-through lands in a
+    // fresh block that simplification drops).
     let Terminator::Yield { next, .. } = cfg.blocks[arms[1].body].terminator else {
         panic!("else arm should yield");
     };
     let resume = &cfg.blocks[next];
-    assert_eq!(resume.stmts.len(), 1, "the rewritten `return` stays opaque");
-    assert!(matches!(resume.terminator, Terminator::Unreachable(_)));
+    assert_eq!(resume.stmts.len(), 0, "the `return` becomes a terminator");
+    assert!(matches!(resume.terminator, Terminator::Return(_)));
+    assert!(
+        cfg.blocks
+            .iter()
+            .all(|b| !matches!(&b.terminator, Terminator::Unreachable(_))),
+    );
 }
 
 #[test]
@@ -1260,6 +1266,91 @@ fn fn_tail_if_arms_return() {
             .iter()
             .any(|t| matches!(t, Terminator::Return(e) if *e == two))
     );
+}
+
+#[test]
+fn statement_return_terminates_the_block() {
+    // The `return v;` after the yield ends its block with a `Return`
+    // terminator: no false fall-through edge into the join survives, so
+    // nothing after the `if` looks reachable from the returning path.
+    let block: syn::Block = parse_quote!({
+        let a = n * 2;
+        if n > 0 {
+            let r = yield_!(1);
+            return r;
+        }
+        let r2 = yield_!(a);
+        r2
+    });
+    let cfg = lower_args(&["n"], &block);
+    let resume = cfg
+        .blocks
+        .iter()
+        .find(|b| b.resume_point && b.defs.contains(&binding(&cfg, "r")))
+        .expect("the first yield's resume block");
+    let expected: syn::Expr = parse_quote!(r);
+    assert!(
+        matches!(&resume.terminator, Terminator::Return(e) if *e == expected),
+        "the statement return should terminate the resume block: {:?}",
+        resume.terminator
+    );
+    // `a` is dead on the returning path: the resume block neither uses
+    // nor carries it (liveness would only see it through a false
+    // fall-through edge).
+    assert!(!resume.uses.contains(&binding(&cfg, "a")));
+}
+
+#[test]
+fn return_inside_an_expanded_loop_has_no_backedge() {
+    // The `return`-terminated block must not keep a goto back to the
+    // loop header; the `return` is the loop's only exit.
+    let block: syn::Block = parse_quote!({
+        loop {
+            let r = yield_!(1);
+            if r == 0 {
+                yield_!(2);
+                return r;
+            }
+        }
+    });
+    let cfg = lower_ok(&block);
+    let ret_blocks: Vec<usize> = cfg
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| matches!(b.terminator, Terminator::Return(_)))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(ret_blocks.len(), 1, "only the `return r;` exits the loop");
+    // No block is a successor of the returning block.
+    for b in &cfg.blocks {
+        assert!(!matches!(&b.terminator, Terminator::Unreachable(_)));
+    }
+}
+
+#[test]
+fn opaque_return_becomes_a_completion_jump() {
+    // Without a yield inside the `if`, the statement stays opaque and
+    // the `return` is rewritten into a completion jump marker instead
+    // (the fall-through edge is real here: the branch may not be taken).
+    let block: syn::Block = parse_quote!({
+        let r = yield_!(1);
+        if r == 0 {
+            return r;
+        }
+        f(r);
+    });
+    let cfg = lower_ok(&block);
+    assert_eq!(cfg.opaque_jumps.len(), 1);
+    assert!(matches!(cfg.opaque_jumps[0].kind, OpaqueJumpKind::Complete));
+    let resume = cfg.blocks.iter().find(|b| b.resume_point).unwrap();
+    assert_eq!(resume.jumps, vec![0]);
+    let printed: String = resume
+        .stmts
+        .iter()
+        .map(|s| quote::quote!(#s).to_string())
+        .collect();
+    assert!(printed.contains("__diapause_jump ! (0 , r)"), "{printed}");
 }
 
 #[test]

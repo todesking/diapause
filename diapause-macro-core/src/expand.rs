@@ -1453,6 +1453,35 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
 /// value is evaluated before the state write so a panic inside it (or
 /// inside a `From` conversion) still poisons.
 fn rewrite_early_exits(body: &mut syn::Block, ret_ty: &syn::Type) {
+    /// The completion transition `{ let __ret: T = value; *self =
+    /// State::Done; return Complete(__ret); }`. The `return` is emitted
+    /// as a verbatim statement — not an `Expr::Return` node — so later
+    /// passes can tell synthesized early exits apart from the user's own
+    /// `return`s (lowering's opaque-statement rewriter turns the latter
+    /// into completion jump markers and must leave these alone). The
+    /// printed tokens are identical either way.
+    fn completion_transition(
+        ret_ty: &syn::Type,
+        value: TokenStream,
+        span: proc_macro2::Span,
+    ) -> syn::Expr {
+        let mut block: syn::Block = syn::parse_quote_spanned!(span => {
+            let __ret: #ret_ty = #value;
+            *self = State::Done;
+        });
+        block.stmts.push(syn::Stmt::Expr(
+            syn::Expr::Verbatim(quote::quote_spanned!(span =>
+                return ::diapause::CoroutineState::Complete(__ret)
+            )),
+            Some(syn::Token![;](span)),
+        ));
+        syn::Expr::Block(syn::ExprBlock {
+            attrs: Vec::new(),
+            label: None,
+            block,
+        })
+    }
+
     struct Rewriter<'a> {
         ret_ty: &'a syn::Type,
     }
@@ -1462,31 +1491,41 @@ fn rewrite_early_exits(body: &mut syn::Block, ret_ty: &syn::Type) {
             let ret_ty = self.ret_ty;
             match e {
                 syn::Expr::Return(r) => {
+                    let span = r.return_token.span();
                     let value = r.expr.take().map_or_else(|| quote!(()), |v| quote!(#v));
-                    *e = syn::parse_quote!({
-                        let __ret: #ret_ty = #value;
-                        *self = State::Done;
-                        return ::diapause::CoroutineState::Complete(__ret);
-                    });
+                    *e = completion_transition(ret_ty, value, span);
                 }
                 syn::Expr::Try(t) => {
-                    let operand = &t.expr;
                     // Spanning the generated tokens to the `?` makes a
                     // trait-bound error (unsupported operand type, or a
                     // Result/Option mismatch) point at the offending `?`
                     // instead of the whole attribute.
                     let span = t.question_token.span();
-                    *e = syn::parse_quote_spanned!(span =>
-                        match ::diapause::Try::branch(#operand) {
+                    let exit = completion_transition(
+                        ret_ty,
+                        quote::quote_spanned!(span =>
+                            ::diapause::FromResidual::from_residual(__r)
+                        ),
+                        span,
+                    );
+                    // The exit arm and the operand are grafted in as AST
+                    // nodes rather than interpolated: `parse_quote!`
+                    // would re-parse the verbatim `return`s inside them
+                    // (the exit's own, or a nested `?`'s) into
+                    // `Expr::Return` nodes, losing the synthesized-exit
+                    // marking.
+                    let mut em: syn::ExprMatch = syn::parse_quote_spanned!(span =>
+                        match ::diapause::Try::branch(__operand) {
                             ::core::ops::ControlFlow::Continue(__v) => __v,
-                            ::core::ops::ControlFlow::Break(__r) => {
-                                let __ret: #ret_ty =
-                                    ::diapause::FromResidual::from_residual(__r);
-                                *self = State::Done;
-                                return ::diapause::CoroutineState::Complete(__ret);
-                            }
+                            ::core::ops::ControlFlow::Break(__r) => __exit,
                         }
                     );
+                    let syn::Expr::Call(branch) = &mut *em.expr else {
+                        unreachable!("BUG: the scrutinee is a call by construction")
+                    };
+                    branch.args[0] = (*t.expr).clone();
+                    *em.arms[1].body = exit;
+                    *e = syn::Expr::Match(em);
                 }
                 _ => {}
             }

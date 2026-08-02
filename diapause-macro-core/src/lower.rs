@@ -519,8 +519,12 @@ impl Lowerer {
     }
 
     fn lower_tail_expr(&mut self, stmt: &syn::Stmt, e: &syn::Expr, ctx: TailCtx) {
-        // A trailing `break`/`continue` transfers control like any other.
-        if matches!(e, syn::Expr::Break(_) | syn::Expr::Continue(_)) {
+        // A trailing `break`/`continue`/`return` transfers control like
+        // any other.
+        if matches!(
+            e,
+            syn::Expr::Break(_) | syn::Expr::Continue(_) | syn::Expr::Return(_)
+        ) {
             return self.lower_stmt(stmt);
         }
         match ctx {
@@ -682,6 +686,7 @@ impl Lowerer {
             }
             syn::Stmt::Expr(syn::Expr::Break(b), _) => self.lower_break(b),
             syn::Stmt::Expr(syn::Expr::Continue(c), _) => self.lower_continue(c),
+            syn::Stmt::Expr(syn::Expr::Return(r), _) => self.lower_return(r),
             _ if !contains_yield_stmt(stmt) => self.push_opaque(stmt),
             // From here on the statement contains a yield_! somewhere.
             syn::Stmt::Local(local) if matches!(&local.init, Some(init) if init.diverge.is_some()) =>
@@ -836,11 +841,11 @@ impl Lowerer {
         self.current = else_bb;
         self.in_scope(|lw| lw.lower_stmt_list(&else_block.block.stmts, TailCtx::Discard));
         // In valid code the `else` block diverges, so a fall-through
-        // terminator is unreachable; it only has to typecheck (`return`
-        // is rewritten into an opaque statement before lowering and a
-        // trailing `panic!()` stays opaque, so the block can still look
-        // open here). Invalid, non-diverging code reaches the
-        // `unreachable!` at run time instead of failing to compile.
+        // terminator is unreachable; it only has to typecheck (a
+        // `return` terminates the block but leaves a fresh open one
+        // behind, and a trailing `panic!()` stays opaque, so the block
+        // can still look open here). Invalid, non-diverging code reaches
+        // the `unreachable!` at run time instead of failing to compile.
         if !self.is_current_terminated() {
             self.terminate(Terminator::Unreachable(syn::parse_quote_spanned!(
                 else_token.span() =>
@@ -1222,6 +1227,28 @@ impl Lowerer {
         }
         // Anything after the jump is unreachable; lower it into a fresh
         // block that simplification will drop.
+        self.current = self.new_block(false);
+    }
+
+    /// A statement-position `return` ends the block with a `Return`
+    /// terminator, like a valued `break` out of a tail-position loop.
+    /// The early-exit rewriter leaves these in place (see
+    /// `rewrite_early_exits` in `expand.rs`) precisely so the CFG knows
+    /// the path ends here: rewriting them into opaque completion code
+    /// would leave a false fall-through edge behind, keeping dead
+    /// variables alive across it and keeping loop backedges that make
+    /// rustc reject moves on the returning path.
+    fn lower_return(&mut self, r: &syn::ExprReturn) {
+        let v = r
+            .expr
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| unit_expr(r.return_token.span()));
+        self.check_no_yield(&v, ERR_VALUE_POSITION);
+        self.record_expr_uses(&v, self.current);
+        self.terminate(Terminator::Return(v));
+        // Anything after the return is unreachable; lower it into a
+        // fresh block that simplification will drop.
         self.current = self.new_block(false);
     }
 
