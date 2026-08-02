@@ -185,6 +185,150 @@ fn nested_try_operands() {
     assert_eq!(c.start(), CoroutineState::Complete(Err(ParseError)));
 }
 
+// === `?` on a delegation's completion value ===
+
+/// Errors before its first yield when `s` does not parse.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn try_sub(s: &'static str) -> Result<u32, ParseError> {
+    let x: u32 = parse(s)?;
+    let r = yield_!(x);
+    Ok(x + r)
+}
+
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn delegate_try_let(s: &'static str) -> Result<u32, ParseError> {
+    let sub: try_sub::State = try_sub(s);
+    let v: u32 = yield_all!(sub)?;
+    let r = yield_!(v);
+    Ok(v + r)
+}
+
+#[test]
+fn delegation_try_ok_path() {
+    let mut c = delegate_try_let("7");
+    assert_eq!(c.start(), CoroutineState::Yielded(7)); // sub yields x
+    assert_eq!(c.resume(1), CoroutineState::Yielded(8)); // sub completes Ok(7+1), `?` unwraps
+    assert_eq!(c.resume(2), CoroutineState::Complete(Ok(10)));
+}
+
+#[test]
+fn delegation_try_err_short_circuits() {
+    let mut c = delegate_try_let("x");
+    assert_eq!(c.start(), CoroutineState::Complete(Err(ParseError)));
+}
+
+/// Yields once, then errors on resume: the delegation suspends before
+/// the `?` takes the Err exit.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn yield_then_err(s: &'static str) -> Result<u32, ParseError> {
+    let r = yield_!(0);
+    let x: u32 = parse(s)?;
+    Ok(x + r)
+}
+
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn delegate_try_mid(s: &'static str) -> Result<u32, ParseError> {
+    let sub: yield_then_err::State = yield_then_err(s);
+    let v: u32 = yield_all!(sub)?;
+    Ok(v + 100)
+}
+
+#[test]
+fn delegation_err_after_a_forwarded_yield() {
+    let mut c = delegate_try_mid("x");
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(1), CoroutineState::Complete(Err(ParseError)));
+}
+
+/// A completing delegation `?` transitions to Done like any completion.
+#[test]
+#[should_panic(expected = "Already done")]
+fn resume_after_delegation_try_exit_panics() {
+    let mut c = delegate_try_mid("x");
+    let _ = c.start();
+    let _ = c.resume(1);
+    let _ = c.resume(2);
+}
+
+/// Statement position: the Ok value (a non-`()` `u32`) is discarded,
+/// the Err still exits early.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn delegate_try_stmt(s: &'static str) -> Result<u32, ParseError> {
+    let sub: try_sub::State = try_sub(s);
+    yield_all!(sub)?;
+    Ok(1)
+}
+
+#[test]
+fn statement_position_delegation_try() {
+    let mut c = delegate_try_stmt("7");
+    assert_eq!(c.start(), CoroutineState::Yielded(7));
+    assert_eq!(c.resume(1), CoroutineState::Complete(Ok(1)));
+
+    let mut c = delegate_try_stmt("x");
+    assert_eq!(c.start(), CoroutineState::Complete(Err(ParseError)));
+}
+
+/// Tail position: the delegate completes with a nested
+/// `Result<Result<u32, _>, _>`; the `?` unwraps the outer layer and the
+/// inner Result is the coroutine's completion value.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn nested_result_sub(s: &'static str) -> Result<Result<u32, ParseError>, ParseError> {
+    let r = yield_!(0);
+    let x: u32 = parse(s)?;
+    Ok(Ok(x + r))
+}
+
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn delegate_try_tail(s: &'static str) -> Result<u32, ParseError> {
+    let sub: nested_result_sub::State = nested_result_sub(s);
+    yield_all!(sub)?
+}
+
+#[test]
+fn tail_position_delegation_try() {
+    let mut c = delegate_try_tail("7");
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(1), CoroutineState::Complete(Ok(8)));
+
+    let mut c = delegate_try_tail("x");
+    assert_eq!(c.start(), CoroutineState::Yielded(0));
+    assert_eq!(c.resume(1), CoroutineState::Complete(Err(ParseError)));
+}
+
+/// The `box` modifier combines with `?`.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn delegate_try_boxed(s: &'static str) -> Result<u32, ParseError> {
+    let sub: try_sub::State = try_sub(s);
+    let v: u32 = yield_all!(box sub)?;
+    Ok(v)
+}
+
+#[test]
+fn boxed_delegation_try() {
+    let mut c = delegate_try_boxed("7");
+    assert_eq!(c.start(), CoroutineState::Yielded(7));
+    assert_eq!(c.resume(1), CoroutineState::Complete(Ok(8)));
+
+    let mut c = delegate_try_boxed("x");
+    assert_eq!(c.start(), CoroutineState::Complete(Err(ParseError)));
+}
+
+/// `yield_all_resume!` combines with `?` the same way.
+#[diapause::coroutine(yield = u32, resume = u32)]
+fn delegate_resume_try(sub: try_sub::State, first: u32) -> Result<u32, ParseError> {
+    let v: u32 = yield_all_resume!(sub, first)?;
+    Ok(v * 10)
+}
+
+#[test]
+fn resume_delegation_try() {
+    let mut sub = try_sub("7");
+    assert_eq!(sub.start(), CoroutineState::Yielded(7));
+    let mut c = delegate_resume_try(sub, 1); // sub completes Ok(7+1) on entry
+    assert_eq!(c.start(), CoroutineState::Complete(Ok(80)));
+}
+
 /// `?` inside a closure belongs to the closure, not the coroutine.
 #[diapause::coroutine(yield = u32)]
 fn closure_try(s: &'static str) -> u32 {
