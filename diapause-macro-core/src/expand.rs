@@ -923,7 +923,19 @@ impl Codegen<'_> {
             }
             Terminator::Return(e) => {
                 let ret_ty = self.ret_ty;
+                // The completion value is bound before the state is
+                // marked `Done` so that a panic in it still leaves the
+                // placeholder behind. That puts the user's expression in
+                // value position, where a deliberately diverging one
+                // (`unreachable!()` after a yield that is never resumed,
+                // a `-> !` helper) trips
+                // `clippy::diverging_sub_expression` on the user's own
+                // span and fails `-D warnings` builds -- even though the
+                // same expression is fine as the tail of a plain `fn`.
+                // The allow is scoped to this binding, so the lint still
+                // fires on sub-expressions elsewhere in the body.
                 quote! {
+                    #[allow(clippy::diverging_sub_expression)]
                     let __ret: #ret_ty = #e;
                     *self = State::Done;
                     return ::diapause::CoroutineState::Complete(__ret);
