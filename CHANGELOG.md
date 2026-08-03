@@ -24,6 +24,17 @@ versioned and released together; this changelog covers all three.
   boxed only if it actually suspends, so completing on entry never
   allocates. Gated behind a new `alloc` feature (enabled by default),
   which also adds a `Coroutine` forwarding impl for `Box<C>`.
+- `yield_all!` now takes a direct call of a coroutine function as its
+  operand (`yield_all!(sub(x))`), not only a variable: the delegate's
+  type is derived from the callee path as `sub::State`, with a
+  turbofish carried over as its type arguments (`sub::<u32>(x)` gives
+  `sub::State<u32>`). The `box` modifier, a trailing `?`, and every
+  supported position compose with the new form. A callee that is not a
+  coroutine leaves `sub::State` unresolved — a compile error, not a
+  silently wrong program; a generic coroutine called without a
+  turbofish and a coroutine taking a reference still need the two-line
+  form. `yield_all_resume!` keeps the variable-only operand, since a
+  freshly called coroutine is never started.
 - The `?` operator can now be applied directly to a delegation
   (`let v: T = yield_all!(sub)?;`, `yield_all_resume!(sub, rv)?;`,
   `box` modifier included) in every position the macros support: a

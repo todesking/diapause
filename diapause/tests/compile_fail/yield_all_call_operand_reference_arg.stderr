@@ -1,0 +1,10 @@
+error[E0106]: missing lifetime specifier
+  --> tests/compile_fail/yield_all_call_operand_reference_arg.rs:13:29
+   |
+13 |     let v: u32 = yield_all!(sub(x));
+   |                             ^^^ expected named lifetime parameter
+   |
+help: consider using the `'a` lifetime
+   |
+13 |     let v: u32 = yield_all!(sub<'a>(x));
+   |                                ++++

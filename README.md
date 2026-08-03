@@ -80,7 +80,10 @@ any code. `start()` runs the body up to the first `yield_!`; each
   resume value is forwarded back in, and the expression evaluates to
   its completion value (Python's `yield from`). The inner state enum is
   stored by value inside the outer one — no boxing — so `Clone` and
-  serde derives compose across arbitrary nesting depth.
+  serde derives compose across arbitrary nesting depth. The operand is
+  a variable holding the coroutine or a direct call of a coroutine
+  function (`yield_all!(sub(x))`), whose delegate type is derived from
+  the callee.
   `yield_all_resume!(sub, rv)` delegates to a coroutine that is already
   started (e.g. one deserialized mid-run), entering with `resume(rv)`
   instead of `start()`. A `?` applied to the delegation
@@ -147,8 +150,10 @@ fn chunk(start: u32) -> u32 {
 #[diapause::coroutine(yield = u32, resume = u32)]
 #[derive(Serialize, Deserialize)]
 fn totals(n: u32) -> u32 {
-    let sub: chunk::State = chunk(n); // bind with a type annotation
-    let first: u32 = yield_all!(sub); // run `sub` to completion
+    // Delegating to a fresh `chunk`: the delegate's type is derived
+    // from the callee (`chunk::State`). Equivalently, in two lines:
+    // `let sub: chunk::State = chunk(n); let first: u32 = yield_all!(sub);`
+    let first: u32 = yield_all!(chunk(n)); // run a `chunk` to completion
     let again = yield_!(first);
     first + again
 }
@@ -157,7 +162,7 @@ fn main() {
     let mut c = totals(5);
     assert_eq!(c.start(), CoroutineState::Yielded(5)); // chunk's yield
 
-    // Suspended inside `sub`: the outer state holds the inner state as
+    // Suspended inside the delegation: the outer state holds the inner state as
     // an ordinary nested value, so persistence works across the nesting.
     let json = serde_json::to_string(&c).unwrap();
     let mut restored: totals::State = serde_json::from_str(&json).unwrap();
@@ -296,15 +301,28 @@ produces a dedicated compile error with the workaround in the message.
 - **Let chains are unsupported**: an `if`/`while` whose body contains a
   `yield_!` cannot use an edition-2024 let chain
   (`if let P = e && cond`); use nested `if let` or `match` instead.
-- **`yield_all!` takes a variable, not an expression**: the operand must
-  be a variable with a syntactically known type
-  (`let sub: chunk::State = chunk(..); ... yield_all!(sub)` — the state
-  stores the inner coroutine, so its type must be spellable). Its yield
-  and resume types must match the outer coroutine's; mismatches surface
-  as ordinary type errors. The inner coroutine must not have been
-  started yet (`start()` panics otherwise; use
-  `yield_all_resume!(sub, rv)` for a started one — its resume value may
-  be any expression not containing `yield_!`). Supported positions are
+- **`yield_all!` takes a variable or a coroutine call, not an arbitrary
+  expression**: the state stores the inner coroutine, so its type must
+  be spellable — either from a variable with a syntactically known type
+  (`let sub: chunk::State = chunk(..); ... yield_all!(sub)`) or from the
+  callee of a direct call, which is turned into the state type
+  (`yield_all!(chunk(n))` stores a `chunk::State`, `f::<u32>(x)` an
+  `f::State<u32>`; `use m::f as g;` works too, since the import brings
+  both the function and the module of the same name into scope). A
+  callee that is not a coroutine leaves `f::State` unresolved — a
+  compile error, never a silently wrong program. Two cases still need
+  the two-line form: a generic coroutine whose type parameters the call
+  does not spell (add a turbofish, or annotate the binding), and a
+  coroutine taking a reference, whose state is generic over a lifetime
+  that the outer state cannot elide (`let sub: chunk::State<'a> = ..`).
+  Anything else — a method call, a call through a qualified path, a
+  computed callee — must be bound first. Its yield and resume types
+  must match the outer coroutine's; mismatches surface as ordinary type
+  errors. The inner coroutine must not have been started yet (`start()`
+  panics otherwise); `yield_all_resume!(sub, rv)` enters a started one
+  instead, and takes a variable only — a freshly called coroutine is
+  never started — with a resume value that may be any expression not
+  containing `yield_!`. Supported positions are
   the same as for value-producing control flow: a statement
   (`yield_all!(sub);`, completion value discarded), a whole `let`
   initializer, or a trailing expression — of the function body, or of

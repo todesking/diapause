@@ -1,0 +1,30 @@
+error[E0277]: the trait bound `u32: diapause::Coroutine<_>` is not satisfied
+ --> tests/compile_fail/yield_all_non_coroutine_call.rs:9:29
+  |
+9 |     let v: u32 = yield_all!(make());
+  |                             ^^^^ the trait `diapause::Coroutine<_>` is not implemented for `u32`
+  |
+help: the following other types implement trait `diapause::Coroutine<R>`
+ --> tests/compile_fail/yield_all_non_coroutine_call.rs:7:1
+  |
+7 |   #[diapause::coroutine(yield = u32)]
+  |   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `State` implements `diapause::Coroutine`
+  |
+ ::: src/lib.rs
+  |
+  | / impl<C, R> Coroutine<R> for &mut C
+  | | where
+  | |     C: Coroutine<R> + ?Sized,
+  | |_____________________________^ `&mut C` implements `diapause::Coroutine<R>`
+...
+  | / impl<C, R> Coroutine<R> for alloc::boxed::Box<C>
+  | | where
+  | |     C: Coroutine<R> + ?Sized,
+  | |_____________________________^ `Box<C>` implements `diapause::Coroutine<R>`
+  = note: this error originates in the attribute macro `diapause::coroutine` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0433]: cannot find module or crate `make` in this scope
+ --> tests/compile_fail/yield_all_non_coroutine_call.rs:9:29
+  |
+9 |     let v: u32 = yield_all!(make());
+  |                             ^^^^ function `make` is not a crate or module

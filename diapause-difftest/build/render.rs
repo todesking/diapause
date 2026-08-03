@@ -189,10 +189,16 @@ fn render_body(body: &Body, level: usize, ctx: Ctx) -> String {
             let sub_mod = format!("crate::case_{sub_case:03}");
             match ctx.world {
                 World::Coroutine => {
-                    out.push_str(&format!(
-                        "{i}let {sub_var}: {sub_mod}::co::State = {sub_mod}::co({call});\n"
-                    ));
-                    out.push_str(&format!("{i}yield_all!({sub_var})\n"));
+                    let operand = match sub_var {
+                        Some(v) => {
+                            out.push_str(&format!(
+                                "{i}let {v}: {sub_mod}::co::State = {sub_mod}::co({call});\n"
+                            ));
+                            v.clone()
+                        }
+                        None => format!("{sub_mod}::co({call})"),
+                    };
+                    out.push_str(&format!("{i}yield_all!({operand})\n"));
                 }
                 World::Reference => {
                     out.push_str(&format!("{i}{sub_mod}::reference({call})\n"));
@@ -640,24 +646,30 @@ fn render_stmt(out: &mut String, s: &Stmt, l: usize, ctx: Ctx) {
             let sub_mod = format!("crate::case_{sub_case:03}");
             match ctx.world {
                 World::Coroutine => {
-                    out.push_str(&format!(
-                        "{i}let {sub_var}: {sub_mod}::co::State = {sub_mod}::co({call});\n"
-                    ));
+                    let operand = match sub_var {
+                        Some(v) => {
+                            out.push_str(&format!(
+                                "{i}let {v}: {sub_mod}::co::State = {sub_mod}::co({call});\n"
+                            ));
+                            v.clone()
+                        }
+                        None => format!("{sub_mod}::co({call})"),
+                    };
                     match bind {
                         DelegateBind::Discard => {
-                            out.push_str(&format!("{i}yield_all!({sub_var});\n"));
+                            out.push_str(&format!("{i}yield_all!({operand});\n"));
                         }
                         DelegateBind::U32(name) => {
-                            out.push_str(&format!("{i}let {name}: u32 = yield_all!({sub_var});\n"));
+                            out.push_str(&format!("{i}let {name}: u32 = yield_all!({operand});\n"));
                         }
                         DelegateBind::Opt(name) => {
                             out.push_str(&format!(
-                                "{i}let mut {name}: Option<u32> = yield_all!({sub_var});\n"
+                                "{i}let mut {name}: Option<u32> = yield_all!({operand});\n"
                             ));
                         }
                         DelegateBind::Res(name) => {
                             out.push_str(&format!(
-                                "{i}let {name}: Result<u32, diapause_difftest::Err1> = yield_all!({sub_var});\n"
+                                "{i}let {name}: Result<u32, diapause_difftest::Err1> = yield_all!({operand});\n"
                             ));
                         }
                     }

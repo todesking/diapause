@@ -1,0 +1,5 @@
+error: yield_all! takes a variable holding the coroutine to delegate to, or a direct call of a coroutine function (`yield_all!(make_sub(..))`); for any other expression bind it first: `let sub: SubTy = ..;` and then `yield_all!(sub)`
+  --> tests/compile_fail/yield_all_method_call_operand.rs:11:29
+   |
+11 |     let v: u32 = yield_all!(f.make());
+   |                             ^^^^^^^^

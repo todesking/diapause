@@ -459,7 +459,11 @@ pub enum Stmt {
         /// Argument-list shape of the sub-case, captured at generation
         /// time so the renderer can format the call.
         sub_shape: ArgShape,
-        sub_var: String,
+        /// The variable the sub-coroutine is bound to before being
+        /// delegated to; `None` selects the call-operand form
+        /// (`yield_all!(case_003::co(..))`), which derives the delegate
+        /// type from the callee path instead.
+        sub_var: Option<String>,
         /// One expression per u32 value (`sub_shape.arity()` of them),
         /// each reduced mod 16.
         args: Vec<Expr>,
@@ -498,7 +502,8 @@ pub enum Tail {
     Delegate {
         sub_case: usize,
         sub_shape: ArgShape,
-        sub_var: String,
+        /// `None` selects the call-operand form (see `Stmt::Delegate`).
+        sub_var: Option<String>,
         args: Vec<Expr>,
     },
 }

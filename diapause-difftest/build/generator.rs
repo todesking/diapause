@@ -26,7 +26,9 @@
 //!   chained through other delegating cases) is generated only while
 //!   the current case's bound stays under [`YIELD_BOUND`], so trace
 //!   lengths cannot run away; its arguments are reduced mod 16 so
-//!   argument-bounded loops in the sub-case stay small.
+//!   argument-bounded loops in the sub-case stay small. Each delegation
+//!   picks one of the two operand forms — a bound variable or the
+//!   sub-case's call — which must drive the sub-coroutine identically.
 
 use crate::ast::*;
 use crate::rng::Rng;
@@ -219,7 +221,7 @@ impl<'a> Gen<'a> {
                 let sub_shape = self.prior[sub_case].shape;
                 self.bound += self.prior[sub_case].bound;
                 let args = self.gen_delegate_args(sub_shape);
-                let sub_var = self.fresh("s");
+                let sub_var = self.gen_delegate_operand();
                 return Tail::Delegate {
                     sub_case,
                     sub_shape,
@@ -1254,7 +1256,7 @@ impl<'a> Gen<'a> {
         let sub_shape = self.prior[sub_case].shape;
         self.bound += self.loop_mult * self.prior[sub_case].bound;
         let args = self.gen_delegate_args(sub_shape);
-        let sub_var = self.fresh("s");
+        let sub_var = self.gen_delegate_operand();
         // A unit completion value is not worth binding.
         let bind = if sub_flavor == Flavor::Unit || self.rng.chance(1, 3) {
             DelegateBind::Discard
@@ -1286,6 +1288,18 @@ impl<'a> Gen<'a> {
             sub_var,
             args,
             bind,
+        }
+    }
+
+    /// The delegation's operand form: a variable bound to the
+    /// sub-coroutine, or (`None`) the call operand `yield_all!(co(..))`,
+    /// whose delegate type comes from the callee path. Both must drive
+    /// the sub-case identically.
+    fn gen_delegate_operand(&mut self) -> Option<String> {
+        if self.rng.chance(1, 2) {
+            None
+        } else {
+            Some(self.fresh("s"))
         }
     }
 
