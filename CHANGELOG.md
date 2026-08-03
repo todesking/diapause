@@ -10,6 +10,8 @@ versioned and released together; this changelog covers all three.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-04
+
 ### Added
 
 - `yield_all_resume!(sub, rv)` delegation to an already-started
@@ -135,5 +137,6 @@ Initial release.
 - `in_place = false` attribute argument to disable the optimization per
   coroutine, restoring the poison-on-panic guarantee everywhere.
 
-[Unreleased]: https://github.com/todesking/diapause/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/todesking/diapause/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/todesking/diapause/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/todesking/diapause/releases/tag/v0.1.0

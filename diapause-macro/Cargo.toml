@@ -12,6 +12,6 @@ categories = ["development-tools::procedural-macro-helpers"]
 proc-macro = true
 
 [dependencies]
-diapause-macro-core = { path = "../diapause-macro-core", version = "0.1.0" }
+diapause-macro-core = { path = "../diapause-macro-core", version = "0.2.0" }
 syn = { version = "2", features = ["full"] }
 proc-macro2 = "1"

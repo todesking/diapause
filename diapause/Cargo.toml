@@ -18,7 +18,7 @@ default = ["alloc"]
 alloc = []
 
 [dependencies]
-diapause-macro = { path = "../diapause-macro", version = "0.1.0" }
+diapause-macro = { path = "../diapause-macro", version = "0.2.0" }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

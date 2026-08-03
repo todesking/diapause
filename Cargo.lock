@@ -209,7 +209,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "diapause"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "diapause-macro",
  "serde",
@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "diapause-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "corosensei",
  "criterion",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "diapause-difftest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "diapause",
  "proptest",
@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "diapause-macro"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "diapause-macro-core",
  "proc-macro2",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "diapause-macro-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -259,14 +259,14 @@ dependencies = [
 
 [[package]]
 name = "diapause-no-std-test"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "diapause",
 ]
 
 [[package]]
 name = "diapause-playground"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "diapause-macro-core",
  "js-sys",
