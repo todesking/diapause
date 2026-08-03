@@ -532,9 +532,16 @@ macro_rules! yield_ {
 /// started yet (`start` panics otherwise) — delegate to an
 /// already-started coroutine with [`yield_all_resume!`].
 ///
-/// The operand must be a variable whose type is syntactically known
-/// (bind the coroutine with a type annotation first); passing an
-/// arbitrary expression is a compile error. Supported positions are a
+/// The operand is either a variable whose type is syntactically known
+/// (bind the coroutine with a type annotation first) or a direct call
+/// of a coroutine function — `yield_all!(sub(x))`, whose delegate type
+/// is derived from the callee path as `sub::State`, carrying a
+/// turbofish over as its arguments (`sub::<u32>(x)` gives
+/// `sub::State<u32>`). Two shapes are not derivable and need the
+/// variable form: a generic coroutine called without a turbofish, and
+/// one taking a reference (its state is generic over a lifetime the
+/// outer state cannot elide). Any other expression is a compile error.
+/// Supported positions are a
 /// statement (`yield_all!(sub);`, completion value discarded), a whole
 /// `let` initializer (`let x = yield_all!(sub);` — the binding's type
 /// is derived from the operand, an explicit annotation wins), and a
@@ -567,8 +574,7 @@ macro_rules! yield_ {
 /// fn countdown(n: u32) {
 ///     yield_!(n);
 ///     if n > 0 {
-///         let sub: countdown::State = countdown(n - 1);
-///         yield_all!(box sub);
+///         yield_all!(box countdown(n - 1));
 ///     }
 /// }
 ///
@@ -630,8 +636,10 @@ macro_rules! yield_all {
 /// # }
 /// ```
 ///
-/// The first operand follows [`yield_all!`]'s rule: a variable whose
-/// type is syntactically known. The resume value may be any expression
+/// The first operand must be a variable whose type is syntactically
+/// known — [`yield_all!`]'s call form has no meaning here, since a
+/// freshly called coroutine is never started. The resume value may be
+/// any expression
 /// not containing `yield_!`; it is consumed by the first `resume` call
 /// before any suspension and is never stored in the state. The
 /// supported positions are the same: a statement

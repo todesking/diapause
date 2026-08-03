@@ -70,6 +70,21 @@ list".
 - Multiple independent errors are all reported (combined via
   `syn::Error::combine`), not just the first.
 
+## Errors left to rustc
+
+Some restrictions are cheaper to enforce by generating code that fails
+to compile than by checking them in the macro — but only when the
+resulting error lands on the user's own tokens. `yield_all!`'s call
+operand is the case to keep in mind: the delegate's type is derived from
+the callee path (`sub(x)` -> `sub::State`), so a callee that is not a
+coroutine leaves `sub::State` unresolved, and a coroutine taking a
+reference leaves its state's lifetime unspecified. Both errors are
+rustc's (E0433 / E0106), both point at the callee the user wrote, and
+both are answered by the two-line form
+(`let sub: SubTy = ..; yield_all!(sub)`), which the macro's own operand
+error already spells out. Such cases still get a trybuild fixture, so
+the message a user actually sees is recorded.
+
 ## Testing
 
 - Every user-facing diagnostic has a trybuild case under
