@@ -1,0 +1,5 @@
+error: yield_! in the operand of yield_all! is not supported; bind it first: `let r = yield_!(..);` and pass `r` to the coroutine function
+ --> tests/compile_fail/yield_all_yield_in_call_operand.rs:9:29
+  |
+9 |     let v: u32 = yield_all!(sub(yield_!(1)));
+  |                             ^^^^^^^^^^^^^^^

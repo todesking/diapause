@@ -1,5 +1,0 @@
-error: yield_all! takes a single variable holding the coroutine to delegate to; bind it first: `let sub: SubTy = make_sub(..);` and then `yield_all!(sub)`
- --> tests/compile_fail/yield_all_boxed_direct_expression.rs:9:33
-  |
-9 |     let v: u32 = yield_all!(box sub());
-  |                                 ^^^^^
