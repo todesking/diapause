@@ -525,9 +525,13 @@ const ERR_BREAK_VALUE: &str = "`break` with a value can only target a loop conta
      yield_! when the loop is a `let` initializer or the function's trailing \
      expression; otherwise assign the value to a variable declared before the loop \
      and `break;` without one";
-const ERR_YIELD_ALL_OPERAND: &str = "yield_all! takes a single variable holding the \
-     coroutine to delegate to; bind it first: `let sub: SubTy = make_sub(..);` and then \
-     `yield_all!(sub)`";
+const ERR_YIELD_ALL_OPERAND: &str = "yield_all! takes a variable holding the coroutine \
+     to delegate to, or a direct call of a coroutine function \
+     (`yield_all!(make_sub(..))`); for any other expression bind it first: \
+     `let sub: SubTy = ..;` and then `yield_all!(sub)`";
+const ERR_YIELD_ALL_OPERAND_VALUE: &str = "yield_! in the operand of yield_all! is not \
+     supported; bind it first: `let r = yield_!(..);` and pass `r` to the coroutine \
+     function";
 const ERR_YIELD_ALL_POSITION: &str = "yield_all! is only supported in statement \
      position (`yield_all!(sub);`), as a whole `let` initializer, or as a trailing \
      expression — of the function body, or of a block, `if`/`else` branch, or match \
@@ -535,7 +539,9 @@ const ERR_YIELD_ALL_POSITION: &str = "yield_all! is only supported in statement 
      by `?` (`let v: T = yield_all!(sub)?;`)";
 const ERR_YIELD_ALL_RESUME_OPERAND: &str = "yield_all_resume! takes a variable holding \
      the started coroutine to delegate to and the resume value to enter it with: \
-     `yield_all_resume!(sub, rv)`; bind the coroutine first: `let sub: SubTy = ..;`";
+     `yield_all_resume!(sub, rv)`; bind the coroutine first: `let sub: SubTy = ..;`. \
+     A call is not accepted here — a freshly created coroutine is not started; \
+     delegate to it with `yield_all!(make_sub(..))`";
 const ERR_YIELD_ALL_RESUME_POSITION: &str = "yield_all_resume! is only supported in \
      statement position (`yield_all_resume!(sub, rv);`), as a whole `let` initializer, \
      or as a trailing expression — of the function body, or of a block, `if`/`else` \
@@ -996,8 +1002,12 @@ impl Lowerer {
     /// `yield_all!(g)` / `yield_all_resume!(g, rv)` — delegates to the
     /// coroutine held by the variable `g`: each inner yield is forwarded
     /// to the caller, each resume value is forwarded back in, and the
-    /// inner completion value is the expansion's value. Desugared into
-    /// source that the ordinary machinery lowers:
+    /// inner completion value is the expansion's value. `yield_all!`
+    /// also takes a direct call of a coroutine function
+    /// (`yield_all!(foo(x))`), which drives the call's result under the
+    /// derived type `foo::State` — the desugaring below is identical,
+    /// with the call in place of `g`. Desugared into source that the
+    /// ordinary machinery lowers:
     ///
     /// ```text
     /// let mut __dg0 = g;
@@ -1050,10 +1060,12 @@ impl Lowerer {
     /// ```
     ///
     /// Only `__dg{k}` and `__rv{k}` are live at the delegation loop's
-    /// header: the coroutine's type follows the operand variable (the
-    /// usual known-variable move rule — hence the variable-only operand
-    /// restriction) and the resume value's type defaults to the outer
-    /// resume type like any resume binding. Everything else (`__y{k}`,
+    /// header: the coroutine's type follows the operand — the usual
+    /// known-variable move rule for a variable operand, the derived
+    /// `foo::State` for a call operand (`call_state_ty`), which is why
+    /// the operand is restricted to those two forms — and the resume
+    /// value's type defaults to the outer resume type like any resume
+    /// binding. Everything else (`__y{k}`,
     /// `__v{k}`) is consumed before the next transition. A yield/resume
     /// type mismatch between the inner and outer coroutine surfaces as
     /// an ordinary type error in the generated code.
@@ -1087,9 +1099,25 @@ impl Lowerer {
             return self.err(syn::Error::new(mac.span(), operand_err));
         }
         let inner = strip_parens(&args[0]);
-        if !matches!(inner, syn::Expr::Path(p) if p.qself.is_none() && p.path.get_ident().is_some())
-        {
+        // Two operand forms: a variable holding the coroutine (the type
+        // follows the binding), or — for `yield_all!` only — a direct
+        // call of a coroutine function, whose delegate type is derived
+        // from the callee path (`foo(x)` -> `foo::State`). An already
+        // started coroutine is what `yield_all_resume!` delegates to, so
+        // a fresh call there is meaningless and stays rejected.
+        let is_var = matches!(inner, syn::Expr::Path(p) if p.qself.is_none() && p.path.get_ident().is_some());
+        let call_ty = if resume_form {
+            None
+        } else {
+            call_state_ty(inner)
+        };
+        if !is_var && call_ty.is_none() {
             return self.err(syn::Error::new_spanned(inner, operand_err));
+        }
+        // The operand is emitted as the initializer of the synthetic
+        // delegate `let`, which is never lowered as a yield position.
+        if contains_yield_expr(inner) {
+            return self.err(syn::Error::new_spanned(inner, ERR_YIELD_ALL_OPERAND_VALUE));
         }
         let entry_rv = resume_form.then(|| args[1].clone());
         if let Some(rv0) = &entry_rv
@@ -1185,7 +1213,10 @@ impl Lowerer {
             } else {
                 BindingKind::Delegate
             };
-            let ty = lw.infer_ty_source(inner);
+            let ty = match &call_ty {
+                Some(t) => TySource::Known(t.clone()),
+                None => lw.infer_ty_source(inner),
+            };
             // An unannotated destination binding gets the delegation's
             // completion type, `<C as Coroutine<R>>::Return` (an
             // explicit annotation wins). This is what lets the value
@@ -1456,6 +1487,51 @@ impl Lowerer {
         }
         self.blocks[self.current].stmts.push(stmt);
     }
+}
+
+/// The delegate type derived from `yield_all!`'s call-expression
+/// operand: the callee path with a `State` segment appended, carrying a
+/// turbofish over as the state's type arguments — `foo(x)` gives
+/// `foo::State`, `foo::<u32>(x)` gives `foo::State<u32>`, `m::foo(x)`
+/// gives `m::foo::State`. This is exactly the type the `#[coroutine]`
+/// expansion gives the starter function's return, so an alias
+/// (`use m::foo as f;`) resolves too: the import brings both the
+/// function and the module of the same name into scope.
+///
+/// `None` for anything but a call whose callee is a plain path: a
+/// method call, a call through a `<T as Tr>::` qualified path, or a
+/// call of something computed. A non-coroutine function passes this
+/// test and produces an unresolved `f::State` in the generated code —
+/// a type error naming the operand, never silently wrong behavior.
+fn call_state_ty(expr: &syn::Expr) -> Option<syn::Type> {
+    let syn::Expr::Call(call) = expr else {
+        return None;
+    };
+    let syn::Expr::Path(callee) = strip_parens(&call.func) else {
+        return None;
+    };
+    if callee.qself.is_some() {
+        return None;
+    }
+    let mut path = callee.path.clone();
+    let last = path.segments.last_mut()?;
+    let span = last.ident.span();
+    let arguments = match std::mem::take(&mut last.arguments) {
+        syn::PathArguments::None => syn::PathArguments::None,
+        // `foo::<T>(x)`: the same arguments, minus the turbofish's
+        // `::`, which a type path does not need.
+        syn::PathArguments::AngleBracketed(mut ab) => {
+            ab.colon2_token = None;
+            syn::PathArguments::AngleBracketed(ab)
+        }
+        // `Fn(A) -> B` sugar cannot appear in a call's callee.
+        syn::PathArguments::Parenthesized(_) => return None,
+    };
+    path.segments.push(syn::PathSegment {
+        ident: syn::Ident::new("State", span),
+        arguments,
+    });
+    Some(syn::Type::Path(syn::TypePath { qself: None, path }))
 }
 
 fn is_block_like(e: &syn::Expr) -> bool {

@@ -2087,17 +2087,130 @@ fn unannotated_delegation_destination_follows_the_operand() {
     assert!(matches!(&cfg.bindings[r.0].ty, TySource::Known(_)));
 }
 
+/// The call-expression operand: the delegate's type is derived from
+/// the callee path instead of following an operand variable.
 #[test]
-fn yield_all_direct_expression_is_rejected() {
+fn yield_all_call_operand_derives_the_delegate_type() {
     let block: syn::Block = parse_quote!({
-        yield_all!(mk());
+        yield_all!(mk(1, 2));
+    });
+    let cfg = lower_ok(&block);
+    let dg = binding(&cfg, "__dg0");
+    assert_eq!(cfg.bindings[dg.0].kind, BindingKind::Delegate);
+    let expected: syn::Type = parse_quote!(mk::State);
+    assert!(matches!(&cfg.bindings[dg.0].ty, TySource::Known(t) if *t == expected));
+    // The call itself is the delegate let's initializer, so its
+    // arguments' uses are recorded like any other statement's.
+    let block: syn::Block = parse_quote!({
+        let a: u32 = 1;
+        yield_all!(mk(a));
+        f(a);
+    });
+    let cfg = lower_ok(&block);
+    let a = binding(&cfg, "a");
+    assert!(cfg.blocks.iter().any(|b| b.uses.contains(&a)));
+}
+
+/// A turbofish on the callee becomes the state type's arguments, and a
+/// multi-segment callee keeps its prefix.
+#[test]
+fn yield_all_call_operand_carries_over_the_turbofish() {
+    let block: syn::Block = parse_quote!({
+        yield_all!(mk::<u32>(1));
+    });
+    let cfg = lower_ok(&block);
+    let expected: syn::Type = parse_quote!(mk::State<u32>);
+    let dg = binding(&cfg, "__dg0");
+    assert!(matches!(&cfg.bindings[dg.0].ty, TySource::Known(t) if *t == expected));
+    let block: syn::Block = parse_quote!({
+        yield_all!(m::mk(1));
+    });
+    let cfg = lower_ok(&block);
+    let expected: syn::Type = parse_quote!(m::mk::State);
+    let dg = binding(&cfg, "__dg0");
+    assert!(matches!(&cfg.bindings[dg.0].ty, TySource::Known(t) if *t == expected));
+}
+
+/// A boxed call operand keeps the lazy-boxing shape: the call drives
+/// the unboxed `__co0`, whose derived type the `Box` wraps.
+#[test]
+fn yield_all_boxed_call_operand_boxes_the_derived_type() {
+    let block: syn::Block = parse_quote!({
+        yield_all!(box mk(1));
+    });
+    let cfg = lower_ok(&block);
+    let co = binding(&cfg, "__co0");
+    let expected: syn::Type = parse_quote!(mk::State);
+    assert!(matches!(&cfg.bindings[co.0].ty, TySource::Known(t) if *t == expected));
+    let dg = binding(&cfg, "__dg0");
+    assert!(matches!(&cfg.bindings[dg.0].ty,
+        TySource::Boxed(inner) if matches!(**inner, TySource::Moved(id) if id == co)));
+}
+
+/// An unannotated completion binding derives its type from the call
+/// operand exactly as it does from a variable operand.
+#[test]
+fn unannotated_destination_follows_a_call_operand() {
+    let block: syn::Block = parse_quote!({
+        let r = yield_all!(mk(1));
+        f(r);
+    });
+    let cfg = lower_ok(&block);
+    let r = binding(&cfg, "r");
+    let expected: syn::Type = parse_quote!(mk::State);
+    assert!(matches!(&cfg.bindings[r.0].ty,
+        TySource::DelegateReturn(inner) if matches!(&**inner, TySource::Known(t) if *t == expected)));
+}
+
+#[test]
+fn yield_all_non_call_expression_is_rejected() {
+    // A method call has no callee path to derive the state type from.
+    let block: syn::Block = parse_quote!({
+        yield_all!(x.mk());
     });
     let msg = error_of(&block).to_string();
-    assert!(msg.contains("single variable"), "got: {msg}");
+    assert!(
+        msg.contains("direct call of a coroutine function"),
+        "got: {msg}"
+    );
+    let block: syn::Block = parse_quote!({
+        yield_all!(mk(1) + mk(2));
+    });
+    let msg = error_of(&block).to_string();
+    assert!(
+        msg.contains("direct call of a coroutine function"),
+        "got: {msg}"
+    );
     let block: syn::Block = parse_quote!({
         yield_all!();
     });
-    assert!(error_of(&block).to_string().contains("single variable"));
+    let msg = error_of(&block).to_string();
+    assert!(
+        msg.contains("direct call of a coroutine function"),
+        "got: {msg}"
+    );
+}
+
+/// The operand is emitted verbatim as the delegate let's initializer,
+/// so a yield inside a call argument has to be bound first.
+#[test]
+fn yield_in_a_call_operand_is_rejected() {
+    let block: syn::Block = parse_quote!({
+        yield_all!(mk(yield_!(1)));
+    });
+    let msg = error_of(&block).to_string();
+    assert!(msg.contains("operand of yield_all!"), "got: {msg}");
+}
+
+/// `yield_all_resume!` delegates to an already started coroutine, so a
+/// call operand stays rejected there.
+#[test]
+fn yield_all_resume_call_operand_is_rejected() {
+    let block: syn::Block = parse_quote!({
+        yield_all_resume!(mk(1), 0);
+    });
+    let msg = error_of(&block).to_string();
+    assert!(msg.contains("variable holding"), "got: {msg}");
 }
 
 #[test]
