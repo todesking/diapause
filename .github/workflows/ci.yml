@@ -5,6 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+# Cancel superseded runs of the same PR; never cancel main builds.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # Wider difftest sweep than the local default of 48 cases; the seed
@@ -14,14 +22,20 @@ env:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      # Third-party actions are pinned to a commit SHA; Dependabot keeps
+      # the pin and the version comment in sync.
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          # Required when pinned to a SHA: the toolchain can no longer be
+          # inferred from the ref name.
+          toolchain: stable
           components: rustfmt, clippy
           # Bare metal target for the no_std regression check below.
           targets: thumbv7em-none-eabihf
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Clippy
