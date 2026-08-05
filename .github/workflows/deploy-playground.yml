@@ -1,7 +1,9 @@
 name: Deploy playground
 
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
   workflow_dispatch:
 
@@ -16,41 +18,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      # Third-party actions are pinned to a commit SHA; Dependabot keeps
-      # the pin and the version comment in sync.
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          # Required when pinned to a SHA: the toolchain can no longer be
-          # inferred from the ref name.
-          toolchain: stable
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-      - name: Install wasm-pack
-        uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
-        with:
-          tool: wasm-pack@0.15.0
-      - name: Build playground
-        run: ./diapause-playground/build.sh
-      - uses: actions/configure-pages@v6
-        with:
-          # Enable Pages (source: GitHub Actions) on first run if needed.
-          enablement: true
-      - uses: actions/upload-pages-artifact@v5
-        with:
-          path: diapause-playground/dist
-
   deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v5
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    uses: todesking/github-actions-workflows/.github/workflows/deploy-playground.yml@main
+    with:
+      build-script: ./diapause-playground/build.sh
+      dist-path: diapause-playground/dist

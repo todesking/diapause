@@ -4,47 +4,26 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-# Cancel superseded runs of the same PR; never cancel main builds.
+# Cancel superseded runs on PRs; let main runs finish.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  CARGO_TERM_COLOR: always
-  # Wider difftest sweep than the local default of 48 cases; the seed
-  # stays fixed, so this is still deterministic.
-  DIAPAUSE_DIFFTEST_CASES: "300"
-
 jobs:
   ci:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      # Third-party actions are pinned to a commit SHA; Dependabot keeps
-      # the pin and the version comment in sync.
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-        with:
-          # Required when pinned to a SHA: the toolchain can no longer be
-          # inferred from the ref name.
-          toolchain: stable
-          components: rustfmt, clippy
-          # Bare metal target for the no_std regression check below.
-          targets: thumbv7em-none-eabihf
-      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-      - name: Check formatting
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      # Runs the full test suite, including the difftest crate with its
-      # default (fixed) generator seed.
-      - name: Test
-        run: cargo test --workspace
+    uses: todesking/github-actions-workflows/.github/workflows/rust-ci.yml@main
+    with:
+      # Bare metal target for the no_std regression check below.
+      targets: thumbv7em-none-eabihf
+      # Wider difftest sweep than the local default of 48 cases; the seed
+      # stays fixed, so this is still deterministic.
+      test-env: |
+        DIAPAUSE_DIFFTEST_CASES=300
       # Guards the no_std claim: build the no-std test crate (and thus
       # diapause itself) for a bare metal target with no std available.
-      - name: Build for bare metal target
-        run: cargo build -p diapause-no-std-test --target thumbv7em-none-eabihf
+      extra-check: cargo build -p diapause-no-std-test --target thumbv7em-none-eabihf
