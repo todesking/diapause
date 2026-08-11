@@ -33,6 +33,18 @@ import time
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
+
+def _toml_path(path: pathlib.Path) -> str:
+    """Render a filesystem path as an escaped TOML basic string.
+
+    Uses forward slashes (valid on all platforms, including Windows) and
+    escapes backslashes/quotes so the result is safe to embed directly in
+    a generated Cargo.toml, even if the path itself contains characters
+    that would otherwise be interpreted as TOML escape sequences.
+    """
+    escaped = path.as_posix().replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
 DIA_FN = """
 #[diapause::coroutine(yield = u64, resume = u64)]
 pub fn co_{i}(n: u64) -> u64 {{
@@ -110,7 +122,7 @@ impl Co{i} {{
 
 STYLES = {
     "dia": {
-        "deps": f'diapause = {{ path = "{REPO_ROOT}/diapause" }}',
+        "deps": f'diapause = {{ path = {_toml_path(REPO_ROOT / "diapause")} }}',
         "header": "",
         "fn": DIA_FN,
     },
