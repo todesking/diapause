@@ -64,7 +64,8 @@ use proc_macro::TokenStream;
 /// (`yield_!(1) + 2`), assignment right-hand sides
 /// (`x = f(yield_!(1));`, `x += yield_!(..);`), trailing expressions
 /// (`yield_!(e)` evaluates to the resume value), `if` conditions,
-/// `match`/`if let`/`let ... else` scrutinees, and `for` heads.
+/// `match`/`if let`/`let ... else` scrutinees, `for` heads, and
+/// `return` values (`return yield_!(x);`).
 ///
 /// `yield_all!(sub)` delegates to another coroutine — held by the
 /// variable `sub`, or produced by a direct call of a coroutine function
@@ -220,8 +221,9 @@ use proc_macro::TokenStream;
 /// `State::FINGERPRINT: u64`: an FNV-1a hash of the attribute
 /// arguments, signature, and body tokens, which changes when the
 /// coroutine is edited (comments and formatting do not affect it).
-/// With the `fingerprint` attribute flag, each data-carrying variant
-/// additionally stores that hash in a plain `__fp: u64` field —
+/// With the `fingerprint` attribute flag, every variant but `Done` and
+/// `Poisoned` additionally stores that hash in a plain `__fp: u64`
+/// field —
 /// derives persist it as ordinary data — `start`/`resume` panic when
 /// it does not match the current source, and the state enum implements
 /// the `diapause::Fingerprinted` trait, whose
