@@ -692,18 +692,7 @@ impl Lowerer {
     fn push_store(&mut self, id: BindingId, value: &syn::Expr) {
         self.check_no_yield(value, ERR_VALUE_POSITION);
         self.record_expr_uses(value, self.current);
-        let b = &self.bindings[id.0];
-        let ident = b.ident.clone();
-        let mutability = b.mutability;
-        let annotation = match &b.ty {
-            TySource::Known(t) => Some(t.clone()),
-            _ => None,
-        };
-        let span = value.span();
-        let stmt: syn::Stmt = match annotation {
-            Some(ty) => syn::parse_quote_spanned!(span => let #mutability #ident: #ty = #value;),
-            None => syn::parse_quote_spanned!(span => let #mutability #ident = #value;),
-        };
+        let stmt = binding_let(&self.bindings[id.0], value, value.span());
         self.blocks[self.current].stmts.push(stmt);
         self.blocks[self.current].defs.insert(id);
     }
@@ -1554,6 +1543,22 @@ fn is_block_like(e: &syn::Expr) -> bool {
 /// `else`, a block without a trailing expression, `while`/`for` exits).
 fn unit_expr(span: proc_macro2::Span) -> syn::Expr {
     syn::parse_quote_spanned!(span => ())
+}
+
+/// The `let [mut] ident[: T] = value;` assigning a value to `b`, used
+/// wherever a `Store` destination is filled in. A syntactically known
+/// type is carried over as an annotation: the binding may be live
+/// across a state boundary, where its state field is typed by the same
+/// `TySource` and the local has to agree with it.
+fn binding_let(b: &Binding, value: &syn::Expr, span: proc_macro2::Span) -> syn::Stmt {
+    let ident = &b.ident;
+    let mutability = &b.mutability;
+    match &b.ty {
+        TySource::Known(ty) => {
+            syn::parse_quote_spanned!(span => let #mutability #ident: #ty = #value;)
+        }
+        _ => syn::parse_quote_spanned!(span => let #mutability #ident = #value;),
+    }
 }
 
 /// A two-arm `Match` terminator testing `pat` against `scrutinee`: the
