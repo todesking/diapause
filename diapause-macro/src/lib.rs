@@ -66,16 +66,20 @@ use proc_macro::TokenStream;
 /// (`yield_!(e)` evaluates to the resume value), `if` conditions,
 /// `match`/`if let`/`let ... else` scrutinees, and `for` heads.
 ///
-/// `yield_all!(sub)` delegates to the coroutine held by the variable
-/// `sub`: its yields are forwarded to the caller, resume values are
+/// `yield_all!(sub)` delegates to another coroutine — held by the
+/// variable `sub`, or produced by a direct call of a coroutine function
+/// (`yield_all!(sub(x))`): its yields are forwarded to the caller,
+/// resume values are
 /// forwarded back in, and the expression evaluates to its completion
 /// value. Its state enum is stored by value inside the outer one, so
 /// `Clone` and serde derives compose across the nesting. Supported in
 /// statement position, as a whole `let` initializer, and as a trailing
 /// expression — the function body's, or that of a block, `if`/`else`
 /// branch, or match arm in one of these positions — each optionally
-/// followed by `?` (`let v: T = yield_all!(sub)?;` — see the
-/// constraint below).
+/// followed by `?` (`yield_all!(sub)?` unwraps the completion value,
+/// exiting early on `Err`). The completion binding needs no annotation:
+/// its type is derived from the operand as
+/// `<SubTy as Coroutine<R>>::Return`.
 /// `yield_all_resume!(sub, rv)` is the same delegation for a coroutine
 /// that is already started: it enters with `resume(rv)` instead of
 /// `start()` and forwards from there. Both macros accept a `box`
@@ -107,15 +111,25 @@ use proc_macro::TokenStream;
 ///   invocations. Yield-containing control flow produces a value only
 ///   in the two supported positions above; anywhere else, assign into
 ///   an `Option<T>` in each branch and `unwrap()` after the join.
-/// - **`yield_all!` takes a variable.** The delegated coroutine is
-///   stored in the state, so the operand must be a variable with a
-///   syntactically known type; bind it first
-///   (`let sub: Ty = make_sub(..);`). Its yield and resume types must
+/// - **`yield_all!` takes a variable or a coroutine call.** The
+///   delegated coroutine is stored in the state, so its type must be
+///   spellable: either from a variable with a syntactically known type
+///   (`let sub: Ty = make_sub(..);`) or from the callee of a direct
+///   call, turned into the state type (`yield_all!(sub(x))` stores a
+///   `sub::State`, `f::<u32>(x)` an `f::State<u32>`). A callee that is
+///   not a coroutine leaves `f::State` unresolved — a compile error,
+///   never a silently wrong program. Two cases still need the two-line
+///   form: a generic coroutine whose type parameters the call does not
+///   spell, and one taking a reference (its state is generic over a
+///   lifetime the outer state cannot elide). Anything else — a method
+///   call, a qualified path, a computed callee — must be bound first.
+///   Its yield and resume types must
 ///   match the outer coroutine's (mismatches are ordinary type errors)
 ///   and it must not have been started yet (`start()` panics
 ///   otherwise; delegate to a started coroutine with
-///   `yield_all_resume!(sub, rv)`, whose resume value may be any
-///   expression not containing `yield_!`).
+///   `yield_all_resume!(sub, rv)`, which takes a variable only, with a
+///   resume value that may be any expression not containing
+///   `yield_!`).
 /// - **`break` with a value** may target a yield-containing loop only
 ///   when the loop is a `let` initializer or the function's trailing
 ///   expression.
