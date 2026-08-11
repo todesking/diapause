@@ -344,10 +344,10 @@ function renderPanicError() {
   el.errors.hidden = false;
   const item = document.createElement("li");
   item.textContent =
-    "内部エラー: コンパイラがパニックしました。wasmの状態が壊れているため、" +
-    "ページをリロードしてください。";
+    "Internal error: the compiler panicked. The wasm instance is now " +
+    "poisoned; reload the page to recover.";
   el.errors.append(item);
-  showStatus("内部エラーが発生しました。ページをリロードしてください。");
+  showStatus("Internal error (compiler panic). Reload the page to recover.");
 }
 
 async function run(transform) {
