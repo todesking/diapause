@@ -10,7 +10,7 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
-use crate::analyze_cfg::{self, Analysis, ArgInfo, InPlacePlan, Variant};
+use crate::analyze_cfg::{self, Analysis, ArgInfo, InPlacePlan, Reborrow, Variant};
 use crate::args::{Fingerprint, MacroArgs};
 use crate::cfg::{BindingId, BlockId, Cfg, OpaqueJumpKind, ResumeBinding, Terminator, TySource};
 use crate::lower::{self, PatBindingCollector, skip_nested_scopes};
@@ -836,13 +836,7 @@ impl Codegen<'_> {
             .variant(b)
             .map_or(&[][..], |v| &v.reborrows)
             .iter()
-            .map(|rb| {
-                let target_mut = &rb.target_mut;
-                let target = &rb.target;
-                let source = &rb.source;
-                let mut_tok = rb.mutable.then(|| quote!(mut));
-                quote!(let #target_mut #target = & #mut_tok #source;)
-            });
+            .map(|rb| reborrow_let(rb, &rb.source));
         let has_jumps = !self.cfg.blocks[b].jumps.is_empty();
         let stmts = self.cfg.blocks[b]
             .stmts
@@ -1038,10 +1032,7 @@ impl Codegen<'_> {
             path.reborrow_blocks.push(b);
         }
         for rb in reborrows {
-            let target_mut = &rb.target_mut;
-            let target = &rb.target;
             let source = &rb.source;
-            let mut_tok = rb.mutable.then(|| quote!(mut));
             let src = if rb.source_is_local && active.contains(&source.to_string()) {
                 let sf = self_field_ident(source);
                 quote!((*#sf))
@@ -1051,9 +1042,10 @@ impl Codegen<'_> {
             // `unused_variables`: a reborrow used only by this block's
             // cold parts is shadowed by the rehydration's rebuild and
             // never read here.
+            let stmt = reborrow_let(rb, src);
             out.extend(quote! {
                 #[allow(unused_variables)]
-                let #target_mut #target = & #mut_tok #src;
+                #stmt
             });
         }
         for (i, stmt) in self.cfg.blocks[b].stmts.iter().enumerate() {
@@ -1215,13 +1207,10 @@ impl Codegen<'_> {
             .iter()
             .flat_map(|&b| self.analysis.variant(b).map_or(&[][..], |v| &v.reborrows))
             .map(|rb| {
-                let target_mut = &rb.target_mut;
-                let target = &rb.target;
-                let source = &rb.source;
-                let mut_tok = rb.mutable.then(|| quote!(mut));
+                let stmt = reborrow_let(rb, &rb.source);
                 quote! {
                     #[allow(unused_variables)]
-                    let #target_mut #target = & #mut_tok #source;
+                    #stmt
                 }
             });
         quote! {
@@ -1243,6 +1232,17 @@ struct FastPath {
     rebound: BTreeSet<BindingId>,
     /// Variant blocks whose reborrows this path has established.
     reborrow_blocks: Vec<BlockId>,
+}
+
+/// The `let` re-establishing one crossed borrow at the head of an arm.
+/// `source` is the place to borrow, which differs per call site: the
+/// recorded source name, or — on the fast path — a dereference of the
+/// `ref mut` binding that stands for a stored source.
+fn reborrow_let(rb: &Reborrow, source: impl quote::ToTokens) -> TokenStream {
+    let target_mut = &rb.target_mut;
+    let target = &rb.target;
+    let mut_tok = rb.mutable.then(|| quote!(mut));
+    quote!(let #target_mut #target = & #mut_tok #source;)
 }
 
 /// The `ref mut` binding holding the stored `ident` in an in-place arm.
