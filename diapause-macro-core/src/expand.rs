@@ -10,7 +10,7 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
-use crate::analyze_cfg::{self, Analysis, ArgInfo, InPlacePlan, Variant};
+use crate::analyze_cfg::{self, Analysis, ArgInfo, InPlacePlan, Reborrow, Variant};
 use crate::args::{Fingerprint, MacroArgs};
 use crate::cfg::{BindingId, BlockId, Cfg, OpaqueJumpKind, ResumeBinding, Terminator, TySource};
 use crate::lower::{self, PatBindingCollector, skip_nested_scopes};
@@ -414,6 +414,30 @@ impl ExpandCtx<'_> {
     fn fp_enabled(&self) -> bool {
         self.fp_guard.is_some()
     }
+
+    /// The state variants a caller can legitimately observe: the resume
+    /// points. `resume()` accepts exactly these, and `status()` reports
+    /// exactly these as `Suspended`, so both dispatchers must derive
+    /// them the same way.
+    fn suspension_idents(&self) -> Vec<&syn::Ident> {
+        self.analysis
+            .variants
+            .iter()
+            .filter(|v| self.cfg.blocks[v.block].resume_point)
+            .map(|v| &v.ident)
+            .collect()
+    }
+
+    /// Whether `enum State` has a variant for an internal transition
+    /// (neither `Start` nor a resume point). Such a state is reachable
+    /// only through a forged value (serde etc.); its presence is what
+    /// makes the dispatchers' catch-all arm reachable — and non-exhaustive
+    /// without it, hence needed by both.
+    fn has_internal_variants(&self) -> bool {
+        (0..self.cfg.blocks.len()).any(|b| {
+            b != self.cfg.entry && !self.cfg.blocks[b].inline && !self.cfg.blocks[b].resume_point
+        })
+    }
 }
 
 /// The state `__drive` swaps into `*self` before running user code, so
@@ -556,16 +580,10 @@ fn range_inclusive_iter_def(derive_attrs: &[&syn::Attribute]) -> TokenStream {
 fn build_resume_dispatch(cx: &ExpandCtx, has_yields: bool) -> TokenStream {
     // resume() permits only suspension variants; internal variants are
     // reachable only through forged states (serde etc.).
-    let s_idents: Vec<&syn::Ident> = cx
-        .analysis
-        .variants
-        .iter()
-        .filter(|v| cx.cfg.blocks[v.block].resume_point)
-        .map(|v| &v.ident)
-        .collect();
-    let has_internal = (0..cx.cfg.blocks.len())
-        .any(|b| b != cx.cfg.entry && !cx.cfg.blocks[b].inline && !cx.cfg.blocks[b].resume_point);
-    let invalid_arm = has_internal.then(|| quote!(_ => ::core::panic!("Invalid state"),));
+    let s_idents = cx.suspension_idents();
+    let invalid_arm = cx
+        .has_internal_variants()
+        .then(|| quote!(_ => ::core::panic!("Invalid state"),));
     let poisoned_arm = quote!(State::Poisoned => ::core::panic!("Poisoned"),);
 
     if !has_yields {
@@ -598,21 +616,14 @@ fn build_resume_dispatch(cx: &ExpandCtx, has_yields: bool) -> TokenStream {
 /// Builds `status()`'s body: a match on the discriminant only. A
 /// coroutine without yields simply contributes no `Suspended` arms.
 fn build_status_dispatch(cx: &ExpandCtx) -> TokenStream {
-    // Mirrors build_resume_dispatch's `s_idents`/`has_internal`: resume
-    // points map to `Suspended`, and internal-transition variants (only
-    // reachable through forged states, same as `resume`'s "Invalid
-    // state") map to `Poisoned` as the closest fit among the four
-    // statuses.
-    let s_idents: Vec<&syn::Ident> = cx
-        .analysis
-        .variants
-        .iter()
-        .filter(|v| cx.cfg.blocks[v.block].resume_point)
-        .map(|v| &v.ident)
-        .collect();
-    let has_internal = (0..cx.cfg.blocks.len())
-        .any(|b| b != cx.cfg.entry && !cx.cfg.blocks[b].inline && !cx.cfg.blocks[b].resume_point);
-    let invalid_arm = has_internal.then(|| quote!(_ => ::diapause::CoroutineStatus::Poisoned,));
+    // Shares `build_resume_dispatch`'s classification: resume points map
+    // to `Suspended`, and internal-transition variants (only reachable
+    // through forged states, same as `resume`'s "Invalid state") map to
+    // `Poisoned` as the closest fit among the four statuses.
+    let s_idents = cx.suspension_idents();
+    let invalid_arm = cx
+        .has_internal_variants()
+        .then(|| quote!(_ => ::diapause::CoroutineStatus::Poisoned,));
 
     quote! {
         match self {
@@ -825,13 +836,7 @@ impl Codegen<'_> {
             .variant(b)
             .map_or(&[][..], |v| &v.reborrows)
             .iter()
-            .map(|rb| {
-                let target_mut = &rb.target_mut;
-                let target = &rb.target;
-                let source = &rb.source;
-                let mut_tok = rb.mutable.then(|| quote!(mut));
-                quote!(let #target_mut #target = & #mut_tok #source;)
-            });
+            .map(|rb| reborrow_let(rb, &rb.source));
         let has_jumps = !self.cfg.blocks[b].jumps.is_empty();
         let stmts = self.cfg.blocks[b]
             .stmts
@@ -1027,10 +1032,7 @@ impl Codegen<'_> {
             path.reborrow_blocks.push(b);
         }
         for rb in reborrows {
-            let target_mut = &rb.target_mut;
-            let target = &rb.target;
             let source = &rb.source;
-            let mut_tok = rb.mutable.then(|| quote!(mut));
             let src = if rb.source_is_local && active.contains(&source.to_string()) {
                 let sf = self_field_ident(source);
                 quote!((*#sf))
@@ -1040,9 +1042,10 @@ impl Codegen<'_> {
             // `unused_variables`: a reborrow used only by this block's
             // cold parts is shadowed by the rehydration's rebuild and
             // never read here.
+            let stmt = reborrow_let(rb, src);
             out.extend(quote! {
                 #[allow(unused_variables)]
-                let #target_mut #target = & #mut_tok #src;
+                #stmt
             });
         }
         for (i, stmt) in self.cfg.blocks[b].stmts.iter().enumerate() {
@@ -1204,13 +1207,10 @@ impl Codegen<'_> {
             .iter()
             .flat_map(|&b| self.analysis.variant(b).map_or(&[][..], |v| &v.reborrows))
             .map(|rb| {
-                let target_mut = &rb.target_mut;
-                let target = &rb.target;
-                let source = &rb.source;
-                let mut_tok = rb.mutable.then(|| quote!(mut));
+                let stmt = reborrow_let(rb, &rb.source);
                 quote! {
                     #[allow(unused_variables)]
-                    let #target_mut #target = & #mut_tok #source;
+                    #stmt
                 }
             });
         quote! {
@@ -1232,6 +1232,17 @@ struct FastPath {
     rebound: BTreeSet<BindingId>,
     /// Variant blocks whose reborrows this path has established.
     reborrow_blocks: Vec<BlockId>,
+}
+
+/// The `let` re-establishing one crossed borrow at the head of an arm.
+/// `source` is the place to borrow, which differs per call site: the
+/// recorded source name, or — on the fast path — a dereference of the
+/// `ref mut` binding that stands for a stored source.
+fn reborrow_let(rb: &Reborrow, source: impl quote::ToTokens) -> TokenStream {
+    let target_mut = &rb.target_mut;
+    let target = &rb.target;
+    let mut_tok = rb.mutable.then(|| quote!(mut));
+    quote!(let #target_mut #target = & #mut_tok #source;)
 }
 
 /// The `ref mut` binding holding the stored `ident` in an in-place arm.

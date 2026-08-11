@@ -7,10 +7,12 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 
-use crate::cfg::{BindingId, BlockId, OpaqueJump, OpaqueJumpKind, TySource};
+use crate::cfg::{BindingId, BlockId, OpaqueJump, OpaqueJumpKind};
 
 use super::visitors::{is_yield_macro, skip_nested_scopes, tokens_contain_yield};
-use super::{BreakDest, ERR_BREAK_VALUE, ERR_FOREIGN_MACRO, ERR_UNHOISTABLE, Lowerer, unit_expr};
+use super::{
+    BreakDest, ERR_BREAK_VALUE, ERR_FOREIGN_MACRO, ERR_UNHOISTABLE, Lowerer, binding_let, unit_expr,
+};
 
 impl Lowerer {
     /// Checks and rewrites a statement that stays opaque: no foreign
@@ -173,21 +175,10 @@ impl OpaqueRewriter<'_> {
             // cannot be captured by mistake).
             BreakDest::Store { binding, exit } => {
                 let v = value(b);
-                let bd = &self.lw.bindings[binding.0];
-                let ident = bd.ident.clone();
-                let mutability = bd.mutability;
-                let annotation = match &bd.ty {
-                    TySource::Known(t) => Some(t.clone()),
-                    _ => None,
-                };
+                let let_stmt = binding_let(&self.lw.bindings[binding.0], &v, span);
                 let current = self.lw.current;
                 self.lw.blocks[current].defs.insert(binding);
                 let marker = self.goto_marker(exit, Some(binding), span);
-                let let_stmt: syn::Stmt = match annotation {
-                    Some(ty) => syn::parse_quote_spanned!(span =>
-                        let #mutability #ident: #ty = #v;),
-                    None => syn::parse_quote_spanned!(span => let #mutability #ident = #v;),
-                };
                 Some(syn::parse_quote_spanned!(span => { #let_stmt #marker }))
             }
             // The loop is the function's tail expression: the `break`
