@@ -330,11 +330,46 @@ async function loadTransform() {
 
 let generation = 0;
 
+// Once the wasm instance panics, Rust aborts and the whole instance is
+// poisoned: every subsequent exported call (including `transform`) throws
+// immediately. There is no way to recover short of reloading the wasm
+// module, so once this flips we stop calling `transform` altogether and
+// just keep telling the user to reload.
+let poisoned = false;
+
+/** Shows a single error item explaining the panic, without touching the
+ * (now stale) expansion/CFG panels. */
+function renderPanicError() {
+  el.errors.textContent = "";
+  el.errors.hidden = false;
+  const item = document.createElement("li");
+  item.textContent =
+    "内部エラー: コンパイラがパニックしました。wasmの状態が壊れているため、" +
+    "ページをリロードしてください。";
+  el.errors.append(item);
+  showStatus("内部エラーが発生しました。ページをリロードしてください。");
+}
+
 async function run(transform) {
   const source = el.source.value;
-  const report = transform(source);
   const current = ++generation;
   renderSyntax(source);
+
+  if (poisoned) {
+    renderPanicError();
+    return;
+  }
+
+  let report;
+  try {
+    report = transform(source);
+  } catch (err) {
+    poisoned = true;
+    console.error("wasm transform panicked:", err);
+    renderPanicError();
+    return;
+  }
+
   renderHighlights(source, report.errors);
   renderErrorList(source, report.errors);
   el.expanded.innerHTML = rustHtml(
