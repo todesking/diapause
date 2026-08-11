@@ -41,7 +41,9 @@ use proc_macro::TokenStream;
 /// # Supported control flow
 ///
 /// `yield_!` may appear inside `if`, `if let`, `match`, `loop`,
-/// `while`, `while let`, and `for`, and inside the diverging block of
+/// `while`, `while let`, and `for` — including edition-2024 let chains
+/// (`if let Some(v) = opt && v > 0 { yield_!(v); }`, `while let` too) —
+/// and inside the diverging block of
 /// `let ... else`, at any nesting depth, combined with `break`,
 /// `continue` (including labeled forms), early `return`, and the `?`
 /// operator on `Result` and `Option`. Statements that contain no
@@ -62,18 +64,23 @@ use proc_macro::TokenStream;
 /// (`yield_!(1) + 2`), assignment right-hand sides
 /// (`x = f(yield_!(1));`, `x += yield_!(..);`), trailing expressions
 /// (`yield_!(e)` evaluates to the resume value), `if` conditions,
-/// `match`/`if let`/`let ... else` scrutinees, and `for` heads.
+/// `match`/`if let`/`let ... else` scrutinees, `for` heads, and
+/// `return` values (`return yield_!(x);`).
 ///
-/// `yield_all!(sub)` delegates to the coroutine held by the variable
-/// `sub`: its yields are forwarded to the caller, resume values are
+/// `yield_all!(sub)` delegates to another coroutine — held by the
+/// variable `sub`, or produced by a direct call of a coroutine function
+/// (`yield_all!(sub(x))`): its yields are forwarded to the caller,
+/// resume values are
 /// forwarded back in, and the expression evaluates to its completion
 /// value. Its state enum is stored by value inside the outer one, so
 /// `Clone` and serde derives compose across the nesting. Supported in
 /// statement position, as a whole `let` initializer, and as a trailing
 /// expression — the function body's, or that of a block, `if`/`else`
 /// branch, or match arm in one of these positions — each optionally
-/// followed by `?` (`let v: T = yield_all!(sub)?;` — see the
-/// constraint below).
+/// followed by `?` (`yield_all!(sub)?` unwraps the completion value,
+/// exiting early on `Err`). The completion binding needs no annotation:
+/// its type is derived from the operand as
+/// `<SubTy as Coroutine<R>>::Return`.
 /// `yield_all_resume!(sub, rv)` is the same delegation for a coroutine
 /// that is already started: it enters with `resume(rv)` instead of
 /// `start()` and forwards from there. Both macros accept a `box`
@@ -98,23 +105,32 @@ use proc_macro::TokenStream;
 ///   first), sit in a conditionally evaluated position
 ///   (`c && yield_!(1)`, guards, nested `if`/`match` arms, closures),
 ///   a `while` condition or `while let` scrutinee (re-evaluated every
-///   iteration), method-call arguments (receiver autoderef may run
+///   iteration), a let chain link other than the leading one
+///   (`if a && let Some(v) = f(yield_!(1))`), method-call arguments
+///   (receiver autoderef may run
 ///   user `Deref` code first), `unsafe` blocks, or other macro
 ///   invocations. Yield-containing control flow produces a value only
 ///   in the two supported positions above; anywhere else, assign into
 ///   an `Option<T>` in each branch and `unwrap()` after the join.
-/// - **No let chains.** An `if`/`while` whose body contains `yield_!`
-///   cannot use an edition-2024 let chain (`if let P = e && cond`);
-///   use nested `if let` or `match` instead.
-/// - **`yield_all!` takes a variable.** The delegated coroutine is
-///   stored in the state, so the operand must be a variable with a
-///   syntactically known type; bind it first
-///   (`let sub: Ty = make_sub(..);`). Its yield and resume types must
+/// - **`yield_all!` takes a variable or a coroutine call.** The
+///   delegated coroutine is stored in the state, so its type must be
+///   spellable: either from a variable with a syntactically known type
+///   (`let sub: Ty = make_sub(..);`) or from the callee of a direct
+///   call, turned into the state type (`yield_all!(sub(x))` stores a
+///   `sub::State`, `f::<u32>(x)` an `f::State<u32>`). A callee that is
+///   not a coroutine leaves `f::State` unresolved — a compile error,
+///   never a silently wrong program. Two cases still need the two-line
+///   form: a generic coroutine whose type parameters the call does not
+///   spell, and one taking a reference (its state is generic over a
+///   lifetime the outer state cannot elide). Anything else — a method
+///   call, a qualified path, a computed callee — must be bound first.
+///   Its yield and resume types must
 ///   match the outer coroutine's (mismatches are ordinary type errors)
 ///   and it must not have been started yet (`start()` panics
 ///   otherwise; delegate to a started coroutine with
-///   `yield_all_resume!(sub, rv)`, whose resume value may be any
-///   expression not containing `yield_!`).
+///   `yield_all_resume!(sub, rv)`, which takes a variable only, with a
+///   resume value that may be any expression not containing
+///   `yield_!`).
 /// - **`break` with a value** may target a yield-containing loop only
 ///   when the loop is a `let` initializer or the function's trailing
 ///   expression.
@@ -140,19 +156,16 @@ use proc_macro::TokenStream;
 ///   local variable (`for x in &local`) — the stored iterator would be
 ///   self-referential; iterate by value or borrow an argument.
 /// - **Jumps out of suspending loops.** A `break`/`continue` targeting
-///   a yield-containing loop must itself sit in a yield-containing
-///   statement; a plain `if done { break; }` after a yield is rejected.
-///   Move the exit condition into the loop header via a flag variable.
-///   `break` with a value cannot target such a loop.
+///   a yield-containing loop works from anywhere in the loop body,
+///   including from a statement without a yield of its own (the plain
+///   `if done { break; }` after a yield). Such a jump moves the
+///   variables of the target state by name, so a binding declared in
+///   that same statement that shadows one of them is rejected — rename
+///   the inner binding.
 /// - **`?` on `Result` and `Option` only.** The rewrite goes through
 ///   the internal `Try`/`FromResidual` traits (they appear in
 ///   rustc error messages when `?` is applied to another type);
 ///   implementing them for custom types is not supported.
-/// - **All paths returning.** If every live path ends in an explicit
-///   `return` and the diverging control flow contains yields, the
-///   unreachable implicit `()` tail triggers
-///   `E0308: expected <ret>, found ()`. Append `unreachable!()` as the
-///   tail expression.
 /// - **Visibility.** The state enum is as public as the function, so
 ///   argument and return types must be at least that visible
 ///   (otherwise `E0446`).
@@ -208,8 +221,9 @@ use proc_macro::TokenStream;
 /// `State::FINGERPRINT: u64`: an FNV-1a hash of the attribute
 /// arguments, signature, and body tokens, which changes when the
 /// coroutine is edited (comments and formatting do not affect it).
-/// With the `fingerprint` attribute flag, each data-carrying variant
-/// additionally stores that hash in a plain `__fp: u64` field —
+/// With the `fingerprint` attribute flag, every variant but `Done` and
+/// `Poisoned` additionally stores that hash in a plain `__fp: u64`
+/// field —
 /// derives persist it as ordinary data — `start`/`resume` panic when
 /// it does not match the current source, and the state enum implements
 /// the `diapause::Fingerprinted` trait, whose
