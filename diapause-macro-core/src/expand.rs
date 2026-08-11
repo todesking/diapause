@@ -414,6 +414,30 @@ impl ExpandCtx<'_> {
     fn fp_enabled(&self) -> bool {
         self.fp_guard.is_some()
     }
+
+    /// The state variants a caller can legitimately observe: the resume
+    /// points. `resume()` accepts exactly these, and `status()` reports
+    /// exactly these as `Suspended`, so both dispatchers must derive
+    /// them the same way.
+    fn suspension_idents(&self) -> Vec<&syn::Ident> {
+        self.analysis
+            .variants
+            .iter()
+            .filter(|v| self.cfg.blocks[v.block].resume_point)
+            .map(|v| &v.ident)
+            .collect()
+    }
+
+    /// Whether `enum State` has a variant for an internal transition
+    /// (neither `Start` nor a resume point). Such a state is reachable
+    /// only through a forged value (serde etc.); its presence is what
+    /// makes the dispatchers' catch-all arm reachable — and non-exhaustive
+    /// without it, hence needed by both.
+    fn has_internal_variants(&self) -> bool {
+        (0..self.cfg.blocks.len()).any(|b| {
+            b != self.cfg.entry && !self.cfg.blocks[b].inline && !self.cfg.blocks[b].resume_point
+        })
+    }
 }
 
 /// The state `__drive` swaps into `*self` before running user code, so
@@ -556,16 +580,10 @@ fn range_inclusive_iter_def(derive_attrs: &[&syn::Attribute]) -> TokenStream {
 fn build_resume_dispatch(cx: &ExpandCtx, has_yields: bool) -> TokenStream {
     // resume() permits only suspension variants; internal variants are
     // reachable only through forged states (serde etc.).
-    let s_idents: Vec<&syn::Ident> = cx
-        .analysis
-        .variants
-        .iter()
-        .filter(|v| cx.cfg.blocks[v.block].resume_point)
-        .map(|v| &v.ident)
-        .collect();
-    let has_internal = (0..cx.cfg.blocks.len())
-        .any(|b| b != cx.cfg.entry && !cx.cfg.blocks[b].inline && !cx.cfg.blocks[b].resume_point);
-    let invalid_arm = has_internal.then(|| quote!(_ => ::core::panic!("Invalid state"),));
+    let s_idents = cx.suspension_idents();
+    let invalid_arm = cx
+        .has_internal_variants()
+        .then(|| quote!(_ => ::core::panic!("Invalid state"),));
     let poisoned_arm = quote!(State::Poisoned => ::core::panic!("Poisoned"),);
 
     if !has_yields {
@@ -598,21 +616,14 @@ fn build_resume_dispatch(cx: &ExpandCtx, has_yields: bool) -> TokenStream {
 /// Builds `status()`'s body: a match on the discriminant only. A
 /// coroutine without yields simply contributes no `Suspended` arms.
 fn build_status_dispatch(cx: &ExpandCtx) -> TokenStream {
-    // Mirrors build_resume_dispatch's `s_idents`/`has_internal`: resume
-    // points map to `Suspended`, and internal-transition variants (only
-    // reachable through forged states, same as `resume`'s "Invalid
-    // state") map to `Poisoned` as the closest fit among the four
-    // statuses.
-    let s_idents: Vec<&syn::Ident> = cx
-        .analysis
-        .variants
-        .iter()
-        .filter(|v| cx.cfg.blocks[v.block].resume_point)
-        .map(|v| &v.ident)
-        .collect();
-    let has_internal = (0..cx.cfg.blocks.len())
-        .any(|b| b != cx.cfg.entry && !cx.cfg.blocks[b].inline && !cx.cfg.blocks[b].resume_point);
-    let invalid_arm = has_internal.then(|| quote!(_ => ::diapause::CoroutineStatus::Poisoned,));
+    // Shares `build_resume_dispatch`'s classification: resume points map
+    // to `Suspended`, and internal-transition variants (only reachable
+    // through forged states, same as `resume`'s "Invalid state") map to
+    // `Poisoned` as the closest fit among the four statuses.
+    let s_idents = cx.suspension_idents();
+    let invalid_arm = cx
+        .has_internal_variants()
+        .then(|| quote!(_ => ::diapause::CoroutineStatus::Poisoned,));
 
     quote! {
         match self {
