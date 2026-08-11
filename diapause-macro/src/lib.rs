@@ -155,10 +155,12 @@ use proc_macro::TokenStream;
 ///   local variable (`for x in &local`) — the stored iterator would be
 ///   self-referential; iterate by value or borrow an argument.
 /// - **Jumps out of suspending loops.** A `break`/`continue` targeting
-///   a yield-containing loop must itself sit in a yield-containing
-///   statement; a plain `if done { break; }` after a yield is rejected.
-///   Move the exit condition into the loop header via a flag variable.
-///   `break` with a value cannot target such a loop.
+///   a yield-containing loop works from anywhere in the loop body,
+///   including from a statement without a yield of its own (the plain
+///   `if done { break; }` after a yield). Such a jump moves the
+///   variables of the target state by name, so a binding declared in
+///   that same statement that shadows one of them is rejected — rename
+///   the inner binding.
 /// - **`?` on `Result` and `Option` only.** The rewrite goes through
 ///   the internal `Try`/`FromResidual` traits (they appear in
 ///   rustc error messages when `?` is applied to another type);
