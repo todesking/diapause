@@ -247,14 +247,15 @@ impl Prepared {
             .map(|a| bind_pat(&a.mutability, &a.ident))
             .collect();
 
-        // Without yields the body is a single transition, so no panic can
-        // occur between a state write and the return: Done doubles as the
-        // placeholder, Poisoned is omitted, and every resume is
-        // unconditionally an error. `Suspension::new` is the only place that
-        // branches on that condition; everything downstream only sees the
-        // consequences.
-        let n_yields = cfg.blocks.iter().filter(|b| b.resume_point).count();
-        let suspension = Suspension::new(n_yields);
+        // Whether the coroutine ever suspends. Without yields there is no
+        // suspension variant to resume from, so every resume is
+        // unconditionally an error and `resume`'s dispatch is a diverging
+        // match with no `__drive` call after it. That is the only
+        // difference: the `Poisoned` variant and the placeholder swap are
+        // the same either way, because `__drive` runs user code after
+        // installing the placeholder and a panic there must leave the
+        // documented `Poisoned` state behind.
+        let has_yields = cfg.blocks.iter().any(|b| b.resume_point);
 
         // The `fingerprint` flag threads a plain `__fp: u64` field through
         // every data-carrying variant: initialized to FINGERPRINT at
@@ -289,15 +290,15 @@ impl Prepared {
         let StateEnum {
             tokens: state_enum_tokens,
             phantom_init,
-        } = build_state_enum(&cx, &derive_attrs, &suspension.poisoned_variant);
+        } = build_state_enum(&cx, &derive_attrs);
         let range_iter_def = cfg
             .bindings
             .iter()
             .any(|b| matches!(b.ty, TySource::RangeInclusiveIter(_)))
             .then(|| range_inclusive_iter_def(&derive_attrs));
-        let resume_body = build_resume_dispatch(&cx, &suspension);
-        let status_body = build_status_dispatch(&cx, &suspension);
-        let drive_fn = build_drive_fn(&cx, &suspension.placeholder);
+        let resume_body = build_resume_dispatch(&cx, has_yields);
+        let status_body = build_status_dispatch(&cx);
+        let drive_fn = build_drive_fn(&cx);
         let fp_impl = fp_enabled.then(|| build_fingerprinted_impl(&cx, fingerprint));
 
         // A coroutine driven with `()` resume values can be iterated, so
@@ -387,9 +388,9 @@ impl Prepared {
 // === Codegen assembly ===
 //
 // `expand` above parses and validates the source item, then hands off to
-// the four pieces below: the n_yields==0 special case (`Suspension`), the
-// `State` enum (`build_state_enum`), `resume()`'s dispatch
-// (`build_resume_dispatch`), and `__drive` (`build_drive_fn`).
+// the three pieces below: the `State` enum (`build_state_enum`),
+// `resume()`'s dispatch (`build_resume_dispatch`), and `__drive`
+// (`build_drive_fn`).
 
 /// The pieces of the parsed item that the codegen-assembly functions below
 /// need but none of them owns.
@@ -415,36 +416,12 @@ impl ExpandCtx<'_> {
     }
 }
 
-/// Whether the coroutine ever suspends, and the codegen fallout of that:
-/// without yields, the body is a single transition, so no panic can occur
-/// between a state write and the return. `Done` then doubles as the
-/// placeholder, `Poisoned` is omitted, and (in `build_resume_dispatch`)
-/// every resume is unconditionally an error.
-struct Suspension {
-    poisoned_variant: TokenStream,
-    placeholder: TokenStream,
-    poisoned_arm: Option<TokenStream>,
-    has_yields: bool,
-}
-
-impl Suspension {
-    fn new(n_yields: usize) -> Self {
-        if n_yields == 0 {
-            Suspension {
-                poisoned_variant: quote!(),
-                placeholder: quote!(State::Done),
-                poisoned_arm: None,
-                has_yields: false,
-            }
-        } else {
-            Suspension {
-                poisoned_variant: quote!(Poisoned,),
-                placeholder: quote!(State::Poisoned),
-                poisoned_arm: Some(quote!(State::Poisoned => ::core::panic!("Poisoned"),)),
-                has_yields: true,
-            }
-        }
-    }
+/// The state `__drive` swaps into `*self` before running user code, so
+/// that a panic in that code leaves the documented `Poisoned` state
+/// behind. Also what the completion and suspension arms overwrite on
+/// their way out.
+fn placeholder() -> TokenStream {
+    quote!(State::Poisoned)
 }
 
 struct StateEnum {
@@ -456,14 +433,10 @@ struct StateEnum {
 }
 
 /// Builds the `enum State` declaration: variant list (in `BlockId` order,
-/// entry excluded since it becomes `Start`), the `PhantomData` field/init
-/// pair anchoring otherwise-unconstrained generic parameters, and
-/// `Poisoned`'s presence (`poisoned_variant`, from `Suspension`).
-fn build_state_enum(
-    cx: &ExpandCtx,
-    derive_attrs: &[&syn::Attribute],
-    poisoned_variant: &TokenStream,
-) -> StateEnum {
+/// entry excluded since it becomes `Start`) plus the terminal `Done` and
+/// `Poisoned`, and the `PhantomData` field/init pair anchoring
+/// otherwise-unconstrained generic parameters.
+fn build_state_enum(cx: &ExpandCtx, derive_attrs: &[&syn::Attribute]) -> StateEnum {
     // The fingerprint field is ordinary data to user derives (serde,
     // Clone, ...); its meaning lives entirely in the generated checks.
     let fp_field = cx.fp_enabled().then(|| quote!(__fp: u64,));
@@ -514,7 +487,7 @@ fn build_state_enum(
             Start { #(#arg_ident: #arg_ty,)* #fp_field #phantom_field },
             #(#state_variants,)*
             Done,
-            #poisoned_variant
+            Poisoned,
         }
     };
     StateEnum {
@@ -579,8 +552,8 @@ fn range_inclusive_iter_def(derive_attrs: &[&syn::Attribute]) -> TokenStream {
 }
 
 /// Builds `resume()`'s body: the pre-`__drive` state check, dispatched on
-/// whether the coroutine ever suspends (`suspension.has_yields`).
-fn build_resume_dispatch(cx: &ExpandCtx, suspension: &Suspension) -> TokenStream {
+/// whether the coroutine ever suspends (`has_yields`).
+fn build_resume_dispatch(cx: &ExpandCtx, has_yields: bool) -> TokenStream {
     // resume() permits only suspension variants; internal variants are
     // reachable only through forged states (serde etc.).
     let s_idents: Vec<&syn::Ident> = cx
@@ -593,15 +566,16 @@ fn build_resume_dispatch(cx: &ExpandCtx, suspension: &Suspension) -> TokenStream
     let has_internal = (0..cx.cfg.blocks.len())
         .any(|b| b != cx.cfg.entry && !cx.cfg.blocks[b].inline && !cx.cfg.blocks[b].resume_point);
     let invalid_arm = has_internal.then(|| quote!(_ => ::core::panic!("Invalid state"),));
-    let poisoned_arm = &suspension.poisoned_arm;
+    let poisoned_arm = quote!(State::Poisoned => ::core::panic!("Poisoned"),);
 
-    if !suspension.has_yields {
+    if !has_yields {
         // Every resume is an error; the diverging match is the whole
         // body so that no unreachable `__drive` call follows it.
         quote! {
             match self {
                 State::Start { .. } => ::core::panic!("Not started"),
                 State::Done => ::core::panic!("Already done"),
+                #poisoned_arm
                 #invalid_arm
             }
         }
@@ -621,10 +595,9 @@ fn build_resume_dispatch(cx: &ExpandCtx, suspension: &Suspension) -> TokenStream
     }
 }
 
-/// Builds `status()`'s body: a match on the discriminant only, dispatched
-/// on whether the coroutine ever suspends (`suspension.has_yields`), same
-/// as `build_resume_dispatch`.
-fn build_status_dispatch(cx: &ExpandCtx, suspension: &Suspension) -> TokenStream {
+/// Builds `status()`'s body: a match on the discriminant only. A
+/// coroutine without yields simply contributes no `Suspended` arms.
+fn build_status_dispatch(cx: &ExpandCtx) -> TokenStream {
     // Mirrors build_resume_dispatch's `s_idents`/`has_internal`: resume
     // points map to `Suspended`, and internal-transition variants (only
     // reachable through forged states, same as `resume`'s "Invalid
@@ -641,30 +614,20 @@ fn build_status_dispatch(cx: &ExpandCtx, suspension: &Suspension) -> TokenStream
         .any(|b| b != cx.cfg.entry && !cx.cfg.blocks[b].inline && !cx.cfg.blocks[b].resume_point);
     let invalid_arm = has_internal.then(|| quote!(_ => ::diapause::CoroutineStatus::Poisoned,));
 
-    if !suspension.has_yields {
-        quote! {
-            match self {
-                State::Start { .. } => ::diapause::CoroutineStatus::NotStarted,
-                State::Done => ::diapause::CoroutineStatus::Done,
-                #invalid_arm
-            }
-        }
-    } else {
-        quote! {
-            match self {
-                #(State::#s_idents { .. } => ::diapause::CoroutineStatus::Suspended,)*
-                State::Start { .. } => ::diapause::CoroutineStatus::NotStarted,
-                State::Done => ::diapause::CoroutineStatus::Done,
-                State::Poisoned => ::diapause::CoroutineStatus::Poisoned,
-                #invalid_arm
-            }
+    quote! {
+        match self {
+            #(State::#s_idents { .. } => ::diapause::CoroutineStatus::Suspended,)*
+            State::Start { .. } => ::diapause::CoroutineStatus::NotStarted,
+            State::Done => ::diapause::CoroutineStatus::Done,
+            State::Poisoned => ::diapause::CoroutineStatus::Poisoned,
+            #invalid_arm
         }
     }
 }
 
 /// Builds the whole `fn __drive` definition: `Codegen` assembly, one
 /// dispatch arm per variant, and the placeholder-swap loop.
-fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
+fn build_drive_fn(cx: &ExpandCtx) -> TokenStream {
     let mut resume_bindings: BTreeMap<BlockId, &ResumeBinding> = BTreeMap::new();
     for block in &cx.cfg.blocks {
         if let Terminator::Yield {
@@ -685,7 +648,6 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
         yield_ty: cx.yield_ty,
         ret_ty: cx.ret_ty,
         start_pattern: quote!(State::Start { #(#arg_pat,)* .. }),
-        placeholder: placeholder.clone(),
         fp_pat: cx.fp_enabled().then(|| quote!(__fp: _,)),
         fp_init: cx.fp_enabled().then(|| quote!(__fp: Self::FINGERPRINT,)),
     };
@@ -721,6 +683,7 @@ fn build_drive_fn(cx: &ExpandCtx, placeholder: &TokenStream) -> TokenStream {
     let resume_ty = cx.resume_ty;
     let yield_ty = cx.yield_ty;
     let ret_ty = cx.ret_ty;
+    let placeholder = placeholder();
 
     quote! {
         /// Runs the state machine until the next suspension point
@@ -813,9 +776,6 @@ struct Codegen<'a> {
     yield_ty: &'a syn::Type,
     ret_ty: &'a syn::Type,
     start_pattern: TokenStream,
-    /// The placeholder swapped into `*self` (`State::Poisoned`, or
-    /// `State::Done` when the body never yields).
-    placeholder: TokenStream,
     /// `__fp: _,` in variant unpack patterns when fingerprinting.
     fp_pat: Option<TokenStream>,
     /// `__fp: Self::FINGERPRINT,` in constructed next-state values.
@@ -1238,7 +1198,7 @@ impl Codegen<'_> {
             .iter()
             .filter(|f| !rebound_names.contains(&f.ident.to_string()))
             .map(|f| bind_pat(&f.mutability, &f.ident));
-        let placeholder = &self.placeholder;
+        let placeholder = placeholder();
         let reborrows = path
             .reborrow_blocks
             .iter()
