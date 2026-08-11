@@ -10,6 +10,16 @@ versioned and released together; this changelog covers all three.
 
 ## [Unreleased]
 
+### Fixed
+
+- A panic in the body of a coroutine that never yields now leaves the
+  state `Poisoned`, as documented, instead of `Done`. Such coroutines
+  previously omitted the `Poisoned` variant and used `Done` as
+  `__drive`'s placeholder, so a caller that caught the unwind saw
+  `status() == Done` and `is_done() == true` and would conclude that the
+  coroutine had completed and returned a value. The generated `State`
+  enum of a yieldless coroutine gains a `Poisoned` variant.
+
 ## [0.2.0] - 2026-08-04
 
 ### Added

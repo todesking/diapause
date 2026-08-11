@@ -76,6 +76,42 @@ fn visibility_is_propagated() {
     assert_eq!(c.start(), CoroutineState::Complete(42));
 }
 
+fn explode() -> u32 {
+    panic!("boom");
+}
+
+#[diapause::coroutine]
+fn bomb(x: u32) -> u32 {
+    let n = explode();
+    x + n
+}
+
+/// `__drive` installs its placeholder before running the body, so the
+/// body of a yieldless coroutine runs after the state was already
+/// overwritten. The placeholder must be `Poisoned`: reporting `Done`
+/// here would tell a caller that caught the unwind that the coroutine
+/// completed and produced a return value.
+#[test]
+fn panic_in_the_body_poisons_the_state() {
+    let mut c = bomb(1);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.start()));
+    assert!(caught.is_err());
+    assert_eq!(c.status(), CoroutineStatus::Poisoned);
+    assert!(c.is_started());
+    assert!(!c.is_done());
+}
+
+#[test]
+fn resuming_a_poisoned_state_panics() {
+    let mut c = bomb(1);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.start()));
+    assert!(caught.is_err());
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.resume(())));
+    let msg = *poisoned.unwrap_err().downcast::<&str>().unwrap();
+    assert_eq!(msg, "Poisoned");
+    assert_eq!(c.status(), CoroutineStatus::Poisoned);
+}
+
 #[test]
 #[should_panic(expected = "Not started")]
 fn resume_before_start_panics() {
