@@ -1,6 +1,6 @@
-//! The code examples from the transformation-summary document, verbatim
-//! where possible, so the documentation and the implementation cannot
-//! drift apart. Comments name the section each example comes from.
+//! Representative macro transformation examples (before/after), verifying
+//! that each pattern behaves as expected. The comment above each example
+//! names the scenario it covers.
 
 use std::fmt::Display;
 
