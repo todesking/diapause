@@ -165,11 +165,6 @@ use proc_macro::TokenStream;
 ///   the internal `Try`/`FromResidual` traits (they appear in
 ///   rustc error messages when `?` is applied to another type);
 ///   implementing them for custom types is not supported.
-/// - **All paths returning.** If every live path ends in an explicit
-///   `return` and the diverging control flow contains yields, the
-///   unreachable implicit `()` tail triggers
-///   `E0308: expected <ret>, found ()`. Append `unreachable!()` as the
-///   tail expression.
 /// - **Visibility.** The state enum is as public as the function, so
 ///   argument and return types must be at least that visible
 ///   (otherwise `E0446`).
