@@ -49,7 +49,9 @@ any code. `start()` runs the body up to the first `yield_!`; each
 ## Features
 
 - **Control flow**: `yield_!` works inside `if` / `if let` / `match` /
-  `loop` / `while` / `while let` / `for`, and inside the diverging block
+  `loop` / `while` / `while let` / `for` — including edition-2024 let
+  chains (`if let Some(v) = opt && v > 0 { yield_!(v); }`) — and inside
+  the diverging block
   of `let ... else`, at any nesting depth, mixed with `break`,
   `continue` (including labeled forms), early `return`, and the `?`
   operator on `Result` and `Option`. The generated `resume` is a
@@ -292,15 +294,14 @@ produces a dedicated compile error with the workaround in the message.
   conditionally evaluated position (`c && yield_!(1)`, match guards,
   `if`/`match` arms nested inside an expression, closures), in a
   `while` condition or `while let` scrutinee (re-evaluated every
-  iteration), in method-call arguments (receiver autoderef may run
+  iteration), in a let chain link other than the leading one
+  (`if a && let Some(v) = f(yield_!(1))`), in method-call arguments
+  (receiver autoderef may run
   user `Deref` code first), in `unsafe` blocks, or inside other macro
   invocations. Yield-containing control flow produces a value only as
   a whole `let` initializer or as the function's trailing expression
   (see Features); in any other expression position, assign into an
   `Option` in each branch and `unwrap()` after the join.
-- **Let chains are unsupported**: an `if`/`while` whose body contains a
-  `yield_!` cannot use an edition-2024 let chain
-  (`if let P = e && cond`); use nested `if let` or `match` instead.
 - **`yield_all!` takes a variable or a coroutine call, not an arbitrary
   expression**: the state stores the inner coroutine, so its type must
   be spellable — either from a variable with a syntactically known type

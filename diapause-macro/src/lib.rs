@@ -41,7 +41,9 @@ use proc_macro::TokenStream;
 /// # Supported control flow
 ///
 /// `yield_!` may appear inside `if`, `if let`, `match`, `loop`,
-/// `while`, `while let`, and `for`, and inside the diverging block of
+/// `while`, `while let`, and `for` — including edition-2024 let chains
+/// (`if let Some(v) = opt && v > 0 { yield_!(v); }`, `while let` too) —
+/// and inside the diverging block of
 /// `let ... else`, at any nesting depth, combined with `break`,
 /// `continue` (including labeled forms), early `return`, and the `?`
 /// operator on `Result` and `Option`. Statements that contain no
@@ -98,14 +100,13 @@ use proc_macro::TokenStream;
 ///   first), sit in a conditionally evaluated position
 ///   (`c && yield_!(1)`, guards, nested `if`/`match` arms, closures),
 ///   a `while` condition or `while let` scrutinee (re-evaluated every
-///   iteration), method-call arguments (receiver autoderef may run
+///   iteration), a let chain link other than the leading one
+///   (`if a && let Some(v) = f(yield_!(1))`), method-call arguments
+///   (receiver autoderef may run
 ///   user `Deref` code first), `unsafe` blocks, or other macro
 ///   invocations. Yield-containing control flow produces a value only
 ///   in the two supported positions above; anywhere else, assign into
 ///   an `Option<T>` in each branch and `unwrap()` after the join.
-/// - **No let chains.** An `if`/`while` whose body contains `yield_!`
-///   cannot use an edition-2024 let chain (`if let P = e && cond`);
-///   use nested `if let` or `match` instead.
 /// - **`yield_all!` takes a variable.** The delegated coroutine is
 ///   stored in the state, so the operand must be a variable with a
 ///   syntactically known type; bind it first
