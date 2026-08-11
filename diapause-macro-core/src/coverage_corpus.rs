@@ -7,13 +7,23 @@
 //! `diapause-difftest/build.rs`; each case module carries a `SOURCE`
 //! string constant with the exact coroutine source. Set
 //! `DIAPAUSE_MACRO_CORPUS` to a colon-separated list of such files;
-//! without it, any `cases.rs` under the workspace `target/` build
-//! output of diapause-difftest is used. The test skips (with a message)
-//! when no corpus is found, so plain `cargo test` never fails for the
-//! lack of one.
+//! without it, any `cases.rs` under the build output of diapause-difftest
+//! is used, searched under `CARGO_TARGET_DIR` when set (e.g. shared build
+//! caches, `cargo llvm-cov`'s `target/llvm-cov-target`) or else the
+//! workspace-relative `target/`. The test skips (with a message) when no
+//! corpus is found, so plain `cargo test` never fails for the lack of one.
 
 use std::fs;
 use std::path::PathBuf;
+
+/// Resolves the Cargo target directory: `CARGO_TARGET_DIR` when set,
+/// otherwise the workspace-relative `target/`.
+fn target_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+        return PathBuf::from(dir);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target")
+}
 
 /// Corpus files: explicit list from `DIAPAUSE_MACRO_CORPUS`, or every
 /// difftest `cases.rs` found under the workspace target directory.
@@ -21,7 +31,7 @@ fn corpus_paths() -> Vec<PathBuf> {
     if let Ok(list) = std::env::var("DIAPAUSE_MACRO_CORPUS") {
         return list.split(':').map(PathBuf::from).collect();
     }
-    let build_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/debug/build");
+    let build_dir = target_dir().join("debug/build");
     let Ok(entries) = fs::read_dir(&build_dir) else {
         return Vec::new();
     };
