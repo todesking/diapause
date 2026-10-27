@@ -564,11 +564,15 @@ fn range_inclusive_iter_def(derive_attrs: &[&syn::Attribute]) -> TokenStream {
                 let mut range = self.start.clone()..=self.end.clone();
                 let item = ::core::iter::Iterator::next(&mut range);
                 if item.is_none() || range.is_empty() {
+                    // Where std leaves `start` once the range is spent
+                    // differs between releases, so `start` keeps the
+                    // last element and the saved state stays the same.
                     self.done = true;
+                } else {
+                    // `next` advanced the range's start; carry it over so
+                    // the next call resumes where std's iterator would.
+                    (self.start, _) = range.into_inner();
                 }
-                // `next` advanced the range's start; carry it over so
-                // the next call resumes where std's iterator would.
-                (self.start, _) = range.into_inner();
                 item
             }
         }
